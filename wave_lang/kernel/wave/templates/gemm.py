@@ -643,21 +643,7 @@ def get_streamk_gemm_kernel(
                 tid = tkw.scalar(THREAD_0, i32)
                 tkw.set_symbol(THREAD_ID, tid)
 
-                # TODO: unnecessary read/write, right now it reads/writes to partial buffer
-                # to change the element distribution per thread from 4 -> 16
-                # Ideally everything should be kept in registers
-                # i.e. simply do mac_loop + peer_p_reg
-                # will also allow partial buffer and lock buffer to be of shape (NUM_CTAS,) rather than (NUM_CTAS*STREAMK_TILES,)
-                # also reduction CTA should never write to global or else it will overwrite its data, my workaround solves this issue, but problems arise with hybrid
-                tkw.write(
-                    mac_loop, partial_buffer, mapping=partial_buffer_write_mapping
-                )
-                curr_acc = tkw.read(
-                    partial_buffer,
-                    mapping=partial_buffer_read_mapping,
-                    elements_per_thread=16,  # we do elements_per_thread=16 since from our IndexMapping since the iterator strides by 16 elements from vector_shape (num of elements per wave)
-                    # so then within each stride we want to load all 16 elements per thread
-                )
+                curr_acc = mac_loop
                 tkw.set_symbol(OUTPUT_TILE_ITER_END, output_tile_iter_end)
 
                 # essentially if we are not at the end of an output tile there has to be one more cta w/ a higher index that has worked on this output tile too
