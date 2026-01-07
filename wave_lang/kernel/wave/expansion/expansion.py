@@ -772,11 +772,69 @@ def _fixup_region_node_common(
     new_init_args = _fixup_build_new_args_from_sorted_dict(
         region_info.init_args, expansion_context
     )
-    region_node.update_arg(init_args_field, new_init_args)
+
+    # Fix up any GetResult nodes in init_args that have value=None
+    # These GetResult nodes were copied during expansion but their value field
+    # wasn't updated to point to the expanded iterate/conditional.
+    # We need to look at region_info.init_args to find what the original node was,
+    # then find the expanded iterate/conditional that corresponds to it.
+    fixed_init_args = []
+    for i, arg in enumerate(new_init_args):
+        custom_arg = get_custom(arg)
+        if isinstance(custom_arg, GetResult):
+            # Check if the GetResult has an invalid value
+            value_arg = arg.args[0] if len(arg.args) > 0 else None
+            if value_arg is None:
+                # Look up the original ExpansionInfo for this init_arg
+                if i in region_info.init_args:
+                    exp_info = region_info.init_args[i]
+                    # The original node should be a GetResult that pointed to some iterate/conditional
+                    # We need to find the expanded iterate/conditional
+                    if isinstance(exp_info.node, GetResult):
+                        # Get the value that the original GetResult pointed to
+                        original_value = exp_info.node.value
+                        if original_value and isinstance(get_custom(original_value), (Iterate, Conditional)):
+                            # Now find the expanded version of this iterate/conditional
+                            # Since iterate/conditional nodes may not be indexed by the same dimensions
+                            # as the GetResult, we need to find the right expanded version by looking at
+                            # which one is reachable from the current context
+                            orig_region_custom = get_custom(original_value)
+                            # Try to find an expanded version of this iterate
+                            # If it wasn't expanded (no indexing dims), use the original
+                            expanded_region = None
+                            for key, node in expansion_context.expansion_context.items():
+                                if key.node == orig_region_custom and isinstance(node, (Iterate, Conditional)):
+                                    expanded_region = node
+                                    break
+
+                            # If no expanded version found, the iterate wasn't expanded - use original
+                            if not expanded_region:
+                                expanded_region = orig_region_custom
+
+                            # Create a new GetResult with the correct value
+                            # Use the graph that contains the arg node
+                            arg_graph = arg.graph
+                            arg_graph.inserting_before(arg)
+                            new_get_result = GetResult(expanded_region.fx_node, custom_arg.res_idx).add_to_graph(
+                                arg_graph, custom_arg.type, loc=custom_arg.location
+                            )
+                            new_get_result_custom = get_custom(new_get_result)
+                            new_get_result.name = arg.name
+                            # Copy index if it exists on the fx_node
+                            if hasattr(arg, 'index'):
+                                new_get_result.index = arg.index
+                            # Replace the old GetResult with the new one
+                            arg.replace_all_uses_with(new_get_result)
+                            arg = new_get_result
+        fixed_init_args.append(arg)
+
+    region_node.update_arg(init_args_field, fixed_init_args)
 
     for result_index, get_item in region_info.get_results.items():
         get_item.graph.inserting_before(get_item.fx_node)
-        get_result = GetResult(get_item.value, result_index).add_to_graph(
+        # Use region_node.fx_node as the value for GetResult, since get_item.value might be None
+        # or might point to the pre-expansion iterate node
+        get_result = GetResult(region_node.fx_node, result_index).add_to_graph(
             get_item.graph, get_item.type, loc=get_item.location
         )
         get_result.name = get_item.fx_node.name
