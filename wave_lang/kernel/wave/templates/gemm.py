@@ -691,7 +691,6 @@ def get_streamk_gemm_kernel(
                     peer_p_reg = tkw.read(
                         partial_buffer,
                         mapping=partial_buffer_read_mapping,
-                        elements_per_thread=16,
                         flags=tkw.MemoryAccessFlags.VOLATILE,
                     )
                     new_acc = acc + peer_p_reg
@@ -707,7 +706,7 @@ def get_streamk_gemm_kernel(
                     return (new_cta_k_end, new_acc)
 
                 final_k_end, final_acc = aggregate_partials_loop
-                tkw.write(final_acc, c, mapping=c_write_mapping, elements_per_thread=16)
+                tkw.write(final_acc, c, mapping=c_write_mapping)
 
             new_cta_k_start = cta_k_end
             tkw.set_symbol(WORK_UNIT_START, new_cta_k_start)
@@ -1098,7 +1097,6 @@ def get_hybrid_streamk_gemm_kernel(
                     peer_p_reg = tkw.read(
                         partial_buffer,
                         mapping=partial_buffer_read_mapping,
-                        elements_per_thread=16,
                         flags=tkw.MemoryAccessFlags.VOLATILE,
                     )
                     new_acc = acc + peer_p_reg
@@ -1124,7 +1122,6 @@ def get_hybrid_streamk_gemm_kernel(
                     final_acc,
                     c,
                     mapping=c_write_mapping_sk,
-                    elements_per_thread=16,
                 )
 
             new_cta_k_start = cta_k_end
