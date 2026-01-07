@@ -1144,7 +1144,20 @@ def cast_py_value(
                 if isinstance(node_values[0], IRProxyValue)
                 else IRProxyValue(node_values[0])
             )
-        except KeyError:
+        except CodegenError:
+            # If the node hasn't been emitted yet, check if it's a GetResult that we can emit on-demand
+            from wave_lang.kernel.ops.wave_ops import get_custom, GetResult
+            custom = get_custom(value)
+            if isinstance(custom, GetResult):
+                # Emit the GetResult node on-demand
+                emitter._emit_function_call_node(value)
+                node_values = emitter.lookup_node_values(value)
+                assert len(node_values) == 1, f"Expected exactly one value for node {value}"
+                return (
+                    node_values[0]
+                    if isinstance(node_values[0], IRProxyValue)
+                    else IRProxyValue(node_values[0])
+                )
             raise CodegenError(f"Producer node `{value}` has no IR Value")
     elif isinstance(value, IndexExpr):
         simplified = IndexingContext.current().simplify_expr(value)
@@ -1215,7 +1228,20 @@ def cast_py_value(
                 if isinstance(node_values[0], IRProxyValue)
                 else IRProxyValue(node_values[0])
             )
-        except KeyError:
+        except CodegenError:
+            # If the node hasn't been emitted yet, check if it's a GetResult that we can emit on-demand
+            from wave_lang.kernel.ops.wave_ops import get_custom, GetResult
+            custom = get_custom(value)
+            if isinstance(custom, GetResult):
+                # Emit the GetResult node on-demand
+                emitter._emit_function_call_node(value)
+                node_values = emitter.lookup_node_values(value)
+                assert len(node_values) == 1, f"Expected exactly one value for node {value}"
+                return (
+                    node_values[0]
+                    if isinstance(node_values[0], IRProxyValue)
+                    else IRProxyValue(node_values[0])
+                )
             raise CodegenError(f"Producer node `{value}` has no IR Value")
     elif isinstance(value, IndexExpr):
         simplified = IndexingContext.current().simplify_expr(value)
