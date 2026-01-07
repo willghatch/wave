@@ -1053,14 +1053,7 @@ def get_hybrid_streamk_gemm_kernel(
 
                 tid = tkw.scalar(THREAD_0, i32)
                 tkw.set_symbol(THREAD_ID, tid)
-                tkw.write(
-                    mac_loop, partial_buffer, mapping=partial_buffer_write_mapping
-                )
-                curr_acc = tkw.read(
-                    partial_buffer,
-                    mapping=partial_buffer_read_mapping,
-                    elements_per_thread=16,
-                )
+                curr_acc = mac_loop
 
                 tkw.set_symbol(OUTPUT_TILE_ITER_END, output_tile_iter_end)
 
