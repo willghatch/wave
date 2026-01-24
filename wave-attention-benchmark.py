@@ -43,6 +43,12 @@ from wave_lang.kernel.wave.templates.vanilla_attention import (
 from wave_lang.kernel.wave.templates.quantized_attention import (
     get_brevitas_pertensor_fp8_attention_kernel,
 )
+from wave_lang.kernel.wave.templates.tagged_attention import (
+    get_tagged_bshd_attention_kernel,
+)
+from wave_lang.kernel.wave.schedules.attention_prefetch import (
+    get_attention_prefetch_schedule,
+)
 from wave_lang.kernel.wave.utils.general_utils import (
     get_default_scheduling_params,
 )
@@ -80,10 +86,14 @@ FIXED_PARAMS = {
 # These parameters vary across benchmark runs.
 
 # Attention variants to test
-# Options: "fp16" (vanilla FP16), "fp8" (quantized FP8)
+# Options:
+#   "fp16" - vanilla FP16 attention
+#   "fp8" - quantized FP8 attention
+#   "fp16_manual" - FP16 attention with manual schedule (tagged kernel + prefetch schedule)
 ATTENTION_VARIANTS = [
-    "fp16",
+    #"fp16",
     # "fp8",
+    "fp16_manual",
 ]
 
 # FP8 quantization scaling factors (used when variant="fp8")
@@ -317,7 +327,7 @@ def get_custom_wave_kernel(
 
     Args:
         shape: Attention shape configuration
-        variant: "fp16" or "fp8"
+        variant: "fp16", "fp8", or "fp16_manual"
         is_causal: Whether to use causal masking
         qk_t_mma: MMA instruction type for QK^T computation
         att_v_mma: MMA instruction type for Attention×V computation
@@ -363,6 +373,73 @@ def get_custom_wave_kernel(
         del hyperparams[tkl.sym.K2]
         dynamic_symbols = [tkl.sym.B, tkl.sym.M, tkl.sym.N, tkl.sym.K2]
 
+        # Create compile options with custom tuning parameters
+        options = WaveCompileOptions(
+            subs=hyperparams,
+            schedule=schedule,
+            use_scheduling_barriers=use_scheduling_barriers,
+            dynamic_symbols=dynamic_symbols,
+            waves_per_eu=waves_per_eu,
+            denorm_fp_math_f32="preserve-sign",
+            use_buffer_ops=use_buffer_ops,
+            canonicalize=canonicalize,
+        )
+        options = set_default_run_config(options)
+        attention_kernel = wave_compile(options, attention_kernel)
+
+    elif variant == "fp16_manual":
+        # For manual schedule, we need to use the tagged attention kernel
+        # with MANUAL schedule type and the prefetch schedule function
+        # IMPORTANT: num_waves must be 8 for the ping-pong schedule
+        if waves_per_eu != 2:
+            # Note: The manual schedule assumes 8 waves total (waves_per_eu=2 gives 4 waves per workgroup * 2 EU = 8 waves)
+            # This is a simplification - actual wave count depends on EU configuration
+            print(
+                f"Warning: Manual schedule designed for waves_per_eu=2 (8 waves), got {waves_per_eu}"
+            )
+
+        (
+            attention_kernel,
+            hyperparams,
+            dynamic_symbols,
+        ) = get_tagged_bshd_attention_kernel(
+            shape,
+            mfma_variant,
+            dynamic_dims=False,
+            is_causal=is_causal,
+            num_waves=8,  # Required for ping-pong schedule
+        )
+        hyperparams.update(get_default_scheduling_params())
+
+        # Note: Tagged attention uses different tile size parameters (BLOCK_N_Q, BLOCK_N_KV instead of BLOCK_M, BLOCK_K2)
+        # BLOCK_N_Q is automatically set based on num_waves in the kernel
+        # We'll respect block_k2 by setting BLOCK_N_KV
+        if block_k2 != 64:
+            hyperparams[tkl.sym.BLOCK_N_KV] = block_k2
+        # BLOCK_D_KV corresponds to block_n
+        if block_n != 64:
+            hyperparams[tkl.sym.BLOCK_D_KV] = block_n
+
+        # Get the manual schedule function
+        attention_schedule = get_attention_prefetch_schedule()
+
+        # Create compile options - must use MANUAL schedule and enable use_global_to_shared
+        # Note: Don't pass dynamic_symbols when dynamic_dims=False (it's an empty list and may cause issues)
+        options = WaveCompileOptions(
+            subs=hyperparams,
+            schedule=SchedulingType.MANUAL,  # Must be MANUAL for custom schedules
+            use_scheduling_barriers=use_scheduling_barriers,
+            waves_per_eu=waves_per_eu,
+            denorm_fp_math_f32="preserve-sign",
+            use_buffer_ops=use_buffer_ops,
+            canonicalize=canonicalize,
+            use_global_to_shared=True,  # Required for GatherToLDS operations
+        )
+        options = set_default_run_config(options)
+        
+        # Compile with the manual schedule
+        attention_kernel = wave_compile(options, attention_kernel, attention_schedule)
+
     elif variant == "fp8":
         (
             attention_kernel,
@@ -392,22 +469,23 @@ def get_custom_wave_kernel(
         del hyperparams[tkl.sym.N_Q]
         del hyperparams[tkl.sym.N_KV]
         dynamic_symbols = [tkl.sym.B, tkl.sym.N_Q, tkl.sym.N_KV]
+
+        # Create compile options with custom tuning parameters
+        options = WaveCompileOptions(
+            subs=hyperparams,
+            schedule=schedule,
+            use_scheduling_barriers=use_scheduling_barriers,
+            dynamic_symbols=dynamic_symbols,
+            waves_per_eu=waves_per_eu,
+            denorm_fp_math_f32="preserve-sign",
+            use_buffer_ops=use_buffer_ops,
+            canonicalize=canonicalize,
+        )
+        options = set_default_run_config(options)
+        attention_kernel = wave_compile(options, attention_kernel)
     else:
         raise ValueError(f"Unknown variant: {variant}")
 
-    # Create compile options with custom tuning parameters
-    options = WaveCompileOptions(
-        subs=hyperparams,
-        schedule=schedule,
-        use_scheduling_barriers=use_scheduling_barriers,
-        dynamic_symbols=dynamic_symbols,
-        waves_per_eu=waves_per_eu,
-        denorm_fp_math_f32="preserve-sign",
-        use_buffer_ops=use_buffer_ops,
-        canonicalize=canonicalize,
-    )
-    options = set_default_run_config(options)
-    attention_kernel = wave_compile(options, attention_kernel)
     return attention_kernel
 
 
@@ -438,7 +516,8 @@ def benchmark_attention(
     Benchmark Wave attention with given parameters.
 
     Args:
-        variant: "fp16" for vanilla FP16 attention, "fp8" for quantized FP8 attention
+        variant: "fp16" for vanilla FP16 attention, "fp8" for quantized FP8 attention,
+                 "fp16_manual" for FP16 with manual schedule
         qk_t_mma: MMA instruction type for QK^T computation
         att_v_mma: MMA instruction type for Attention×V computation
         block_m: Query sequence tile size
@@ -453,26 +532,83 @@ def benchmark_attention(
     Returns:
         Dictionary containing benchmark results including timing information.
     """
-    # Create input tensors
-    query, key, value = create_attention_inputs(
-        batch_size, num_heads, seq_len_q, seq_len_k, head_dim, dtype, device
-    )
+    # Create input tensors - layout depends on variant
+    # Standard (vanilla/fp8): BHSD [batch, num_heads, seq_len, head_dim]
+    # Manual (tagged): BSHD [batch, seq_len, num_heads, head_dim]
+    if variant == "fp16_manual":
+        # BSHD layout for tagged attention
+        query = torch.randn(
+            [batch_size, seq_len_q, num_heads, head_dim],
+            device=device,
+            dtype=dtype,
+        )
+        key = torch.randn(
+            [batch_size, seq_len_k, num_heads, head_dim],
+            device=device,
+            dtype=dtype,
+        )
+        value = torch.randn(
+            [batch_size, seq_len_k, num_heads, head_dim],
+            device=device,
+            dtype=dtype,
+        )
+    else:
+        # BHSD layout for vanilla/fp8 attention
+        query = torch.randn(
+            [batch_size, num_heads, seq_len_q, head_dim],
+            device=device,
+            dtype=dtype,
+        )
+        key = torch.randn(
+            [batch_size, num_heads, seq_len_k, head_dim],
+            device=device,
+            dtype=dtype,
+        )
+        value = torch.randn(
+            [batch_size, num_heads, seq_len_k, head_dim],
+            device=device,
+            dtype=dtype,
+        )
 
     # Create attention shape
-    batch = query.shape[:-2]
-    flattened_batch_size = math.prod(batch)
-    flat_q_shape = [flattened_batch_size, query.shape[-2], query.shape[-1]]
-    flat_kv_shape = [flattened_batch_size, key.shape[-2], key.shape[-1]]
-    flat_o_shape = [flattened_batch_size, query.shape[-2], key.shape[-1]]
-
-    shape = AttentionShape(
-        num_query_heads=flattened_batch_size,
-        num_kv_heads=flattened_batch_size,
-        query_seq_len=query.shape[-2],
-        head_size_kv=key.shape[-1],
-        head_size=query.shape[-1],
-        kv_seq_len=key.shape[-2],
-    )
+    if variant == "fp16_manual":
+        # BSHD layout: [batch, seq, heads, dim]
+        # Tagged attention expects B=1, actual heads in num_query_heads/num_kv_heads
+        # For now, only support batch_size=1 for manual schedule
+        if batch_size != 1:
+            raise ValueError(
+                f"fp16_manual variant currently only supports batch_size=1, got {batch_size}"
+            )
+        
+        flat_q_shape = [batch_size, seq_len_q, num_heads, head_dim]
+        flat_kv_shape = [batch_size, seq_len_k, num_heads, head_dim]
+        flat_o_shape = [batch_size, seq_len_q, num_heads, head_dim]
+        
+        shape = AttentionShape(
+            num_query_heads=num_heads,
+            num_kv_heads=num_heads,
+            query_seq_len=seq_len_q,
+            head_size_kv=head_dim,
+            head_size=head_dim,
+            kv_seq_len=seq_len_k,
+        )
+    else:
+        # BHSD layout: [batch, heads, seq, dim]
+        # Vanilla attention flattens batch and heads together
+        batch = query.shape[:-2]
+        flattened_batch_size = math.prod(batch)
+        flat_q_shape = [flattened_batch_size, query.shape[-2], query.shape[-1]]
+        flat_kv_shape = [flattened_batch_size, key.shape[-2], key.shape[-1]]
+        flat_o_shape = [flattened_batch_size, query.shape[-2], key.shape[-1]]
+        
+        shape = AttentionShape(
+            num_query_heads=flattened_batch_size,
+            num_kv_heads=flattened_batch_size,
+            query_seq_len=query.shape[-2],
+            head_size_kv=key.shape[-1],
+            head_size=query.shape[-1],
+            kv_seq_len=key.shape[-2],
+        )
 
     # Get compiled kernel with custom tuning parameters
     attention_kernel = get_custom_wave_kernel(
@@ -495,14 +631,21 @@ def benchmark_attention(
     output = torch.empty(flat_o_shape, dtype=torch.float32, device=device)
 
     # Create attention function
-    def attention_func(q, k, v):
-        attention_kernel(
-            q.view(flat_q_shape),
-            k.view(flat_kv_shape),
-            v.view(flat_kv_shape),
-            output,
-        )
-        return output.view(*batch, shape.query_seq_len, shape.head_size_kv)
+    if variant == "fp16_manual":
+        # BSHD layout - no reshaping needed, shapes already match
+        def attention_func(q, k, v):
+            attention_kernel(q, k, v, output)
+            return output
+    else:
+        # BHSD layout - needs reshaping
+        def attention_func(q, k, v):
+            attention_kernel(
+                q.view(flat_q_shape),
+                k.view(flat_kv_shape),
+                v.view(flat_kv_shape),
+                output,
+            )
+            return output.view(batch_size, num_heads, seq_len_q, head_dim)
 
     # Warmup phase
     for _ in range(num_warmup):
@@ -591,6 +734,9 @@ def run_benchmarks() -> List[Dict[str, Any]]:
     print(f"  Benchmark Iterations: {DEFAULT_PARAMS['num_iterations']}")
     print(f"  Device: {DEFAULT_PARAMS['device']}")
     print(f"\nVariants to Test: {', '.join(ATTENTION_VARIANTS)}")
+    print(f"  - fp16: Vanilla FP16 attention")
+    print(f"  - fp8: Quantized FP8 attention")
+    print(f"  - fp16_manual: FP16 with manual prefetch schedule (tagged kernel)")
     if "fp8" in ATTENTION_VARIANTS:
         print(
             f"  FP8 Scales: q={FP8_SCALE_PARAMS['q_scale']}, "
@@ -598,6 +744,7 @@ def run_benchmarks() -> List[Dict[str, Any]]:
         )
     print(f"\nWave-Specific Tuning Parameters:")
     print(f"  Scheduling Strategies: {[s.name for s in SCHEDULING_STRATEGIES]}")
+    print(f"    Note: fp16_manual variant always uses MANUAL schedule")
     print(f"  Waves Per EU: {WAVES_PER_EU_VALUES}")
     print(f"  Scheduling Barriers: {USE_SCHEDULING_BARRIERS_VALUES}")
     print(f"  MMA Types (FP16): {len(MMA_TYPES_FP16)}")
@@ -611,15 +758,29 @@ def run_benchmarks() -> List[Dict[str, Any]]:
     # Calculate total configs dynamically based on variant
     total_configs = 0
     for variant in ATTENTION_VARIANTS:
-        mma_types = MMA_TYPES_FP16 if variant == "fp16" else MMA_TYPES_FP8
+        if variant == "fp8":
+            mma_types = MMA_TYPES_FP8
+        else:  # fp16 or fp16_manual
+            mma_types = MMA_TYPES_FP16
+        
+        # Manual schedule variants only test with one schedule (MANUAL is hardcoded)
+        schedules_to_test = 1 if variant == "fp16_manual" else len(SCHEDULING_STRATEGIES)
+        
+        # fp16_manual only supports batch_size=1, so count only those configs
+        batch_seqlen_count = (
+            len([b for b, s in BATCH_SEQLEN_PAIRS if b == 1])
+            if variant == "fp16_manual"
+            else len(BATCH_SEQLEN_PAIRS)
+        )
+        
         total_configs += (
             len(CAUSAL_VALUES)
-            * len(BATCH_SEQLEN_PAIRS)
+            * batch_seqlen_count
             * len(mma_types)
             * len(BLOCK_M_VALUES)
             * len(BLOCK_N_VALUES)
             * len(BLOCK_K2_VALUES)
-            * len(SCHEDULING_STRATEGIES)
+            * schedules_to_test
             * len(WAVES_PER_EU_VALUES)
             * len(USE_SCHEDULING_BARRIERS_VALUES)
             * len(USE_BUFFER_OPS_VALUES)
@@ -630,15 +791,28 @@ def run_benchmarks() -> List[Dict[str, Any]]:
 
     for variant in ATTENTION_VARIANTS:
         # Select appropriate MMA types for this attention variant
-        mma_types = MMA_TYPES_FP16 if variant == "fp16" else MMA_TYPES_FP8
+        if variant == "fp8":
+            mma_types = MMA_TYPES_FP8
+        else:  # fp16 or fp16_manual
+            mma_types = MMA_TYPES_FP16
 
         for is_causal in CAUSAL_VALUES:
             for batch_size, seq_len in BATCH_SEQLEN_PAIRS:
+                # Skip batch_size > 1 for fp16_manual (not yet supported)
+                if variant == "fp16_manual" and batch_size > 1:
+                    continue
+                    
                 for mma_type in mma_types:
                     for block_m in BLOCK_M_VALUES:
                         for block_n in BLOCK_N_VALUES:
                             for block_k2 in BLOCK_K2_VALUES:
-                                for schedule in SCHEDULING_STRATEGIES:
+                                # Manual schedule variants ignore the schedule parameter (always use MANUAL)
+                                schedules_to_test = (
+                                    [SchedulingType.NONE]
+                                    if variant == "fp16_manual"
+                                    else SCHEDULING_STRATEGIES
+                                )
+                                for schedule in schedules_to_test:
                                     for waves_per_eu in WAVES_PER_EU_VALUES:
                                         for (
                                             use_barriers
@@ -653,12 +827,17 @@ def run_benchmarks() -> List[Dict[str, Any]]:
                                                     mma_short = (
                                                         f"{mma_type.name.split('_')[1]}"
                                                     )
+                                                    sched_name = (
+                                                        "MANUAL"
+                                                        if variant == "fp16_manual"
+                                                        else schedule.name
+                                                    )
                                                     print(
                                                         f"\n[{current_config}/{total_configs}] Running: "
                                                         f"variant={variant}, B={batch_size}, N_CTX={seq_len}, "
                                                         f"causal={is_causal}, mma={mma_short}, "
                                                         f"tiles={block_m}x{block_n}x{block_k2}, "
-                                                        f"sched={schedule.name}, waves={waves_per_eu}"
+                                                        f"sched={sched_name}, waves={waves_per_eu}"
                                                     )
 
                                                     try:
