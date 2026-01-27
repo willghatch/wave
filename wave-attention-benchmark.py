@@ -175,12 +175,19 @@ USE_SCHEDULING_BARRIERS_VALUES = [
 # For now, we use the same MMA type for both operations (sourced from a single list)
 # but they are tracked separately to allow future independent tuning.
 #
+# IMPORTANT: Not all MMA types work with the fp16_manual schedule!
+# The manual prefetch schedule has issues with some MMA types causing
+# "node not found in lifetime" errors during compilation. Currently known
+# to work: F32_16x16x16_F16. Test other types individually before using.
+#
 # CDNA3 FP16 MMA types:
-#   - F32_16x16x16_F16: Standard 16x16x16 MMA
+#   - F32_16x16x16_F16: Standard 16x16x16 MMA (WORKS with fp16_manual)
 #   - F32_32x32x8_F16: Larger 32x32x8 MMA
 #   - F32_16x16x32_K8_F16: 16x16x32 with K=8
 #   - F32_32x32x16_K8_F16: 32x32x16 with K=8
 # CDNA4 FP16 MMA types:
+#   - F32_16x16x32_F16: CDNA4 16x16x32 (issues with fp16_manual)
+#   - F32_32x32x16_F16: CDNA4 32x32x16
 #   - RDNA4_WAVE32_F32_16x16x16_F16: RDNA4/CDNA4 16x16x16 (wave32)
 #
 # CDNA3 FP8 MMA types:
@@ -193,6 +200,7 @@ USE_SCHEDULING_BARRIERS_VALUES = [
 MMA_TYPES_FP16 = [
     MMAType.F32_16x16x16_F16,
     # MMAType.F32_32x32x8_F16,
+    # Note: F32_16x16x32_F16 causes "node not found in lifetime" errors with fp16_manual
     # MMAType.F32_16x16x32_F16,
     # MMAType.F32_32x32x16_K8_F16,
     # MMAType.I32_16x16x16_I8,
@@ -205,7 +213,8 @@ MMA_TYPES_FP16 = [
     # MMAType.I32_16x16x32_I8,
     # MMAType.I32_32x32x16_I8,
     # Intrinsics introduced in CDNA4
-    MMAType.F32_16x16x32_F16,
+    # Note: To test CDNA4 MMA types with fp16_manual, test them individually
+    # MMAType.F32_16x16x32_F16,
     # MMAType.F32_32x32x16_F16,
     # MMAType.F32_16x16x32_BF16,
     # MMAType.F32_32x32x16_BF16,
