@@ -2155,6 +2155,195 @@ def handle_permute(emitter: WaveEmitter, node: fx.Node):
     emitter.bind_node_proxy(node, vector_src)
 
 
+def _apply_chained_mma_shuffle_fix(
+    emitter: WaveEmitter, vector: Value, threads_per_wave: int
+) -> Value:
+    """
+    Apply the shuffle fix for chained MMA where a 32x32 accumulator feeds
+    into a 32x32x16 MMA input.
+
+    The 32x32 accumulator has 4-consecutive element groups:
+    - Lanes 0-31: K positions [0,1,2,3], [8,9,10,11], [16,17,18,19], [24,25,26,27]
+    - Lanes 32-63: K positions [4,5,6,7], [12,13,14,15], [20,21,22,23], [28,29,30,31]
+
+    The 32x32x16 MMA needs 8-consecutive K values. This function shuffles the data
+    so that:
+    - Lanes 0-31 get: [0,1,2,3,4,5,6,7], [16,17,18,19,20,21,22,23]
+    - Lanes 32-63 get: [8,9,10,11,12,13,14,15], [24,25,26,27,28,29,30,31]
+    """
+    vector_type = vector.type
+    element_type = vector_type.element_type
+    num_elements = vector_type.shape[0]
+
+    # Should be 16 elements for 32x32 accumulator
+    if num_elements != 16:
+        return vector
+
+    i32_type = IntegerType.get_signless(32)
+    offset_32 = arith_d.constant(i32_type, 32)
+    width = arith_d.constant(i32_type, threads_per_wave)
+
+    # Get lane ID for conditional selection
+    thread_id = gpu_d.thread_id(gpu_d.Dimension.x)
+    thread_id_i32 = arith_d.index_cast(i32_type, thread_id)
+    lane_id = arith_d.remui(thread_id_i32, width)
+
+    # Condition: lane_id < 32
+    const_32 = arith_d.constant(i32_type, 32)
+    lane_lt_32 = arith_d.cmpi(arith_d.CmpIPredicate.ult, lane_id, const_32)
+
+    # Create the result vector by processing 4-element groups
+    # We need to shuffle and select based on lane ID
+    result = arith_d.ConstantOp(
+        vector_type,
+        DenseElementsAttr.get_splat(vector_type, get_constant_attr(0, element_type)),
+    ).result
+
+    # Process each element individually since gpu.shuffle only works on scalars
+    # For each position i in [0, 16):
+    #   - Extract element i from original
+    #   - Shuffle it with partner lane (XOR 32)
+    #   - Select based on lane_id and position
+    for i in range(num_elements):
+        # Extract element from original vector
+        orig_elem = vector_d.extract(vector, static_position=[i], dynamic_position=[])
+
+        # Shuffle the element - this requires the element to be at least 32 bits
+        # Pad to f32 if needed
+        if element_type == F16Type.get():
+            orig_f32 = arith_d.extf(F32Type.get(), orig_elem)
+            shuffled_f32, _ = gpu_d.shuffle(
+                orig_f32, offset_32, width, gpu_d.ShuffleMode.XOR
+            )
+            shuffled_elem = arith_d.truncf(element_type, shuffled_f32)
+        elif element_type == ir.BF16Type.get():
+            orig_f32 = arith_d.extf(F32Type.get(), orig_elem)
+            shuffled_f32, _ = gpu_d.shuffle(
+                orig_f32, offset_32, width, gpu_d.ShuffleMode.XOR
+            )
+            shuffled_elem = arith_d.truncf(element_type, shuffled_f32)
+        elif element_type == F32Type.get():
+            shuffled_elem, _ = gpu_d.shuffle(
+                orig_elem, offset_32, width, gpu_d.ShuffleMode.XOR
+            )
+        else:
+            # For other types, try direct shuffle (may fail for <32 bit types)
+            shuffled_elem, _ = gpu_d.shuffle(
+                orig_elem, offset_32, width, gpu_d.ShuffleMode.XOR
+            )
+
+        # Determine which element to use based on position and lane ID
+        # Position groups:
+        #   0-3: lanes 0-31 keep orig, lanes 32-63 get shuffled[4-7]
+        #   4-7: lanes 0-31 get shuffled[0-3], lanes 32-63 keep orig
+        #   8-11: lanes 0-31 keep orig, lanes 32-63 get shuffled[12-15]
+        #   12-15: lanes 0-31 get shuffled[8-11], lanes 32-63 keep orig
+        group = i // 4
+        if group == 0:
+            # For positions 0-3, lanes 32-63 need the shuffled version of position i+4
+            partner_pos = i + 4
+            if partner_pos < num_elements:
+                partner_elem = vector_d.extract(
+                    vector, static_position=[partner_pos], dynamic_position=[]
+                )
+                if element_type == F16Type.get():
+                    p_f32 = arith_d.extf(F32Type.get(), partner_elem)
+                    p_shuffled_f32, _ = gpu_d.shuffle(
+                        p_f32, offset_32, width, gpu_d.ShuffleMode.XOR
+                    )
+                    partner_shuffled = arith_d.truncf(element_type, p_shuffled_f32)
+                elif element_type == ir.BF16Type.get():
+                    p_f32 = arith_d.extf(F32Type.get(), partner_elem)
+                    p_shuffled_f32, _ = gpu_d.shuffle(
+                        p_f32, offset_32, width, gpu_d.ShuffleMode.XOR
+                    )
+                    partner_shuffled = arith_d.truncf(element_type, p_shuffled_f32)
+                else:
+                    partner_shuffled, _ = gpu_d.shuffle(
+                        partner_elem, offset_32, width, gpu_d.ShuffleMode.XOR
+                    )
+                selected = arith_d.select(lane_lt_32, orig_elem, partner_shuffled)
+            else:
+                selected = orig_elem
+        elif group == 1:
+            # Positions 4-7: lanes 0-31 need partner's [0-3], lanes 32-63 keep orig
+            partner_pos = i - 4
+            partner_elem = vector_d.extract(
+                vector, static_position=[partner_pos], dynamic_position=[]
+            )
+            if element_type == F16Type.get():
+                p_f32 = arith_d.extf(F32Type.get(), partner_elem)
+                p_shuffled_f32, _ = gpu_d.shuffle(
+                    p_f32, offset_32, width, gpu_d.ShuffleMode.XOR
+                )
+                partner_shuffled = arith_d.truncf(element_type, p_shuffled_f32)
+            elif element_type == ir.BF16Type.get():
+                p_f32 = arith_d.extf(F32Type.get(), partner_elem)
+                p_shuffled_f32, _ = gpu_d.shuffle(
+                    p_f32, offset_32, width, gpu_d.ShuffleMode.XOR
+                )
+                partner_shuffled = arith_d.truncf(element_type, p_shuffled_f32)
+            else:
+                partner_shuffled, _ = gpu_d.shuffle(
+                    partner_elem, offset_32, width, gpu_d.ShuffleMode.XOR
+                )
+            selected = arith_d.select(lane_lt_32, partner_shuffled, orig_elem)
+        elif group == 2:
+            # Positions 8-11: same as group 0
+            partner_pos = i + 4
+            if partner_pos < num_elements:
+                partner_elem = vector_d.extract(
+                    vector, static_position=[partner_pos], dynamic_position=[]
+                )
+                if element_type == F16Type.get():
+                    p_f32 = arith_d.extf(F32Type.get(), partner_elem)
+                    p_shuffled_f32, _ = gpu_d.shuffle(
+                        p_f32, offset_32, width, gpu_d.ShuffleMode.XOR
+                    )
+                    partner_shuffled = arith_d.truncf(element_type, p_shuffled_f32)
+                elif element_type == ir.BF16Type.get():
+                    p_f32 = arith_d.extf(F32Type.get(), partner_elem)
+                    p_shuffled_f32, _ = gpu_d.shuffle(
+                        p_f32, offset_32, width, gpu_d.ShuffleMode.XOR
+                    )
+                    partner_shuffled = arith_d.truncf(element_type, p_shuffled_f32)
+                else:
+                    partner_shuffled, _ = gpu_d.shuffle(
+                        partner_elem, offset_32, width, gpu_d.ShuffleMode.XOR
+                    )
+                selected = arith_d.select(lane_lt_32, orig_elem, partner_shuffled)
+            else:
+                selected = orig_elem
+        else:  # group == 3
+            # Positions 12-15: same as group 1
+            partner_pos = i - 4
+            partner_elem = vector_d.extract(
+                vector, static_position=[partner_pos], dynamic_position=[]
+            )
+            if element_type == F16Type.get():
+                p_f32 = arith_d.extf(F32Type.get(), partner_elem)
+                p_shuffled_f32, _ = gpu_d.shuffle(
+                    p_f32, offset_32, width, gpu_d.ShuffleMode.XOR
+                )
+                partner_shuffled = arith_d.truncf(element_type, p_shuffled_f32)
+            elif element_type == ir.BF16Type.get():
+                p_f32 = arith_d.extf(F32Type.get(), partner_elem)
+                p_shuffled_f32, _ = gpu_d.shuffle(
+                    p_f32, offset_32, width, gpu_d.ShuffleMode.XOR
+                )
+                partner_shuffled = arith_d.truncf(element_type, p_shuffled_f32)
+            else:
+                partner_shuffled, _ = gpu_d.shuffle(
+                    partner_elem, offset_32, width, gpu_d.ShuffleMode.XOR
+                )
+            selected = arith_d.select(lane_lt_32, partner_shuffled, orig_elem)
+
+        # Insert selected element into result
+        result = vector_d.insert(selected, result, static_position=[i], dynamic_position=[])
+
+    return result
+
+
 @handle_op(reshape)
 def handle_reshape(emitter: WaveEmitter, node: fx.Node):
     try:
@@ -2200,6 +2389,9 @@ def handle_reshape(emitter: WaveEmitter, node: fx.Node):
         emitter.bind_node_proxy(node, IRProxyValue(concatenated))
         return
 
+    # Check if this reshape node needs the chained MMA shuffle fix
+    shuffle_fix_meta = node.meta.get("chained_mma_shuffle_fix")
+
     # Extract the appropriate slice. The offset is obtained from the expanded_dim
     # and so corresponds to the dim_query during expansion. To obtain the
     # actual offset, we need to multiply by the size. The size is obtained by
@@ -2211,6 +2403,12 @@ def handle_reshape(emitter: WaveEmitter, node: fx.Node):
         target_vector_shapes[innermost_dim] // custom.vector_shapes[innermost_dim]
     )
     vector = cast_vector(emitter, args[0])
+
+    # Apply shuffle fix if needed
+    if shuffle_fix_meta is not None:
+        threads_per_wave = shuffle_fix_meta["threads_per_wave"]
+        vector = _apply_chained_mma_shuffle_fix(emitter, vector, threads_per_wave)
+
     size = vector.type.shape[0] // num_partitions
     result_type = VectorType.get([size], vector.type.element_type)
     # The offset should only be in [0, num_partitions - 1].

@@ -55,6 +55,7 @@ from .decompose_reduce_ops import decompose_reduce_ops
 from .decompose_scan_ops import decompose_scan_ops
 from .decompose_topk_ops import decompose_topk_ops
 from .decompose_vmma_ops import decompose_vmma_ops
+from .fix_chained_mma_permute import fix_chained_mma_permute
 from .expansion.expansion import add_get_results, expand_graph
 from .fuse_tensor_loads import fuse_tensor_loads
 from .gather_to_shared import gather_to_shared, gather_to_shared_swizzling
@@ -718,6 +719,7 @@ def _trace_launchable_and_get_kernel_signature(
     graph_passes += [
         partial(decompose_vmma_ops, trace, launchable.constraints),
         partial(decompose_dot_mma, trace, launchable.constraints),
+        partial(fix_chained_mma_permute, trace, launchable.constraints),
     ]
 
     # Optimizations.
