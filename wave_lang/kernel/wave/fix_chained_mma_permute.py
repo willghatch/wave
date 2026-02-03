@@ -24,13 +24,11 @@ import torch.fx as fx
 
 from .._support.tracing import CapturedTrace
 from ..ops.wave_ops import (
-    CastOp,
     MMA,
-    Permute,
-    Reshape,
     get_custom,
 )
 from .constraints import Constraint, HardwareConstraint, MMAType
+from .utils.graph_utils import capture_backward_slice
 
 
 # MMA types with 32x32 output that have 4-element consecutive groups
@@ -58,31 +56,18 @@ MMA_NEEDS_8_CONSECUTIVE = {
 
 def get_source_mma(node: fx.Node) -> MMA | None:
     """
-    Trace back through Reshape, Permute and Cast operations to find the source MMA.
-    Returns None if the chain doesn't match the expected pattern.
+    Find the source MMA by following data flow backward through any operations.
+    Uses capture_backward_slice which handles IterArg, GetResult, Iterate,
+    Conditional, and any chain of operations.
+    Returns the first MMA found in the backward slice, or None if no MMA found.
     """
-    custom = get_custom(node)
-
-    # Handle Reshape -> Cast -> Permute -> MMA chain (after expansion)
-    if isinstance(custom, Reshape):
-        # Reshape.args is a list
-        args = custom.args
-        if isinstance(args, (list, tuple)) and len(args) > 0:
-            return get_source_mma(args[0])
-        return None
-    elif isinstance(custom, CastOp):
-        return get_source_mma(custom.arg)
-    elif isinstance(custom, Permute):
-        arg_custom = get_custom(custom.arg)
-        if isinstance(arg_custom, MMA):
-            return arg_custom
-        # Could be MMA -> Cast -> Permute
-        elif isinstance(arg_custom, CastOp):
-            cast_arg = get_custom(arg_custom.arg)
-            if isinstance(cast_arg, MMA):
-                return cast_arg
-        # Could also be MMA -> Permute (no cast)
-        return get_source_mma(custom.arg)
+    # capture_backward_slice uses BFS via get_inputs() which properly handles
+    # loop-carried variables, conditionals, and region boundaries
+    backward_slice = list(capture_backward_slice(node))
+    for arg in reversed(backward_slice):
+        custom = get_custom(arg)
+        if isinstance(custom, MMA):
+            return custom
     return None
 
 
@@ -120,13 +105,17 @@ def fix_chained_mma_permute(
 ):
     """
     Fix data layout for chained MMAs where a 32x32 accumulator feeds into
-    a 32x32x16 MMA input via permute.
+    a 32x32x16 MMA input.
 
-    This pass detects the pattern:
-        MMA(32x32) -> Permute -> [Cast] -> MMA(32x32x16)
+    This pass detects any data flow from one MMA to another (including through
+    loop-carried variables, conditionals, and arbitrary operation chains) and
+    marks the input node for shuffle fix when needed.
 
-    And marks the permute/cast node so that the Reshape handler in codegen
-    can emit the necessary shuffle operations.
+    The shuffle fix is required when:
+    - Source MMA has 32x32 accumulator layout (4-consecutive element groups)
+    - Target MMA requires 8 consecutive K elements as input
+
+    The actual fix is applied during code generation in the Reshape handler.
     """
     # Get hardware constraint
     hardware_constraint = None
