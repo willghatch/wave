@@ -91,7 +91,8 @@ def test_attention_manual_schedule(is_debug=False):
         head_size=128,
         kv_seq_len=16384,
     )
-    mfma_variant = (tkw.MMAType.F32_16x16x16_F16,) * 2
+    #mfma_variant = (tkw.MMAType.F32_16x16x16_F16,) * 2
+    mfma_variant = (tkw.MMAType.F32_32x32x16_F16,) * 2
 
     # Get the tagged BSHD attention kernel
     tagged_attention, hyperparams, _ = get_tagged_bshd_attention_kernel(
@@ -113,7 +114,8 @@ def test_attention_manual_schedule(is_debug=False):
     options = WaveCompileOptions(
         subs=hyperparams,
         canonicalize=True,
-        schedule=SchedulingType.MANUAL,
+        #schedule=SchedulingType.MANUAL,
+        schedule=SchedulingType.NONE,
         use_global_to_shared=True,  # Enable GatherToLDS
         print_ir_after="all" if is_debug else [],
         use_buffer_ops=True,
@@ -133,7 +135,8 @@ def test_attention_manual_schedule(is_debug=False):
 
     # Compile with the custom schedule
     compiled_attention = wave_compile(
-        options, tagged_attention, attention_prefetch_schedule
+        options, tagged_attention,
+        #attention_prefetch_schedule
     )
 
     if is_debug:

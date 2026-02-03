@@ -75,6 +75,8 @@ def get_tagged_bshd_attention_kernel(
         Mvec, Nvec, TPW = 16, 16, 64
     elif mfma_variant[1] == MMAType.F32_32x32x8_F16:
         Mvec, Nvec, TPW = 32, 32, 64
+    elif mfma_variant[1] == MMAType.F32_32x32x16_F16:
+        Mvec, Nvec, TPW = 32, 32, 64
     elif mfma_variant[1] == MMAType.RDNA4_WAVE32_F32_16x16x16_F16:
         Mvec, Nvec, TPW = 16, 16, 32
     else:
