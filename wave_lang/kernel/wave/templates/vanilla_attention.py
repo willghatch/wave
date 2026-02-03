@@ -61,6 +61,10 @@ def get_vanilla_attention_kernel(
         Mvec = 32
         Nvec = 32
         TPW = 64
+    if mfma_variant[1] == MMAType.F32_32x32x16_F16:
+        Mvec = 32
+        Nvec = 32
+        TPW = 64
     if mfma_variant[1] == MMAType.RDNA4_WAVE32_F32_16x16x16_F16:
         Mvec = 16
         Nvec = 16

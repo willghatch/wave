@@ -71,6 +71,10 @@ from wave_lang.kernel.wave.utils.reference_kernel_utils import (
             marks=require_cdna_2_or_3_or_4,
         ),
         pytest.param(
+            (MMAType.F32_32x32x16_F16, MMAType.F32_32x32x16_F16),
+            marks=require_cdna_2_or_3_or_4,
+        ),
+        pytest.param(
             (MMAType.F32_32x32x8_F16, MMAType.F32_32x32x8_F16),
             marks=require_cdna_2_or_3_or_4,
         ),
@@ -246,6 +250,10 @@ def testAttentionPure(
         ),
         pytest.param(
             (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16),
+            marks=require_cdna_2_or_3_or_4,
+        ),
+        pytest.param(
+            (MMAType.F32_32x32x16_F16, MMAType.F32_32x32x16_F16),
             marks=require_cdna_2_or_3_or_4,
         ),
         pytest.param(
@@ -670,6 +678,10 @@ def testAttentionBias(
         Mvec = 32
         Nvec = 32
         TPW = 64
+    if mfma_variant == MMAType.F32_32x32x16_F16:
+        Mvec = 32
+        Nvec = 32
+        TPW = 64
     if mfma_variant == MMAType.RDNA4_WAVE32_F32_16x16x16_F16:
         Mvec = 16
         Nvec = 16
@@ -855,6 +867,10 @@ def testAttentionSoftCap(
         Nvec = 16
         TPW = 64
     if mfma_variant == MMAType.F32_32x32x8_F16:
+        Mvec = 32
+        Nvec = 32
+        TPW = 64
+    if mfma_variant == MMAType.F32_32x32x16_F16:
         Mvec = 32
         Nvec = 32
         TPW = 64
