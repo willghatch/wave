@@ -135,6 +135,7 @@ def testFlashDecoding(
     [
         (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16),
         (MMAType.F32_32x32x8_F16, MMAType.F32_32x32x8_F16),
+        (MMAType.F32_32x32x16_F16, MMAType.F32_32x32x16_F16),
     ],
 )
 def testGqaFlashDecoding(

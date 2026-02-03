@@ -107,16 +107,22 @@ def get_gqa_bshd_attention_kernel(
     ):
         Mvec = 16
         Nvec = 16
+        TPW = 64
     if (
         mfma_variant[1] == MMAType.F32_32x32x8_F16
         or mfma_variant[0] == MMAType.F32_32x32x16_F8
     ):
         Mvec = 32
         Nvec = 32
+        TPW = 64
+    if mfma_variant[1] == MMAType.F32_32x32x16_F16:
+        Mvec = 32
+        Nvec = 32
+        TPW = 64
 
     constraints += [
         tkw.HardwareConstraint(
-            threads_per_wave=64,
+            threads_per_wave=TPW,
             mma_type=mfma_variant[1],
             vector_shapes={B: 0, H: 0, H_KV: 0, N_Q: Mvec, D_KV: Nvec},
         )

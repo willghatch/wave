@@ -195,12 +195,17 @@ def get_attention_fwd_kernel(
 
     if mfma_variant == MMAType.F32_16x16x16_F16:
         vec_size = 16
+        TPW = 64
     if mfma_variant == MMAType.F32_32x32x8_F16:
         vec_size = 32
+        TPW = 64
+    if mfma_variant == MMAType.F32_32x32x16_F16:
+        vec_size = 32
+        TPW = 64
 
     constraints += [
         tkw.HardwareConstraint(
-            threads_per_wave=64,
+            threads_per_wave=TPW,
             mma_type=mfma_variant,
             vector_shapes={B: 0},
         )
@@ -330,8 +335,13 @@ def get_attention_bwd_kernel(
 
     if mfma_variant == MMAType.F32_16x16x16_F16:
         vec_size = 16
+        TPW = 64
     elif mfma_variant == MMAType.F32_32x32x8_F16:
         vec_size = 32
+        TPW = 64
+    elif mfma_variant == MMAType.F32_32x32x16_F16:
+        vec_size = 32
+        TPW = 64
 
     # Expose user-constraints
     constraints: list[tkw.Constraint] = [
@@ -348,7 +358,7 @@ def get_attention_bwd_kernel(
         tkw.WorkgroupConstraint(B, BLOCK_B, 3),
         tkw.TilingConstraint(M_qs, BLOCK_M),
         tkw.HardwareConstraint(
-            threads_per_wave=64,
+            threads_per_wave=TPW,
             mma_type=mfma_variant,
             # TODO(#384): If we don't set the N vector shape here, then there is
             # a compilation failure when BLOCK_N (which is just set to the head
@@ -574,8 +584,13 @@ def get_attention_bwd_dv_kernel(
 
     if mfma_variant == MMAType.F32_16x16x16_F16:
         vec_size = 16
+        TPW = 64
     elif mfma_variant == MMAType.F32_32x32x8_F16:
         vec_size = 32
+        TPW = 64
+    elif mfma_variant == MMAType.F32_32x32x16_F16:
+        vec_size = 32
+        TPW = 64
 
     # Expose user-constraints
     constraints: list[tkw.Constraint] = [
@@ -592,7 +607,7 @@ def get_attention_bwd_dv_kernel(
         tkw.WorkgroupConstraint(B, BLOCK_B, 3),
         tkw.TilingConstraint(M_qs, BLOCK_M),
         tkw.HardwareConstraint(
-            threads_per_wave=64,
+            threads_per_wave=TPW,
             mma_type=mfma_variant,
             vector_shapes={B: 0},
         ),
@@ -719,8 +734,13 @@ def get_attention_bwd_dk_kernel(
 
     if mfma_variant == MMAType.F32_16x16x16_F16:
         vec_size = 16
+        TPW = 64
     elif mfma_variant == MMAType.F32_32x32x8_F16:
         vec_size = 32
+        TPW = 64
+    elif mfma_variant == MMAType.F32_32x32x16_F16:
+        vec_size = 32
+        TPW = 64
 
     # Expose user-constraints
     constraints: list[tkw.Constraint] = [
@@ -737,7 +757,7 @@ def get_attention_bwd_dk_kernel(
         tkw.WorkgroupConstraint(B, BLOCK_B, 3),
         tkw.TilingConstraint(M_qs, BLOCK_M),
         tkw.HardwareConstraint(
-            threads_per_wave=64,
+            threads_per_wave=TPW,
             mma_type=mfma_variant,
             vector_shapes={B: 0},
         ),
@@ -903,8 +923,13 @@ def get_attention_bwd_dq_kernel(
 
     if mfma_variant == MMAType.F32_16x16x16_F16:
         vec_size = 16
+        TPW = 64
     elif mfma_variant == MMAType.F32_32x32x8_F16:
         vec_size = 32
+        TPW = 64
+    elif mfma_variant == MMAType.F32_32x32x16_F16:
+        vec_size = 32
+        TPW = 64
 
     # Expose user-constraints
     constraints: list[tkw.Constraint] = [
@@ -921,7 +946,7 @@ def get_attention_bwd_dq_kernel(
         tkw.WorkgroupConstraint(B, BLOCK_B, 3),
         tkw.TilingConstraint(M_qs, BLOCK_M),
         tkw.HardwareConstraint(
-            threads_per_wave=64,
+            threads_per_wave=TPW,
             mma_type=mfma_variant,
             vector_shapes={B: 0},
         ),

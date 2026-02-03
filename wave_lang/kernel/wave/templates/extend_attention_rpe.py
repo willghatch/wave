@@ -96,13 +96,19 @@ def get_extend_attention_rpe_kernel(
     if mfma_variant[1] == MMAType.F32_16x16x16_F16:
         Mvec = 16
         Nvec = 16
+        TPW = 64
     if mfma_variant[1] == MMAType.F32_32x32x8_F16:
         Mvec = 32
         Nvec = 32
+        TPW = 64
+    if mfma_variant[1] == MMAType.F32_32x32x16_F16:
+        Mvec = 32
+        Nvec = 32
+        TPW = 64
 
     constraints += [
         tkw.HardwareConstraint(
-            threads_per_wave=64,
+            threads_per_wave=TPW,
             mma_type=mfma_variant[1],
             vector_shapes={H: 0, H_KV: 0, N_Q: Mvec, D_KV: Nvec, S: 0},
         )

@@ -319,6 +319,7 @@ def create_inputs(
     [
         (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16),
         (MMAType.F32_32x32x8_F16, MMAType.F32_32x32x8_F16),
+        (MMAType.F32_32x32x16_F16, MMAType.F32_32x32x16_F16),
     ],
 )
 def testExtendAttention(
@@ -363,6 +364,8 @@ def testExtendAttention(
     if mfma_variant[0] == MMAType.F32_16x16x16_F16:
         num_waves = 4
     if mfma_variant[1] == MMAType.F32_32x32x8_F16:
+        num_waves = 2
+    if mfma_variant[1] == MMAType.F32_32x32x16_F16:
         num_waves = 2
 
     # Run the wave kernel.
@@ -465,6 +468,7 @@ def testExtendAttention(
     [
         (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16),
         (MMAType.F32_32x32x8_F16, MMAType.F32_32x32x8_F16),
+        (MMAType.F32_32x32x16_F16, MMAType.F32_32x32x16_F16),
     ],
 )
 def testExtendRpeAttention(
@@ -503,6 +507,8 @@ def testExtendRpeAttention(
     if mfma_variant[0] == MMAType.F32_16x16x16_F16:
         num_waves = 4
     if mfma_variant[1] == MMAType.F32_32x32x8_F16:
+        num_waves = 2
+    if mfma_variant[1] == MMAType.F32_32x32x16_F16:
         num_waves = 2
 
     # Run the wave kernel.
