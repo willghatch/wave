@@ -147,6 +147,10 @@ def test_attention_manual_schedule(is_debug=False):
 
     # Create test data - BSHD layout: [Batch, Seq, Heads, Dim]
     # For the tagged kernel, B=1, H=num_query_heads, H_KV=num_kv_heads
+    # Use fixed seed for reproducible results across MMA variants
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    
     batch = 1
     num_query_heads = shape.num_query_heads
     num_kv_heads = shape.num_kv_heads
