@@ -219,6 +219,7 @@ def verify_nodes(trace: CapturedTrace, constraints: list[Constraint]):
     nodes = trace.walk(lambda x: x)
     for node in nodes:
         custom = get_custom(node)
+        print(f"{custom}")
         if isinstance(custom, (Placeholder, Allocate)) and not isinstance(
             custom, IterArg
         ):
