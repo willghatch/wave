@@ -37,6 +37,7 @@ from ...ops.wave_ops import (
     MemoryCounterWaitBarrier,
     NestedRegionOp,
     Output,
+    Permute,
     Placeholder,
     Read,
     ReduceOp,
@@ -1061,6 +1062,7 @@ def set_thread_dependent_index_from_reduce(
 def set_post_expansion_indices(trace: CapturedTrace, constraints: list[Constraint]):
     """
     Add offsets to the indices based on the expanded dims.
+    Also updates indices for nodes that have been marked for shuffle fix.
     """
 
     def apply_offset(node: fx.Node):

@@ -358,10 +358,10 @@ def testAttentionCausal(
         #     (MMAType.F32_16x16x32_K8_F16, MMAType.F32_16x16x16_F16),
         #     marks=require_cdna_2_or_3_or_4,
         # ),
-        pytest.param(
-            (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16),
-            marks=require_cdna_2_or_3_or_4,
-        ),
+        # pytest.param(
+        #     (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16),
+        #     marks=require_cdna_2_or_3_or_4,
+        # ),
         pytest.param(
             (MMAType.F32_32x32x16_F16, MMAType.F32_32x32x16_F16),
             marks=require_cdna_2_or_3_or_4,

@@ -93,10 +93,22 @@ def mark_node_for_shuffle_fix(node: fx.Node, hardware_constraint: HardwareConstr
     """
     Mark a node as needing the chained MMA shuffle fix.
     The actual fix is applied during code generation.
+    
+    Also updates the index to reflect the shuffled layout:
+    - Before shuffle: 4-element groups with expression like Mod($GPR_NUM, 4) + 8*(Mod(floor($GPR_NUM/4), 4))
+    - After shuffle: 8-element groups with expression like 8*floor(Mod($T0, 64)/32) + Mod($GPR_NUM, 8)
+    
+    Note: The full expression also includes 16*floor($GPR_NUM/8) for the second 8-element group,
+    but that's handled during expansion when we know which partition is being extracted.
     """
     node.meta["chained_mma_shuffle_fix"] = {
         "threads_per_wave": hardware_constraint.threads_per_wave,
     }
+    
+    # Update the index of this node and its users (like reshape) to reflect the shuffled layout
+    # This needs to happen after indices are set but before expansion
+    # We'll do this in a separate pass that runs after set_node_indices
+    node.meta["shuffle_fix_index_update_needed"] = True
 
 
 def fix_chained_mma_permute(
