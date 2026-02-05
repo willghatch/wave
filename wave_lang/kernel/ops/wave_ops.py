@@ -3231,6 +3231,71 @@ class Permute(CustomOp, ABC):
             if k in src_shape
         }
         return permuted_index
+    
+    def transform_index_forward(
+        self, index: dict[IndexSymbol, IndexSequence]
+    ) -> dict[IndexSymbol, IndexSequence]:
+        """
+        Transform index from input layout to output layout (forward through permute).
+        This is the same as the regular transform_index.
+        
+        Example: [B, H, K2, M] -> [B, H, M, K2]
+        Input index has K2 in 3rd position, output has K2 in 4th position.
+        """
+        if self.vector_shapes is None:
+            # If vector_shapes not set yet, just reorder dimensions
+            return {k: index[k] for k in self.target_shape if k in index}
+        return self.transform_index(index)
+    
+    def transform_index_backward(
+        self, index: dict[IndexSymbol, IndexSequence]
+    ) -> dict[IndexSymbol, IndexSequence]:
+        """
+        Transform index from output layout to input layout (inverse permute).
+        Used during backward propagation to transform indices from consumers.
+        
+        Example: If permute does [B, H, K2, M] -> [B, H, M, K2]
+        Then backward transform does [B, H, M, K2] -> [B, H, K2, M]
+        """
+        if self.vector_shapes is None:
+            # If vector_shapes not set yet, just reorder dimensions without transformation
+            custom_src = get_custom(self.arg)
+            src_shape = custom_src.type.symbolic_shape
+            return {k: index[k] for k in src_shape if k in index}
+        
+        custom_src = get_custom(self.arg)
+        src_shape = custom_src.type.symbolic_shape
+        
+        # Create inverse mapping: target position -> source position
+        target_to_src = {
+            self.target_shape[i]: src_shape[i] for i in range(len(src_shape))
+        }
+        
+        # Compute non-unit iterators
+        non_unit_its = [k for k, v in self.vector_shapes.items() if v != 0]
+        non_unit_src = [d for d in src_shape if d in non_unit_its]
+        non_unit_tgt = [d for d in self.target_shape if d in non_unit_its]
+        
+        # If non-unit dimensions are the same, just reorder
+        if non_unit_src == non_unit_tgt:
+            return {k: index[k] for k in src_shape if k in index}
+        
+        # Apply inverse permutation to strides
+        inverse_index = {}
+        for dim in src_shape:
+            if dim not in index:
+                continue
+            # Find where this dimension is in target_shape
+            target_dim = target_to_src[dim]
+            # Use the index from the target position but with source stride
+            if target_dim in index:
+                inverse_index[dim] = IndexSequence(
+                    index[target_dim].start,
+                    index[target_dim].size,
+                    index[dim].stride if dim in index else index[target_dim].stride
+                )
+        
+        return inverse_index
 
 
 def _to_sequence(input: Any | Sequence[Any]) -> Sequence[Any]:
@@ -3255,6 +3320,32 @@ class Reshape(CustomOp, ABC):
 
     def infer_type(self, *args):
         self.type = get_custom(_to_sequence(self.args)[0]).type
+    
+    def transform_index_forward(
+        self, index: dict[IndexSymbol, IndexSequence]
+    ) -> dict[IndexSymbol, IndexSequence]:
+        """
+        Transform index from input layout to output layout (forward through reshape).
+        
+        For shuffle fix: The metadata is set before index propagation, but the actual
+        shuffle transformation is applied later in update_shuffled_indices.
+        During index propagation, reshape acts as an identity transform to preserve
+        vector sizes for MMA instructions.
+        """
+        # Identity transform during index propagation
+        # The shuffle fix will be applied later in update_shuffled_indices
+        return index
+    
+    def transform_index_backward(
+        self, index: dict[IndexSymbol, IndexSequence]
+    ) -> dict[IndexSymbol, IndexSequence]:
+        """
+        Transform index from output layout to input layout (inverse reshape).
+        
+        For shuffle fix: Identity transform during index propagation.
+        """
+        # Identity transform during index propagation
+        return index
 
 
 @define_op("tensor_load_to_lds")

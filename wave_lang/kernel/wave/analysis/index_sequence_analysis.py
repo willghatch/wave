@@ -41,6 +41,8 @@ from ...ops.wave_ops import (
     Placeholder,
     Read,
     ReduceOp,
+    Reshape,
+    SelfIndex,
     TopkOp,
     ScaledMMA,
     SelectOp,
@@ -220,7 +222,7 @@ def verify_nodes(trace: CapturedTrace, constraints: list[Constraint]):
     nodes = trace.walk(lambda x: x)
     for node in nodes:
         custom = get_custom(node)
-        print(f"{custom}")
+        #print(f"{custom}")
         if isinstance(custom, (Placeholder, Allocate)) and not isinstance(
             custom, IterArg
         ):
@@ -745,10 +747,19 @@ def add_nodes_to_sources(
     sources: list[
         tuple[CustomOp, dict[IndexSymbol, IndexSequence], dict[IndexSymbol, int]]
     ],
+    is_backward: bool = None,
 ) -> list[CustomOp]:
     """
     Populate the sources with the inputs and users of the source node.
+    
+    Transform nodes (Permute, Reshape) transform indices during propagation:
+    - Forward propagation: Apply inverse transform (output → input layout)
+    - Backward propagation: Apply forward transform (input → output layout)
     """
+    # Determine direction if fn is one of the known functions
+    if is_backward is None:
+        is_backward = (fn.__name__ == 'get_inputs' if hasattr(fn, '__name__') else False)
+    
     for args, region in [fn(source.fx_node, None)]:
         logger.debug(f"{source.fx_node} -> {args}")
         if not args:
@@ -757,6 +768,25 @@ def add_nodes_to_sources(
             custom = get_custom(arg)
             if isinstance(custom, Placeholder) and not isinstance(custom, IterArg):
                 continue
+            
+            # Transform nodes: apply index transformation during propagation
+            if isinstance(custom, (Permute, Reshape)):
+                # Apply transformation based on propagation direction
+                if is_backward:
+                    # Backward: propagating from output to input
+                    # Need to transform from output layout to input layout
+                    transformed_index = custom.transform_index_backward(source_index)
+                else:
+                    # Forward: propagating from input to output
+                    # Need to transform from input layout to output layout
+                    transformed_index = custom.transform_index_forward(source_index)
+                
+                vector_shapes = (
+                    custom.vector_shapes if custom.vector_shapes else source_vector_shapes
+                )
+                sources.append((custom, transformed_index, vector_shapes))
+                continue
+            
             vector_shapes = (
                 custom.vector_shapes if custom.vector_shapes else source_vector_shapes
             )
@@ -829,11 +859,62 @@ def propagate_indices(
     """
     Propagate the index and vector shapes through the graph
     starting with priveleged nodes (like MMA, Read, Write).
+    
+    Transform nodes (Permute, Reshape) transform indices during propagation.
     """
     while sources:
         source, source_index, source_vector_shapes = sources.pop(0)
         if source in visited:
             continue
+        
+        # Special handling for Transform nodes (Permute, Reshape)
+        if isinstance(source, (Permute, Reshape)):
+            if should_update_index(
+                source, source_index, source_vector_shapes, symbolic_constraints
+            ):
+                source.vector_shapes = deepcopy(source_vector_shapes)
+                # For transform nodes, the source_index has already been transformed
+                # by add_nodes_to_sources, so we use it directly
+                print(f"\n=== TRANSFORM NODE: {type(source).__name__} {source.fx_node.name} ===")
+                print(f"  source_index (incoming): {source_index}")
+                print(f"  source_vector_shapes: {source_vector_shapes}")
+                print(f"  node.index (before): {source.index}")
+                if isinstance(source, Reshape):
+                    print(f"  reshape.chained_mma_shuffle_fix: {source.fx_node.meta.get('chained_mma_shuffle_fix', False)}")
+                    print(f"  reshape.shuffle_fix_index_update_needed: {source.fx_node.meta.get('shuffle_fix_index_update_needed', False)}")
+                    print(f"  reshape.target_vector_shape: {source.target_vector_shape}")
+                source.index = combine_indices(source.index, source_index)
+                # Update vector_shapes to match index sizes for non-trivial dimensions
+                for dim, idx_seq in source.index.items():
+                    if dim in source.vector_shapes and idx_seq.size > 1:
+                        source.vector_shapes[dim] = idx_seq.size
+                append_aliased_shapes(source, symbolic_constraints)
+                print(f"  node.index (after): {source.index}")
+                print(f"  node.vector_shapes (after): {source.vector_shapes}")
+                if isinstance(source, Permute):
+                    print(f"  permute.arg (input): {source.arg}")
+                    input_custom = get_custom(source.arg)
+                    print(f"  permute.arg.type: {type(input_custom).__name__}")
+                    if hasattr(input_custom, 'index'):
+                        print(f"  permute.arg.index: {input_custom.index}")
+                    if hasattr(input_custom, 'vector_shapes'):
+                        print(f"  permute.arg.vector_shapes: {input_custom.vector_shapes}")
+                print(f"=== END TRANSFORM NODE ===\n")
+                logger.debug(f"Set transform node {source.fx_node.name} index: index={source.index}, vector_shapes={source.vector_shapes}")
+            visited.add(source)
+            # Continue propagating through transform nodes
+            for func in [get_inputs, get_users]:
+                is_backward = (func == get_inputs)
+                sources = add_nodes_to_sources(
+                    source,
+                    func,
+                    source_index,
+                    source_vector_shapes,
+                    sources,
+                    is_backward,
+                )
+            continue
+        
         if not isinstance(source, (NestedRegionOp, MMABase)):
             if not should_update_index(
                 source, source_index, source_vector_shapes, symbolic_constraints
@@ -846,14 +927,39 @@ def propagate_indices(
                 source_index = source.transform_index(source_index)
                 source.index = combine_indices(source.index, source_index)
             append_aliased_shapes(source, symbolic_constraints)
+            
+            # Debug output for key nodes (add, select, mask operations, self_index)
+            if isinstance(source, (BinaryPyOp, SelectOp, SelfIndex)) or (hasattr(source.fx_node, 'name') and 'mask' in source.fx_node.name.lower()):
+                print(f"\n=== NODE: {type(source).__name__} {source.fx_node.name} ===")
+                print(f"  index: {source.index}")
+                print(f"  vector_shapes: {source.vector_shapes}")
+                if isinstance(source, SelfIndex):
+                    print(f"  self_index.dim: {source.dim}")
+                    print(f"  self_index.dtype: {source.dtype}")
+                if isinstance(source, BinaryPyOp):
+                    lhs_custom = get_custom(source.lhs)
+                    rhs_custom = get_custom(source.rhs)
+                    print(f"  lhs: {source.lhs} ({type(lhs_custom).__name__})")
+                    if hasattr(lhs_custom, 'index'):
+                        print(f"    lhs.index: {lhs_custom.index}")
+                    print(f"  rhs: {source.rhs} ({type(rhs_custom).__name__})")
+                    if hasattr(rhs_custom, 'index'):
+                        print(f"    rhs.index: {rhs_custom.index}")
+                if isinstance(source, SelectOp):
+                    print(f"  cond: {source.cond} ({type(get_custom(source.cond)).__name__})")
+                    if hasattr(get_custom(source.cond), 'index'):
+                        print(f"    cond.index: {get_custom(source.cond).index}")
+                print(f"=== END NODE ===\n")
         visited.add(source)
         for func in [get_inputs, get_users]:
+            is_backward = (func == get_inputs)
             sources = add_nodes_to_sources(
                 source,
                 func,
                 source_index,
                 source_vector_shapes,
                 sources,
+                is_backward,
             )
     return visited
 

@@ -476,6 +476,11 @@ def _build_initial_pass_pipeline(
                 options.target,
             ),
         ]
+        +         [
+            # Run fix_chained_mma_permute BEFORE setting indices
+            # This allows index propagation to see the shuffle fix metadata
+            partial(fix_chained_mma_permute, trace, launchable.constraints),
+        ]
         + (
             [
                 partial(
@@ -498,7 +503,6 @@ def _build_initial_pass_pipeline(
         )
         + [
             partial(reorder_workgroups, trace, launchable.reordering_constraints),
-            partial(fix_chained_mma_permute, trace, launchable.constraints),
             partial(update_shuffled_indices, trace, launchable.constraints),
             partial(expand_graph, trace, launchable.constraints),
             partial(set_post_expansion_indices, trace, launchable.constraints),
