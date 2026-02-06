@@ -382,24 +382,36 @@ def concretize_mma_symbols(trace: CapturedTrace):
     
     This ensures downstream passes don't encounter Piecewise expressions.
     """
+    def concretize_index_dict(index_dict: dict[IndexSymbol, IndexSequence]) -> dict[IndexSymbol, IndexSequence]:
+        """Helper to concretize a single index dict."""
+        has_mma_symbols = any(
+            idx_seq.has(MMA_ACC) or idx_seq.has(MMA_LHS) or idx_seq.has(MMA_RHS)
+            for idx_seq in index_dict.values()
+        )
+        
+        if has_mma_symbols:
+            return specialize_index(
+                index_dict, {MMA_LHS: 0, MMA_RHS: 0, MMA_ACC: 1}
+            )
+        return index_dict
+    
     def concretize_node(node: fx.Node):
         custom = get_custom(node)
         if not hasattr(custom, 'index') or custom.index is None:
             return
         
-        # Check if index has MMA symbols
-        has_mma_symbols = any(
-            idx_seq.has(MMA_ACC) or idx_seq.has(MMA_LHS) or idx_seq.has(MMA_RHS)
-            for idx_seq in custom.index.values()
-        )
-        
-        if has_mma_symbols:
-            # Specialize with MMA_ACC=1 (accumulator/output)
-            # This resolves Piecewise expressions to concrete values
-            custom.index = specialize_index(
-                custom.index, {MMA_LHS: 0, MMA_RHS: 0, MMA_ACC: 1}
-            )
+        # Handle dict indices (most common case)
+        if isinstance(custom.index, dict):
+            custom.index = concretize_index_dict(custom.index)
             logger.debug(f"Concretized MMA symbols for {node.name}: {custom.index}")
+        
+        # Handle list of indices (e.g., Iterate nodes)
+        elif isinstance(custom.index, list):
+            custom.index = [
+                concretize_index_dict(idx) if isinstance(idx, dict) else idx
+                for idx in custom.index
+            ]
+            logger.debug(f"Concretized MMA symbols in list for {node.name}")
     
     trace.walk(concretize_node)
 
