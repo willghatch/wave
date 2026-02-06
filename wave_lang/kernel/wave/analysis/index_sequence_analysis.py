@@ -570,6 +570,8 @@ def populate_mma_source_indices(
     Initialize the sources with the LHS, RHS, ACC and MMA node
     and their index sequences and vector shapes. These will
     be propagated to the rest of the graph.
+    
+    Concretizes MMA symbols immediately for each operand and the MMA node itself.
     """
     index: dict[IndexSymbol, IndexSequence] = {}
     mapping = mma_index[node]
@@ -577,7 +579,13 @@ def populate_mma_source_indices(
         index[dim] = hardware_constraint.apply_mma_mapping(
             dim, dim_index, node.mma_type
         )
-    node.index = combine_indices(node.index, index)
+    
+    # Concretize the MMA node's own index (as accumulator output)
+    node.index = combine_indices(
+        node.index, 
+        specialize_index(index, {MMA_LHS: 0, MMA_RHS: 0, MMA_ACC: 1})
+    )
+    
     lhs_tuple = (
         get_custom(node.lhs),
         specialize_index(index, {MMA_LHS: 1, MMA_RHS: 0, MMA_ACC: 0}),
@@ -613,6 +621,8 @@ def populate_scaled_mma_source_indices(
     Initialize the sources with the LHS, RHS, ACC and MMA node
     and their index sequences and vector shapes. These will
     be propagated to the rest of the graph.
+    
+    Concretizes MMA symbols immediately for each operand and the MMA node itself.
     """
     index: dict[IndexSymbol, IndexSequence] = {}
     mapping = mma_index[node]
@@ -620,10 +630,26 @@ def populate_scaled_mma_source_indices(
         index[dim] = hardware_constraint.apply_mma_mapping(
             dim, dim_index, node.mma_type
         )
-    node.index = combine_indices(node.index, index)
+    
+    # Concretize the MMA node's own index (as accumulator output)
     lhs_dtype = node.lhs.type.dtype
     rhs_dtype = node.rhs.type.dtype
     is_fp4 = lhs_dtype == rhs_dtype and lhs_dtype == tkl.f4e2m1fn
+    node.index = combine_indices(
+        node.index,
+        specialize_index(
+            index,
+            {
+                MMA_LHS: 0,
+                MMA_RHS: 0,
+                MMA_ACC: 1,
+                MMA_LHS_SCALE: 0,
+                MMA_RHS_SCALE: 0,
+                MMA_SCALE_FP4: is_fp4,
+            },
+        )
+    )
+    
     lhs_tuple = (
         get_custom(node.lhs),
         specialize_index(
