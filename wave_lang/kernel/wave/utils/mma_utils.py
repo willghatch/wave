@@ -3,7 +3,6 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-from copy import deepcopy
 from typing import Optional
 
 import torch.fx as fx
@@ -15,7 +14,6 @@ from ...ops.wave_ops import (
     CustomOp,
     MMA,
     MMABase,
-    Permute,
     Reshape,
     ScaledMMA,
     get_custom,
@@ -159,17 +157,13 @@ def get_mma_dimensional_mapping(
     def add_reshape_if_needed(mma: MMABase, prev_mma: MMABase, arg_index: int):
         with mma.graph.inserting_before(mma.fx_node):
             arg = mma.lhs if arg_index == 0 else mma.rhs
-            arg_custom = get_custom(arg)
-            # Check if reshape is needed: compare prev_mma output with next mma input requirements
-            if is_reshape_needed(arg_custom, prev_mma.vector_shapes, mma.vector_shapes):
-                # Create reshape with target_vector_shape = prev_mma.vector_shapes
-                target_vector_shape = deepcopy(prev_mma.vector_shapes)
-                reshape_vector_shapes = deepcopy(mma.vector_shapes)
-                reshape = Reshape(arg, target_vector_shape).add_to_graph(
+            arg = get_custom(arg)
+            if is_reshape_needed(arg, mma.vector_shapes, prev_mma.vector_shapes):
+                reshape = Reshape(arg.fx_node, prev_mma.vector_shapes).add_to_graph(
                     mma.graph, loc=mma.location
                 )
                 custom_reshape = get_custom(reshape)
-                custom_reshape.vector_shapes = reshape_vector_shapes
+                custom_reshape.vector_shapes = mma.vector_shapes
                 propagate_tag(mma.fx_node, reshape)
                 mma.update_arg(arg_index, reshape)
 

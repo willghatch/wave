@@ -972,94 +972,13 @@ def process_permute_barrier(
     # print(f"  input.vector_shapes: {getattr(input_custom, 'vector_shapes', None)}")
     # print(f"  permute target_shape: {permute.target_shape}")
     
-    # Check if this permute needs inter-MMA shuffle
-    inter_mma_metadata = permute.fx_node.meta.get("inter_mma_shuffle", None)
-    if inter_mma_metadata:
-        # print(f"  INTER-MMA SHUFFLE detected:")
-        # print(f"    source_mma_type: {inter_mma_metadata['source_mma_type']}")
-        # print(f"    target_mma_type: {inter_mma_metadata['target_mma_type']}")
-        
-        # Set vector shapes from input
-        if input_custom.vector_shapes:
-            permute.vector_shapes = deepcopy(input_custom.vector_shapes)
-        
-        # Apply the permute transformation (reorder dimensions)
-        # This will swap strides between dimensions
-        transformed_index = permute.transform_index_forward(input_custom.index)
-        
-        # Now apply the inter-MMA shuffle to the transformed index
-        # The shuffle affects the dimension that:
-        # 1. Has size 16 and stride 32 in the MMA output (input to permute)
-        # 2. Becomes a contiguous dimension (stride 1) after permute
-        #
-        # Example: MMA produces [B, K2, M] with M having size 1, stride 1
-        #          and K2 having size 16, stride 32
-        #          After permute to [B, M, K2], the K2 dimension now has stride 1
-        #          This is the dimension that needs shuffling!
-        
-        # Find the dimension that was shuffled
-        # It should have size 16 and stride 32 in input, and stride 1 after permute
-        shuffle_dim = None
-        for dim in permute.target_shape:
-            if dim not in transformed_index:
-                continue
-            idx_seq = transformed_index[dim]
-            # Check if this dimension has the characteristics of needing shuffle:
-            # - size 16 (from MMA output with 4-element groups)
-            # - stride was 32 before permute (non-contiguous)
-            # - stride is now 1 (contiguous after permute)
-            input_idx_for_dim = input_custom.index.get(dim, None)
-            if input_idx_for_dim and input_idx_for_dim.size == 16 and input_idx_for_dim.stride == 32:
-                if idx_seq.stride == 1:
-                    shuffle_dim = dim
-                    break
-        
-        if shuffle_dim:
-            # print(f"    Applying shuffle to dimension: {shuffle_dim}")
-            # print(f"    Before shuffle:")
-            # print(f"      index: {transformed_index[shuffle_dim]}")
-            # print(f"      vector_shape: {permute.vector_shapes[shuffle_dim]}")
-            
-            # Apply the inter-MMA shuffle transformation
-            # The shuffle rearranges data within the vector but doesn't change sizes:
-            # - vector_shapes stays UNCHANGED (represents total dimension size: 32)
-            # - index.size stays UNCHANGED (still 16 elements in the vector)
-            # - index.stride changes to reflect contiguous layout (stride becomes 1)
-            #
-            # The shuffle transforms data from:
-            # - 4 groups of 4 contiguous elements (size=16, stride=32 between groups)
-            # To:
-            # - 2 groups of 8 contiguous elements (size=16, stride=1 contiguous)
-            #
-            # Then reshape will slice this into 8-element pieces during expansion.
-            
-            old_seq = transformed_index[shuffle_dim]
-            # Keep size as 16 (will be sliced by reshape), stride stays 1 (contiguous)
-            # No change needed - the permute already swapped strides to make it contiguous
-            
-            # print(f"    After shuffle:")
-            # print(f"      index: {transformed_index[shuffle_dim]} (size unchanged, will be sliced by reshape)")
-            # print(f"      vector_shape: {permute.vector_shapes[shuffle_dim]} (unchanged)")
-        else:
-            # print(f"    WARNING: Could not find dimension to shuffle!")
-            # print(f"    Input dimensions and their properties:")
-            # for dim, idx_seq in input_custom.index.items():
-            #     print(f"      {dim}: size={idx_seq.size}, stride={idx_seq.stride}")
-            # print(f"    Transformed dimensions and their properties:")
-            # for dim, idx_seq in transformed_index.items():
-            #     print(f"      {dim}: size={idx_seq.size}, stride={idx_seq.stride}")
-            pass
-        
-        permute.index = combine_indices(permute.index, transformed_index)
-    else:
-        # Normal permute without inter-MMA shuffle
-        # Set vector shapes from input
-        if input_custom.vector_shapes:
-            permute.vector_shapes = deepcopy(input_custom.vector_shapes)
-        
-        # Apply forward transformation from input to output
-        transformed_index = permute.transform_index_forward(input_custom.index)
-        permute.index = combine_indices(permute.index, transformed_index)
+    # Set vector shapes from input
+    if input_custom.vector_shapes:
+        permute.vector_shapes = deepcopy(input_custom.vector_shapes)
+    
+    # Apply forward transformation from input to output
+    transformed_index = permute.transform_index_forward(input_custom.index)
+    permute.index = combine_indices(permute.index, transformed_index)
     
     append_aliased_shapes(permute, symbolic_constraints)
     
@@ -1125,15 +1044,11 @@ def process_reshape_barrier(
     # Inherit index from input
     reshape.index = deepcopy(first_input.index)
     
-    # For vector_shapes: if reshape already has vector_shapes set AND it's marked
-    # with inter_mma_shuffle_reshape flag (set by add_reshape_if_needed for inter-MMA
-    # shuffle), keep it. Otherwise, use the vector_shapes that were set by add_reshape_if_needed.
-    # DO NOT overwrite from input or target_vector_shape!
-    if not hasattr(reshape, 'vector_shapes') or reshape.vector_shapes is None:
-        # This shouldn't happen since add_reshape_if_needed always sets it,
-        # but handle it gracefully
-        #print(f"    WARNING: reshape.vector_shapes not set, using input vector_shapes")
+    # Set vector shapes - use input or target_vector_shape if available
+    if first_input.vector_shapes:
         reshape.vector_shapes = deepcopy(first_input.vector_shapes)
+    elif reshape.target_vector_shape:
+        reshape.vector_shapes = reshape.target_vector_shape
     
     append_aliased_shapes(reshape, symbolic_constraints)
     
