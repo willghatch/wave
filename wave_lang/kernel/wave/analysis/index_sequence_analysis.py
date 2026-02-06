@@ -1020,29 +1020,26 @@ def process_permute_barrier(
             print(f"      index: {transformed_index[shuffle_dim]}")
             print(f"      vector_shape: {permute.vector_shapes[shuffle_dim]}")
             
-            # Update the vector shape for shuffled layout
-            # Change from 16-element groups (with stride 32) to 8-element groups (with stride 1 within group)
-            permute.vector_shapes[shuffle_dim] = 8
-            
-            # Update the index sequence to reflect 8-element groups
-            # The inter-MMA shuffle changes:
-            # - size: 16 -> 8 (consecutive elements per thread)
-            # - stride: 1 -> 1 (elements are contiguous within group)
-            # - start: needs to reflect the new grouping pattern
+            # Apply the inter-MMA shuffle transformation
+            # The shuffle rearranges data within the vector but doesn't change sizes:
+            # - vector_shapes stays UNCHANGED (represents total dimension size: 32)
+            # - index.size stays UNCHANGED (still 16 elements in the vector)
+            # - index.stride changes to reflect contiguous layout (stride becomes 1)
             #
-            # The original MMA accumulator layout uses GPR_NUM/4 for grouping
-            # The shuffled layout uses GPR_NUM/2 for grouping
-            # But since the permute has already swapped strides, we just need to update size
+            # The shuffle transforms data from:
+            # - 4 groups of 4 contiguous elements (size=16, stride=32 between groups)
+            # To:
+            # - 2 groups of 8 contiguous elements (size=16, stride=1 contiguous)
+            #
+            # Then reshape will slice this into 8-element pieces during expansion.
+            
             old_seq = transformed_index[shuffle_dim]
-            transformed_index[shuffle_dim] = IndexSequence(
-                old_seq.start,  # Keep the same start formula
-                8,  # 8 consecutive elements (half of 16)
-                old_seq.stride  # Stride stays 1 (contiguous)
-            )
+            # Keep size as 16 (will be sliced by reshape), stride stays 1 (contiguous)
+            # No change needed - the permute already swapped strides to make it contiguous
             
             print(f"    After shuffle:")
-            print(f"      index: {transformed_index[shuffle_dim]}")
-            print(f"      vector_shape: {permute.vector_shapes[shuffle_dim]}")
+            print(f"      index: {transformed_index[shuffle_dim]} (size unchanged, will be sliced by reshape)")
+            print(f"      vector_shape: {permute.vector_shapes[shuffle_dim]} (unchanged)")
         else:
             print(f"    WARNING: Could not find dimension to shuffle!")
             print(f"    Input dimensions and their properties:")

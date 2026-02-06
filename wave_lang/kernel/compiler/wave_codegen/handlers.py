@@ -2350,9 +2350,11 @@ def handle_permute(emitter: WaveEmitter, node: fx.Node):
     if inter_mma_meta is not None:
         threads_per_wave = inter_mma_meta["threads_per_wave"]
         # Apply the shuffle transformation
-        vector_src = IRProxyValue(_apply_chained_mma_shuffle_fix(
-            emitter, cast_vector(emitter, vector_src), threads_per_wave
-        ))
+        # vector_src is already an IRProxyValue, extract the ir_value
+        shuffled_value = _apply_chained_mma_shuffle_fix(
+            emitter, vector_src.ir_value, threads_per_wave
+        )
+        vector_src = IRProxyValue(shuffled_value)
     
     emitter.bind_node_proxy(node, vector_src)
 
