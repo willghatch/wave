@@ -165,58 +165,11 @@ def get_mma_dimensional_mapping(
                 # Create reshape with target_vector_shape = prev_mma.vector_shapes
                 target_vector_shape = deepcopy(prev_mma.vector_shapes)
                 reshape_vector_shapes = deepcopy(mma.vector_shapes)
-                has_inter_mma_shuffle = False
-                
-                # Check if there's inter_mma_shuffle in the backward slice
-                # If so, adjust reshape_vector_shapes for the shuffled dimension
-                # to enable proper slicing
-                backward_slice = list(capture_backward_slice(arg))
-                for node in backward_slice:
-                    custom_node = get_custom(node)
-                    if isinstance(custom_node, Permute):
-                        inter_mma_meta = custom_node.fx_node.meta.get("inter_mma_shuffle", None)
-                        if inter_mma_meta:
-                            has_inter_mma_shuffle = True
-                            # For inter-MMA shuffle (32x32x16 → 32x32x16):
-                            # - The shuffled vector has 16 elements
-                            # - It needs to be sliced into 8-element pieces for next MMA
-                            # - num_partitions = target_vector_shape / reshape_vector_shapes
-                            # - We want num_partitions = 2, so:
-                            #   32 / reshape_vector_shapes[K2] = 2
-                            #   reshape_vector_shapes[K2] = 16
-                            #
-                            # The dimension that needs slicing is the one that will be
-                            # used as K input in the next MMA.
-                            # For lhs (arg_index=0), K is the last dimension
-                            # For rhs (arg_index=1), K is the second-to-last dimension
-                            if arg_index == 0:
-                                # LHS input: K is the last dimension
-                                shuffle_dim = arg_custom.type.symbolic_shape[-1]
-                            else:
-                                # RHS input: K is the second-to-last dimension  
-                                shuffle_dim = arg_custom.type.symbolic_shape[-2]
-                            
-                            # Only apply special slicing if target dimension is 32
-                            # (for 32x32x16 MMA, not 32x32x8)
-                            if (shuffle_dim in reshape_vector_shapes and 
-                                shuffle_dim in target_vector_shape and
-                                target_vector_shape[shuffle_dim] == 32 and
-                                reshape_vector_shapes[shuffle_dim] == 32):
-                                # Set reshape_vector_shapes to half to enable slicing
-                                # num_partitions = 32 / 16 = 2 (slices 16-elem vector into two 8-elem pieces)
-                                reshape_vector_shapes[shuffle_dim] = 16
-                            break
-                
                 reshape = Reshape(arg, target_vector_shape).add_to_graph(
                     mma.graph, loc=mma.location
                 )
                 custom_reshape = get_custom(reshape)
                 custom_reshape.vector_shapes = reshape_vector_shapes
-                
-                # Mark if this is an inter-MMA shuffle reshape
-                if has_inter_mma_shuffle:
-                    reshape.meta["inter_mma_shuffle_reshape"] = True
-                
                 propagate_tag(mma.fx_node, reshape)
                 mma.update_arg(arg_index, reshape)
 
