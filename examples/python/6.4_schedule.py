@@ -172,6 +172,19 @@ def test_attention_manual_schedule(is_debug=False):
         batch, seq_q, num_query_heads, head_size_kv, dtype=torch.float32, device="cuda"
     )
 
+    # q = torch.ones(
+    #     batch, seq_q, num_query_heads, head_size, dtype=torch.float16, device="cuda"
+    # )
+    # k = torch.ones(
+    #     batch, seq_kv, num_kv_heads, head_size, dtype=torch.float16, device="cuda"
+    # )
+    # v = torch.ones(
+    #     batch, seq_kv, num_kv_heads, head_size_kv, dtype=torch.float16, device="cuda"
+    # )
+    # c = torch.zeros(
+    #     batch, seq_q, num_query_heads, head_size_kv, dtype=torch.float32, device="cuda"
+    # )
+
     # Run the kernel
     compiled_attention(q, k, v, c)
 

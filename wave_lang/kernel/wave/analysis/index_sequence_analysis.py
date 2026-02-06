@@ -966,18 +966,18 @@ def process_permute_barrier(
         return False
     
     # Input has index, apply forward transformation
-    print(f"\n=== PERMUTE BARRIER: {permute.fx_node.name} ===")
-    print(f"  input: {permute.arg.name} ({type(input_custom).__name__})")
-    print(f"  input.index: {input_custom.index}")
-    print(f"  input.vector_shapes: {getattr(input_custom, 'vector_shapes', None)}")
-    print(f"  permute target_shape: {permute.target_shape}")
+    # print(f"\n=== PERMUTE BARRIER: {permute.fx_node.name} ===")
+    # print(f"  input: {permute.arg.name} ({type(input_custom).__name__})")
+    # print(f"  input.index: {input_custom.index}")
+    # print(f"  input.vector_shapes: {getattr(input_custom, 'vector_shapes', None)}")
+    # print(f"  permute target_shape: {permute.target_shape}")
     
     # Check if this permute needs inter-MMA shuffle
     inter_mma_metadata = permute.fx_node.meta.get("inter_mma_shuffle", None)
     if inter_mma_metadata:
-        print(f"  INTER-MMA SHUFFLE detected:")
-        print(f"    source_mma_type: {inter_mma_metadata['source_mma_type']}")
-        print(f"    target_mma_type: {inter_mma_metadata['target_mma_type']}")
+        # print(f"  INTER-MMA SHUFFLE detected:")
+        # print(f"    source_mma_type: {inter_mma_metadata['source_mma_type']}")
+        # print(f"    target_mma_type: {inter_mma_metadata['target_mma_type']}")
         
         # Set vector shapes from input
         if input_custom.vector_shapes:
@@ -1015,10 +1015,10 @@ def process_permute_barrier(
                     break
         
         if shuffle_dim:
-            print(f"    Applying shuffle to dimension: {shuffle_dim}")
-            print(f"    Before shuffle:")
-            print(f"      index: {transformed_index[shuffle_dim]}")
-            print(f"      vector_shape: {permute.vector_shapes[shuffle_dim]}")
+            # print(f"    Applying shuffle to dimension: {shuffle_dim}")
+            # print(f"    Before shuffle:")
+            # print(f"      index: {transformed_index[shuffle_dim]}")
+            # print(f"      vector_shape: {permute.vector_shapes[shuffle_dim]}")
             
             # Apply the inter-MMA shuffle transformation
             # The shuffle rearranges data within the vector but doesn't change sizes:
@@ -1037,17 +1037,18 @@ def process_permute_barrier(
             # Keep size as 16 (will be sliced by reshape), stride stays 1 (contiguous)
             # No change needed - the permute already swapped strides to make it contiguous
             
-            print(f"    After shuffle:")
-            print(f"      index: {transformed_index[shuffle_dim]} (size unchanged, will be sliced by reshape)")
-            print(f"      vector_shape: {permute.vector_shapes[shuffle_dim]} (unchanged)")
+            # print(f"    After shuffle:")
+            # print(f"      index: {transformed_index[shuffle_dim]} (size unchanged, will be sliced by reshape)")
+            # print(f"      vector_shape: {permute.vector_shapes[shuffle_dim]} (unchanged)")
         else:
-            print(f"    WARNING: Could not find dimension to shuffle!")
-            print(f"    Input dimensions and their properties:")
-            for dim, idx_seq in input_custom.index.items():
-                print(f"      {dim}: size={idx_seq.size}, stride={idx_seq.stride}")
-            print(f"    Transformed dimensions and their properties:")
-            for dim, idx_seq in transformed_index.items():
-                print(f"      {dim}: size={idx_seq.size}, stride={idx_seq.stride}")
+            # print(f"    WARNING: Could not find dimension to shuffle!")
+            # print(f"    Input dimensions and their properties:")
+            # for dim, idx_seq in input_custom.index.items():
+            #     print(f"      {dim}: size={idx_seq.size}, stride={idx_seq.stride}")
+            # print(f"    Transformed dimensions and their properties:")
+            # for dim, idx_seq in transformed_index.items():
+            #     print(f"      {dim}: size={idx_seq.size}, stride={idx_seq.stride}")
+            pass
         
         permute.index = combine_indices(permute.index, transformed_index)
     else:
@@ -1062,9 +1063,9 @@ def process_permute_barrier(
     
     append_aliased_shapes(permute, symbolic_constraints)
     
-    print(f"  permute.index (final): {permute.index}")
-    print(f"  permute.vector_shapes (final): {permute.vector_shapes}")
-    print(f"=== END PERMUTE BARRIER ===\n")
+    # print(f"  permute.index (final): {permute.index}")
+    # print(f"  permute.vector_shapes (final): {permute.vector_shapes}")
+    # print(f"=== END PERMUTE BARRIER ===\n")
     
     # Add users of permute to sources for continued propagation
     output_index = permute.index
@@ -1112,14 +1113,14 @@ def process_reshape_barrier(
         return False
     
     # All inputs have indices, validate and inherit
-    print(f"\n=== RESHAPE BARRIER: {reshape.fx_node.name} ===")
-    print(f"  target_vector_shape: {reshape.target_vector_shape}")
+    # print(f"\n=== RESHAPE BARRIER: {reshape.fx_node.name} ===")
+    # print(f"  target_vector_shape: {reshape.target_vector_shape}")
     
     # Take index from first input
     first_input = get_custom(args[0])
-    print(f"  input: {args[0].name} ({type(first_input).__name__})")
-    print(f"  input.index: {first_input.index}")
-    print(f"  input.vector_shapes: {getattr(first_input, 'vector_shapes', None)}")
+    # print(f"  input: {args[0].name} ({type(first_input).__name__})")
+    # print(f"  input.index: {first_input.index}")
+    # print(f"  input.vector_shapes: {getattr(first_input, 'vector_shapes', None)}")
     
     # Inherit index from input
     reshape.index = deepcopy(first_input.index)
@@ -1131,14 +1132,14 @@ def process_reshape_barrier(
     if not hasattr(reshape, 'vector_shapes') or reshape.vector_shapes is None:
         # This shouldn't happen since add_reshape_if_needed always sets it,
         # but handle it gracefully
-        print(f"    WARNING: reshape.vector_shapes not set, using input vector_shapes")
+        #print(f"    WARNING: reshape.vector_shapes not set, using input vector_shapes")
         reshape.vector_shapes = deepcopy(first_input.vector_shapes)
     
     append_aliased_shapes(reshape, symbolic_constraints)
     
-    print(f"  reshape.index (final): {reshape.index}")
-    print(f"  reshape.vector_shapes (final): {reshape.vector_shapes}")
-    print(f"=== END RESHAPE BARRIER ===\n")
+    # print(f"  reshape.index (final): {reshape.index}")
+    # print(f"  reshape.vector_shapes (final): {reshape.vector_shapes}")
+    # print(f"=== END RESHAPE BARRIER ===\n")
     
     # Add users of reshape to sources for continued propagation
     output_index = reshape.index
@@ -1197,26 +1198,26 @@ def propagate_indices(
                 
                 # Debug output for key nodes (add, select, mask operations, self_index)
                 if isinstance(source, (BinaryPyOp, SelectOp, SelfIndex)) or (hasattr(source.fx_node, 'name') and 'mask' in source.fx_node.name.lower()):
-                    print(f"\n=== NODE: {type(source).__name__} {source.fx_node.name} ===")
-                    print(f"  index: {source.index}")
-                    print(f"  vector_shapes: {source.vector_shapes}")
-                    if isinstance(source, SelfIndex):
-                        print(f"  self_index.dim: {source.dim}")
-                        print(f"  self_index.dtype: {source.dtype}")
+                    # print(f"\n=== NODE: {type(source).__name__} {source.fx_node.name} ===")
+                    # print(f"  index: {source.index}")
+                    # print(f"  vector_shapes: {source.vector_shapes}")
+                    # if isinstance(source, SelfIndex):
+                    #      print(f"  self_index.dim: {source.dim}")
+                    #      print(f"  self_index.dtype: {source.dtype}")
                     if isinstance(source, BinaryPyOp):
                         lhs_custom = get_custom(source.lhs)
                         rhs_custom = get_custom(source.rhs)
-                        print(f"  lhs: {source.lhs} ({type(lhs_custom).__name__})")
-                        if hasattr(lhs_custom, 'index'):
-                            print(f"    lhs.index: {lhs_custom.index}")
-                        print(f"  rhs: {source.rhs} ({type(rhs_custom).__name__})")
-                        if hasattr(rhs_custom, 'index'):
-                            print(f"    rhs.index: {rhs_custom.index}")
-                    if isinstance(source, SelectOp):
-                        print(f"  cond: {source.cond} ({type(get_custom(source.cond)).__name__})")
-                        if hasattr(get_custom(source.cond), 'index'):
-                            print(f"    cond.index: {get_custom(source.cond).index}")
-                    print(f"=== END NODE ===\n")
+                    #     print(f"  lhs: {source.lhs} ({type(lhs_custom).__name__})")
+                    #     if hasattr(lhs_custom, 'index'):
+                    #         print(f"    lhs.index: {lhs_custom.index}")
+                    #     print(f"  rhs: {source.rhs} ({type(rhs_custom).__name__})")
+                    #     if hasattr(rhs_custom, 'index'):
+                    #         print(f"    rhs.index: {rhs_custom.index}")
+                    # if isinstance(source, SelectOp):
+                    #     print(f"  cond: {source.cond} ({type(get_custom(source.cond)).__name__})")
+                    #     if hasattr(get_custom(source.cond), 'index'):
+                    #         print(f"    cond.index: {get_custom(source.cond).index}")
+                    # print(f"=== END NODE ===\n")
             visited.add(source)
             for func in [get_inputs, get_users]:
                 sources = add_nodes_to_sources(

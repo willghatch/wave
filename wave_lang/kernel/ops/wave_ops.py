@@ -3219,6 +3219,8 @@ class Permute(CustomOp, ABC):
             self.vector_shapes is not None
         ), "`vector_shapes` must be set before calling this function"
 
+        # TODO - when feeding from an MMA that has 32x32xK layout to another MMA that is F32_32x32x16_F16, IE when marked for shuffling, must use the inter_mma_shuffle_index_offset and inter_mma_shuffle_index_size and inter_mma_shuffle_index_stride
+
         custom_src = get_custom(self.arg)
         src_shape = custom_src.type.symbolic_shape
         src_to_target = {

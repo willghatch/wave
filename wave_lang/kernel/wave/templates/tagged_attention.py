@@ -21,6 +21,7 @@ import wave_lang.kernel.lang as tkl
 import wave_lang.kernel.wave as tkw
 from wave_lang.kernel.lang.global_symbols import *
 from wave_lang.kernel.wave.constraints import MMAType
+from wave_lang.debugging.html_viewer import html_viewer
 
 from .attention_common import AttentionShape
 
@@ -160,15 +161,21 @@ def get_tagged_bshd_attention_kernel(
             q_reg = tkw.tag(q_reg * qkv_scaling, "softmax0_scale")
             k_reg = tkw.read(k, mapping=k_mapping, tag="read_k")
             inner_acc = tkw.mma(k_reg, q_reg, imm_reg, mfma_variant[0], tag="mma_qk")
+            tkw.debug_log(inner_acc, label="firstmma")
             x_j = tkw.permute(
                 inner_acc, target_shape=[B, H, N_Q, N_KV], tag="softmax0_permute"
             )
+            # this debug log crashes it...
+            #tkw.debug_log(x_j, label="permuted")
 
             # Masking
             n_kv_index = tkw.self_index(N_KV, tkl.i32, tag="softmax0_self_index_kv")
+            tkw.debug_log(n_kv_index, label="selfindex")
             mask = tkw.apply_expr(
                 n_kv_index, lambda x: x < N_KV, tag="softmax0_apply_expr"
             )
+            # this debug log doesn't work
+            #tkw.debug_log(mask, label="mask")
             mask = tkw.broadcast(
                 mask, target_shape=[N_Q, N_KV], tag="softmax0_broadcast_mask"
             )
@@ -182,6 +189,8 @@ def get_tagged_bshd_attention_kernel(
             mask = tkw.cast(mask, tkw.i1, tag="softmax0_cast_mask")
             bias = tkw.select(mask, ZEROF, MIN_INF, tag="softmax0_select_bias")
             x_j = tkw.tag(x_j + bias, "softmax0_add_bias")
+            # this debug log crashes it, write to read-only page
+            #tkw.debug_log(x_j, label="biased")
 
             # Softmax0: ops before last sub
             m_j = tkw.max(x_j, partial_max, dim=N_KV, tag="softmax0_max")
@@ -204,6 +213,7 @@ def get_tagged_bshd_attention_kernel(
         res_max, res_sum, res_mm = repeat
         reciprocal_sum = tkw.reciprocal(res_sum, tag="epilog_reciprocal")
         res = tkw.tag(res_mm * reciprocal_sum, "epilog_normalize")
+        tkw.debug_log(res, label="result")
         tkw.write(res, c, mapping=output_mapping, tag="write_output")
 
     # BLOCK_N_Q scales with num_waves: BASE_BLOCK_N_Q elements per WAVES_PER_BLOCK_FACTOR waves
