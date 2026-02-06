@@ -405,7 +405,7 @@ def emit_wmma(
 
 def _apply_chained_mma_shuffle_fix(
     emitter: WaveEmitter, vector: Value, threads_per_wave: int
-) -> Value:
+) -> list[Value]:
     """
     Apply the shuffle fix for chained MMA where a 32x32 accumulator feeds
     into a 32x32x16 MMA input.
@@ -418,6 +418,8 @@ def _apply_chained_mma_shuffle_fix(
     so that:
     - Lanes 0-31 get: [0,1,2,3,4,5,6,7], [16,17,18,19,20,21,22,23]
     - Lanes 32-63 get: [8,9,10,11,12,13,14,15], [24,25,26,27,28,29,30,31]
+    
+    Returns a list of two 8-element vectors representing the two shuffled groups.
     """
     vector_type = vector.type
     element_type = vector_type.element_type
@@ -425,7 +427,8 @@ def _apply_chained_mma_shuffle_fix(
 
     # Should be 16 elements for 32x32 accumulator
     if num_elements != 16:
-        return vector
+        print(f"WARNING - giving up on chained MMA shuffle fix, num_elements {num_elements} != 16")
+        return [vector]
 
     i32_type = IntegerType.get_signless(32)
     offset_32 = arith_d.constant(i32_type, 32)
@@ -589,7 +592,26 @@ def _apply_chained_mma_shuffle_fix(
         # Insert selected element into result
         result = vector_d.insert(selected, result, static_position=[i], dynamic_position=[])
 
-    return result
+    # After shuffling, split the 16-element vector into two 8-element vectors
+    # result[0:7] = [0,1,2,3,4,5,6,7] or [8,9,10,11,12,13,14,15] depending on lane
+    # result[8:15] = [16,17,18,19,20,21,22,23] or [24,25,26,27,28,29,30,31] depending on lane
+    vector_8_type = VectorType.get([8], element_type)
+    first_8 = vector_d.extract_strided_slice(
+        vector_8_type,
+        result,
+        [0],
+        [8],
+        [1]
+    )
+    second_8 = vector_d.extract_strided_slice(
+        vector_8_type,
+        result,
+        [8],
+        [8],
+        [1]
+    )
+
+    return [first_8, second_8]
 
 
 @handle_op(mma)
@@ -2351,12 +2373,41 @@ def handle_permute(emitter: WaveEmitter, node: fx.Node):
         threads_per_wave = inter_mma_meta["threads_per_wave"]
         # Apply the shuffle transformation
         # vector_src is already an IRProxyValue, extract the ir_value
-        shuffled_value = _apply_chained_mma_shuffle_fix(
+        shuffled_values = _apply_chained_mma_shuffle_fix(
             emitter, vector_src.ir_value, threads_per_wave
         )
-        vector_src = IRProxyValue(shuffled_value)
-    
-    emitter.bind_node_proxy(node, vector_src)
+        # shuffled_values is a list of Values (two 8-element vectors)
+        # If this is an expanded node, use expanded_dims to select which value to bind
+        custom = get_custom(node)
+        if custom.expanded_dims is not None:
+            # Find the dimension that was shuffled (should have the inter_mma_shuffle metadata)
+            # For now, assume it's the last dimension in the permute target_shape
+            # that has a non-zero expansion
+            shuffled_dim = None
+            for dim in custom.target_shape:
+                if dim in custom.expanded_dims and custom.expanded_dims[dim] >= 0:
+                    # Check if this dimension was affected by the shuffle
+                    # (it should be the dimension with size 8 in the index)
+                    if dim in custom.index and custom.index[dim].size == 8:
+                        shuffled_dim = dim
+                        break
+            
+            if shuffled_dim is not None:
+                # Use the expansion index to select the appropriate vector
+                expansion_idx = custom.expanded_dims[shuffled_dim]
+                if expansion_idx < len(shuffled_values):
+                    emitter.bind_node_proxy(node, IRProxyValue(shuffled_values[expansion_idx]))
+                else:
+                    # Fallback: bind the last value
+                    emitter.bind_node_proxy(node, IRProxyValue(shuffled_values[-1]))
+            else:
+                # No shuffled dimension found, bind the first value
+                emitter.bind_node_proxy(node, IRProxyValue(shuffled_values[0]))
+        else:
+            # Not expanded yet, bind all values
+            emitter.bind_node_proxies(node, [IRProxyValue(v) for v in shuffled_values])
+    else:
+        emitter.bind_node_proxy(node, vector_src)
 
 
 @handle_op(reshape)
