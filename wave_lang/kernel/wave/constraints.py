@@ -321,9 +321,10 @@ class HardwareConstraint(Constraint):
                 | MMAType.I32_32x32x16_I8
             ):
                 # Shuffled layout with 8-element consecutive groups
-                # Based on ACC=true equation but using GPR_NUM/2 instead of GPR_NUM/4
+                # Based on ACC=true equation but using GPR_NUM/8 instead of GPR_NUM/4
                 offset = [
-                    (8 * floor(GPR_NUM / 2) % 32) + 4 * floor(lane / 32) + (GPR_NUM % 2),  # M
+                    #(8 * floor(GPR_NUM / 2) % 32) + 4 * floor(lane / 32) + (GPR_NUM % 2),  # M
+                    (8 * floor(GPR_NUM / 8) % 32) + 4 * floor(lane / 32) + (GPR_NUM % 8) , #M
                     lane % 32,  # N
                     8 * floor(lane / 32),  # K
                 ]
