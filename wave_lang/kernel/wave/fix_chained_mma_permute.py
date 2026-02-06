@@ -16,8 +16,10 @@ After permute [K2, M] -> [M, K2], these M positions become K positions for the
 second MMA. The 32x32x16 MMA requires 8 consecutive K values as input, but the
 layout only provides 4 consecutive values at a time.
 
-This pass marks nodes that need a shuffle fix, which is then handled during
-code generation in the Reshape handler.
+This pass marks permute nodes that need an inter-MMA shuffle. The shuffle is
+applied during index propagation in index_sequence_analysis, which allows
+downstream operations (like add, select for masks) to see the correct shuffled
+indices and vector shapes.
 """
 
 import torch.fx as fx
@@ -25,6 +27,7 @@ import torch.fx as fx
 from .._support.tracing import CapturedTrace
 from ..ops.wave_ops import (
     MMA,
+    Permute,
     get_custom,
 )
 from .constraints import Constraint, HardwareConstraint, MMAType
@@ -71,6 +74,33 @@ def get_source_mma(node: fx.Node) -> MMA | None:
     return None
 
 
+def find_permute_between_mmas(source_mma_node: fx.Node, target_mma: MMA) -> Permute | None:
+    """
+    Find a permute node in the data flow path from source MMA to target MMA.
+    
+    This searches forward from the source MMA through the backward slice of
+    the target MMA's input. Returns the first Permute node found, or None.
+    """
+    # Get the input node to the target MMA that we're checking
+    # This should be either lhs or rhs
+    target_input = None
+    if target_mma.lhs == source_mma_node or get_source_mma(target_mma.lhs) is not None:
+        target_input = target_mma.lhs
+    elif target_mma.rhs == source_mma_node or get_source_mma(target_mma.rhs) is not None:
+        target_input = target_mma.rhs
+    else:
+        return None
+    
+    # Search backward from target input to find permute
+    backward_slice = list(capture_backward_slice(target_input))
+    for node in backward_slice:
+        custom = get_custom(node)
+        if isinstance(custom, Permute):
+            return custom
+    
+    return None
+
+
 def needs_shuffle_fix(
     source_mma: MMA,
     target_mma: MMA,
@@ -89,26 +119,30 @@ def needs_shuffle_fix(
     return source_type in MMA_32x32_TYPES and target_type in MMA_NEEDS_8_CONSECUTIVE
 
 
-def mark_node_for_shuffle_fix(node: fx.Node, hardware_constraint: HardwareConstraint):
+def mark_permute_for_inter_mma_shuffle(
+    permute: Permute, 
+    source_mma: MMA,
+    target_mma: MMA,
+    hardware_constraint: HardwareConstraint
+):
     """
-    Mark a node as needing the chained MMA shuffle fix.
-    The actual fix is applied during code generation.
+    Mark a permute node as needing inter-MMA shuffle transformation.
     
-    Also updates the index to reflect the shuffled layout:
-    - Before shuffle: 4-element groups with expression like Mod($GPR_NUM, 4) + 8*(Mod(floor($GPR_NUM/4), 4))
-    - After shuffle: 8-element groups with expression like 8*floor(Mod($T0, 64)/32) + Mod($GPR_NUM, 8)
+    This metadata will be checked during index_sequence_analysis, where the
+    permute's transform_index_forward will use the inter_mma_shuffle layout
+    instead of the standard MMA output layout.
     
-    Note: The full expression also includes 16*floor($GPR_NUM/8) for the second 8-element group,
-    but that's handled during expansion when we know which partition is being extracted.
+    Args:
+        permute: The Permute node between two MMAs
+        source_mma: The MMA producing the data
+        target_mma: The MMA consuming the data
+        hardware_constraint: Hardware configuration
     """
-    node.meta["chained_mma_shuffle_fix"] = {
+    permute.fx_node.meta["inter_mma_shuffle"] = {
+        "source_mma_type": source_mma.mma_type or hardware_constraint.mma_type,
+        "target_mma_type": target_mma.mma_type or hardware_constraint.mma_type,
         "threads_per_wave": hardware_constraint.threads_per_wave,
     }
-    
-    # Update the index of this node and its users (like reshape) to reflect the shuffled layout
-    # This needs to happen after indices are set but before expansion
-    # We'll do this in a separate pass that runs after set_node_indices
-    node.meta["shuffle_fix_index_update_needed"] = True
 
 
 def fix_chained_mma_permute(
@@ -121,13 +155,15 @@ def fix_chained_mma_permute(
 
     This pass detects any data flow from one MMA to another (including through
     loop-carried variables, conditionals, and arbitrary operation chains) and
-    marks the input node for shuffle fix when needed.
+    marks permute nodes for inter-MMA shuffle when needed.
 
     The shuffle fix is required when:
     - Source MMA has 32x32 accumulator layout (4-consecutive element groups)
     - Target MMA requires 8 consecutive K elements as input
+    - A permute operation exists between them
 
-    The actual fix is applied during code generation in the Reshape handler.
+    The actual transformation is applied during index_sequence_analysis when
+    propagating indices through the marked permute node.
     """
     # Get hardware constraint
     hardware_constraint = None
@@ -144,7 +180,7 @@ def fix_chained_mma_permute(
     if not mma_nodes:
         return
 
-    # Check each MMA to see if its inputs come from a problematic permute chain
+    # Check each MMA to see if its inputs come from another MMA through a permute
     for mma_node in mma_nodes:
         mma_custom = get_custom(mma_node)
 
@@ -152,10 +188,20 @@ def fix_chained_mma_permute(
         source_mma = get_source_mma(mma_custom.lhs)
         if source_mma is not None:
             if needs_shuffle_fix(source_mma, mma_custom, hardware_constraint):
-                mark_node_for_shuffle_fix(mma_custom.lhs, hardware_constraint)
+                # Find the permute node between them
+                permute = find_permute_between_mmas(source_mma.fx_node, mma_custom)
+                if permute is not None:
+                    mark_permute_for_inter_mma_shuffle(
+                        permute, source_mma, mma_custom, hardware_constraint
+                    )
 
         # Check RHS input
         source_mma = get_source_mma(mma_custom.rhs)
         if source_mma is not None:
             if needs_shuffle_fix(source_mma, mma_custom, hardware_constraint):
-                mark_node_for_shuffle_fix(mma_custom.rhs, hardware_constraint)
+                # Find the permute node between them
+                permute = find_permute_between_mmas(source_mma.fx_node, mma_custom)
+                if permute is not None:
+                    mark_permute_for_inter_mma_shuffle(
+                        permute, source_mma, mma_custom, hardware_constraint
+                    )

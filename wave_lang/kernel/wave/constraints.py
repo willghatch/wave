@@ -299,6 +299,97 @@ class HardwareConstraint(Constraint):
             case _:
                 raise ValueError(f"Unsupported MMA type: {mma_type}")
 
+    def inter_mma_shuffle_index_offset(self, mma_type: Optional[MMAType | ScaledMMAType]):
+        """
+        Index offset for inter-MMA shuffle (when MMA output is used as MMA input).
+        
+        This represents the shuffled layout where data is reorganized from
+        4-element consecutive groups to 8-element consecutive groups.
+        Only applies to ACC=true (accumulator/output) indices.
+        """
+        lane = self.linearized_thread_id % self.threads_per_wave
+        if mma_type is None:
+            mma_type = self.mma_type
+
+        match mma_type:
+            case (
+                MMAType.F32_32x32x16_F8
+                | MMAType.F32_32x32x16_BF16
+                | MMAType.F32_32x32x16_F16
+                | MMAType.F32_32x32x16_K8_F16
+                | MMAType.F32_32x32x16_K4_F8
+                | MMAType.I32_32x32x16_I8
+            ):
+                # Shuffled layout with 8-element consecutive groups
+                # Based on ACC=true equation but using GPR_NUM/2 instead of GPR_NUM/4
+                offset = [
+                    (8 * floor(GPR_NUM / 2) % 32) + 4 * floor(lane / 32) + (GPR_NUM % 2),  # M
+                    lane % 32,  # N
+                    8 * floor(lane / 32),  # K
+                ]
+            case _:
+                raise ValueError(f"Inter-MMA shuffle not defined for MMA type: {mma_type}")
+        
+        return offset
+
+    def inter_mma_shuffle_index_size(self, mma_type: Optional[MMAType | ScaledMMAType]):
+        """
+        Index size (vector shape) for inter-MMA shuffle layout.
+        
+        This represents the shuffled vector shape where data is reorganized from
+        4-element consecutive groups to 8-element consecutive groups.
+        Only applies to ACC=true indices.
+        """
+        if mma_type is None:
+            mma_type = self.mma_type
+
+        match mma_type:
+            case (
+                MMAType.F32_32x32x16_F8
+                | MMAType.F32_32x32x16_BF16
+                | MMAType.F32_32x32x16_F16
+                | MMAType.F32_32x32x16_K8_F16
+                | MMAType.F32_32x32x16_K4_F8
+                | MMAType.I32_32x32x16_I8
+            ):
+                # Vector shape with 8-element groups (for shuffled layout)
+                size = [
+                    8,  # M (8 consecutive elements instead of 16 with stride 32)
+                    1,  # N
+                    8,  # K
+                ]
+            case _:
+                raise ValueError(f"Inter-MMA shuffle not defined for MMA type: {mma_type}")
+        
+        return size
+
+    def inter_mma_shuffle_index_stride(self, mma_type: Optional[MMAType | ScaledMMAType]):
+        """
+        Index stride for inter-MMA shuffle layout.
+        """
+        if mma_type is None:
+            mma_type = self.mma_type
+
+        match mma_type:
+            case (
+                MMAType.F32_32x32x16_F8
+                | MMAType.F32_32x32x16_BF16
+                | MMAType.F32_32x32x16_F16
+                | MMAType.F32_32x32x16_K8_F16
+                | MMAType.F32_32x32x16_K4_F8
+                | MMAType.I32_32x32x16_I8
+            ):
+                # Stride for shuffled layout with 8-element groups
+                stride = [
+                    32,  # M (stride across groups)
+                    1,   # N
+                    1,   # K
+                ]
+            case _:
+                raise ValueError(f"Inter-MMA shuffle not defined for MMA type: {mma_type}")
+        
+        return stride
+
     def mma_index_offset(self, mma_type: Optional[MMAType | ScaledMMAType]):
         lane = self.linearized_thread_id % self.threads_per_wave
         if mma_type is None:

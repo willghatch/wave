@@ -931,9 +931,9 @@ def process_barrier(
     For Reshape: Validates that indices exist on both input and output sides
     """
     if isinstance(barrier, Permute):
-        return process_permute_barrier(barrier, visited, sources, symbolic_constraints)
+        return process_permute_barrier(barrier, visited, sources, symbolic_constraints, new_barriers)
     elif isinstance(barrier, Reshape):
-        return process_reshape_barrier(barrier, visited, sources, symbolic_constraints)
+        return process_reshape_barrier(barrier, visited, sources, symbolic_constraints, new_barriers)
     else:
         raise NotImplementedError(f"Barrier type {type(barrier).__name__} not implemented")
 
@@ -943,12 +943,18 @@ def process_permute_barrier(
     visited: set[CustomOp],
     sources: list[tuple[CustomOp, dict[IndexSymbol, IndexSequence], dict[IndexSymbol, int]]],
     symbolic_constraints: list[SymbolicAlias],
+    new_barriers: list[CustomOp],
 ) -> bool:
     """
     Process a Permute barrier by applying forward transformation.
     
     Permute should transform from input layout to output layout.
     We need the input node to have an index already.
+    
+    If the permute has inter_mma_shuffle metadata, it uses the inter-MMA shuffle
+    layout instead of the standard MMA output layout. This allows the permute
+    to handle the 4→8 element regrouping inline, so downstream operations see
+    the correct shuffled indices.
     
     MMA symbol concretization happens during normal propagation (in add_nodes_to_sources),
     so the input index should already have concrete values if it came from an MMA.
@@ -966,16 +972,97 @@ def process_permute_barrier(
     print(f"  input.vector_shapes: {getattr(input_custom, 'vector_shapes', None)}")
     print(f"  permute target_shape: {permute.target_shape}")
     
-    # Set vector shapes from input
-    if input_custom.vector_shapes:
-        permute.vector_shapes = deepcopy(input_custom.vector_shapes)
+    # Check if this permute needs inter-MMA shuffle
+    inter_mma_metadata = permute.fx_node.meta.get("inter_mma_shuffle", None)
+    if inter_mma_metadata:
+        print(f"  INTER-MMA SHUFFLE detected:")
+        print(f"    source_mma_type: {inter_mma_metadata['source_mma_type']}")
+        print(f"    target_mma_type: {inter_mma_metadata['target_mma_type']}")
+        
+        # Set vector shapes from input
+        if input_custom.vector_shapes:
+            permute.vector_shapes = deepcopy(input_custom.vector_shapes)
+        
+        # Apply the permute transformation (reorder dimensions)
+        # This will swap strides between dimensions
+        transformed_index = permute.transform_index_forward(input_custom.index)
+        
+        # Now apply the inter-MMA shuffle to the transformed index
+        # The shuffle affects the dimension that:
+        # 1. Has size 16 and stride 32 in the MMA output (input to permute)
+        # 2. Becomes a contiguous dimension (stride 1) after permute
+        #
+        # Example: MMA produces [B, K2, M] with M having size 1, stride 1
+        #          and K2 having size 16, stride 32
+        #          After permute to [B, M, K2], the K2 dimension now has stride 1
+        #          This is the dimension that needs shuffling!
+        
+        # Find the dimension that was shuffled
+        # It should have size 16 and stride 32 in input, and stride 1 after permute
+        shuffle_dim = None
+        for dim in permute.target_shape:
+            if dim not in transformed_index:
+                continue
+            idx_seq = transformed_index[dim]
+            # Check if this dimension has the characteristics of needing shuffle:
+            # - size 16 (from MMA output with 4-element groups)
+            # - stride was 32 before permute (non-contiguous)
+            # - stride is now 1 (contiguous after permute)
+            input_idx_for_dim = input_custom.index.get(dim, None)
+            if input_idx_for_dim and input_idx_for_dim.size == 16 and input_idx_for_dim.stride == 32:
+                if idx_seq.stride == 1:
+                    shuffle_dim = dim
+                    break
+        
+        if shuffle_dim:
+            print(f"    Applying shuffle to dimension: {shuffle_dim}")
+            print(f"    Before shuffle:")
+            print(f"      index: {transformed_index[shuffle_dim]}")
+            print(f"      vector_shape: {permute.vector_shapes[shuffle_dim]}")
+            
+            # Update the vector shape for shuffled layout
+            # Change from 16-element groups (with stride 32) to 8-element groups (with stride 1 within group)
+            permute.vector_shapes[shuffle_dim] = 8
+            
+            # Update the index sequence to reflect 8-element groups
+            # The inter-MMA shuffle changes:
+            # - size: 16 -> 8 (consecutive elements per thread)
+            # - stride: 1 -> 1 (elements are contiguous within group)
+            # - start: needs to reflect the new grouping pattern
+            #
+            # The original MMA accumulator layout uses GPR_NUM/4 for grouping
+            # The shuffled layout uses GPR_NUM/2 for grouping
+            # But since the permute has already swapped strides, we just need to update size
+            old_seq = transformed_index[shuffle_dim]
+            transformed_index[shuffle_dim] = IndexSequence(
+                old_seq.start,  # Keep the same start formula
+                8,  # 8 consecutive elements (half of 16)
+                old_seq.stride  # Stride stays 1 (contiguous)
+            )
+            
+            print(f"    After shuffle:")
+            print(f"      index: {transformed_index[shuffle_dim]}")
+            print(f"      vector_shape: {permute.vector_shapes[shuffle_dim]}")
+        else:
+            print(f"    WARNING: Could not find dimension to shuffle!")
+            print(f"    Input dimensions and their properties:")
+            for dim, idx_seq in input_custom.index.items():
+                print(f"      {dim}: size={idx_seq.size}, stride={idx_seq.stride}")
+            print(f"    Transformed dimensions and their properties:")
+            for dim, idx_seq in transformed_index.items():
+                print(f"      {dim}: size={idx_seq.size}, stride={idx_seq.stride}")
+        
+        permute.index = combine_indices(permute.index, transformed_index)
+    else:
+        # Normal permute without inter-MMA shuffle
+        # Set vector shapes from input
+        if input_custom.vector_shapes:
+            permute.vector_shapes = deepcopy(input_custom.vector_shapes)
+        
+        # Apply forward transformation from input to output
+        transformed_index = permute.transform_index_forward(input_custom.index)
+        permute.index = combine_indices(permute.index, transformed_index)
     
-    # Apply forward transformation from input to output
-    transformed_index = permute.transform_index_forward(input_custom.index)
-    print(f"  transformed_index: {transformed_index}")
-    
-    # Set the permute's index
-    permute.index = combine_indices(permute.index, transformed_index)
     append_aliased_shapes(permute, symbolic_constraints)
     
     print(f"  permute.index (final): {permute.index}")
@@ -1005,6 +1092,7 @@ def process_reshape_barrier(
     visited: set[CustomOp],
     sources: list[tuple[CustomOp, dict[IndexSymbol, IndexSequence], dict[IndexSymbol, int]]],
     symbolic_constraints: list[SymbolicAlias],
+    new_barriers: list[CustomOp],
 ) -> bool:
     """
     Process a Reshape barrier by validating indices on both sides.

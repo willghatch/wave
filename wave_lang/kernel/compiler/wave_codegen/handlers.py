@@ -2341,7 +2341,19 @@ def handle_permute(emitter: WaveEmitter, node: fx.Node):
         register, _ = node.args
     except ValueError as e:
         raise ValidationError("Malformed arguments") from e
+    
     vector_src = cast_py_value(emitter, register)
+    
+    # Check if this permute node needs inter-MMA shuffle
+    inter_mma_meta = node.meta.get("inter_mma_shuffle")
+    
+    if inter_mma_meta is not None:
+        threads_per_wave = inter_mma_meta["threads_per_wave"]
+        # Apply the shuffle transformation
+        vector_src = IRProxyValue(_apply_chained_mma_shuffle_fix(
+            emitter, cast_vector(emitter, vector_src), threads_per_wave
+        ))
+    
     emitter.bind_node_proxy(node, vector_src)
 
 
@@ -2390,9 +2402,6 @@ def handle_reshape(emitter: WaveEmitter, node: fx.Node):
         emitter.bind_node_proxy(node, IRProxyValue(concatenated))
         return
 
-    # Check if this reshape node needs the chained MMA shuffle fix
-    shuffle_fix_meta = node.meta.get("chained_mma_shuffle_fix")
-
     # Extract the appropriate slice. The offset is obtained from the expanded_dim
     # and so corresponds to the dim_query during expansion. To obtain the
     # actual offset, we need to multiply by the size. The size is obtained by
@@ -2404,11 +2413,6 @@ def handle_reshape(emitter: WaveEmitter, node: fx.Node):
         target_vector_shapes[innermost_dim] // custom.vector_shapes[innermost_dim]
     )
     vector = cast_vector(emitter, args[0])
-
-    # Apply shuffle fix if needed
-    if shuffle_fix_meta is not None:
-        threads_per_wave = shuffle_fix_meta["threads_per_wave"]
-        vector = _apply_chained_mma_shuffle_fix(emitter, vector, threads_per_wave)
 
     size = vector.type.shape[0] // num_partitions
     result_type = VectorType.get([size], vector.type.element_type)
