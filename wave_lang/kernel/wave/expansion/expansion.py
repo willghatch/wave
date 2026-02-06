@@ -27,6 +27,7 @@ from ...ops.wave_ops import (
     MMA,
     MMABase,
     Output,
+    Permute,
     Placeholder,
     ReduceOp,
     TopkOp,
@@ -369,8 +370,9 @@ def update_users(
     for user in users:
         user = get_custom(user)
         dim_query = metadata.dim_query
-        # For reshapes and reduces, multiple users can share the same source.
-        if isinstance(user, (Reshape, ReduceOp, TopkOp)):
+        # For reshapes, reduces, and inter-MMA shuffle permutes,
+        # multiple users can share the same source.
+        if isinstance(user, (Reshape, ReduceOp, TopkOp)) or _is_inter_mma_shuffle_permute(user):
             if not metadata.source_dim_query:
                 continue
             dim_query = metadata.source_dim_query
@@ -461,6 +463,43 @@ def add_get_results(trace: CapturedTrace):
                         node.meta["lifted"] = get_result.fx_node
 
 
+def _is_inter_mma_shuffle_permute(node: CustomOp) -> bool:
+    """Check if a node is a Permute with inter_mma_shuffle metadata."""
+    return (
+        isinstance(node, Permute)
+        and node.fx_node.meta.get("inter_mma_shuffle") is not None
+    )
+
+
+def _get_shuffled_dim(permute: Permute) -> IndexSymbol | None:
+    """
+    Identify the dimension that is shuffled in an inter-MMA shuffle permute.
+
+    This is the MMA_M dimension from the source MMA's accumulator layout.
+    In the source shape (e.g., [B, K2, M]), this is the first non-batch
+    dimension (K2). After the permute to [B, M, K2], it moves to a later
+    position. The expansion along this dimension should be absorbed by
+    the permute (extracting different slices from the shuffled result)
+    rather than propagated backward to duplicate the source MMA.
+    """
+    if permute.vector_shapes is None:
+        return None
+
+    # Get the source shape from the permute's input
+    src_custom = get_custom(permute.arg)
+    if not hasattr(src_custom, 'type') or not hasattr(src_custom.type, 'symbolic_shape'):
+        return None
+    src_shape = src_custom.type.symbolic_shape
+
+    # The MMA_M dimension is the first non-batch dimension in the source shape.
+    # "Non-batch" means vector_shapes > 1 (batch dims have vector_shapes = 0 or 1).
+    for dim in src_shape:
+        vs = permute.vector_shapes.get(dim, 0)
+        if vs > 1:
+            return dim
+    return None
+
+
 def populate_inputs(
     node: CustomOp,
     inputs: list[fx.Node],
@@ -513,6 +552,19 @@ def populate_inputs(
                 count += 1
         nodes_to_expand.extend(new_nodes_to_expand)
         return nodes_to_expand
+
+    # Handle Permute with inter_mma_shuffle: the shuffled dimension's expansion
+    # should be absorbed by the permute, not propagated to inputs.
+    # All expanded copies of the permute reference the same (unexpanded) input.
+    if _is_inter_mma_shuffle_permute(node):
+        shuffled_dim = _get_shuffled_dim(node)
+        if shuffled_dim is not None and shuffled_dim in metadata.dim_query:
+            # Pin the shuffled dimension to 0 so all expanded permute copies
+            # reference the same input, then fall through to the normal
+            # input expansion logic (which handles MMA reduction dims, etc.)
+            metadata = deepcopy(metadata)
+            metadata.source_dim_query = deepcopy(metadata.dim_query)
+            metadata.dim_query[shuffled_dim] = 0
 
     for arg in expandable_args:
         match arg:
