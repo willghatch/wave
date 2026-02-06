@@ -1126,19 +1126,13 @@ def process_reshape_barrier(
     
     # For vector_shapes: if reshape already has vector_shapes set AND it's marked
     # with inter_mma_shuffle_reshape flag (set by add_reshape_if_needed for inter-MMA
-    # shuffle), keep it. Otherwise, inherit from input and update with target_vector_shape.
-    has_inter_mma_shuffle = reshape.fx_node.meta.get("inter_mma_shuffle_reshape", False)
-    if has_inter_mma_shuffle and hasattr(reshape, 'vector_shapes') and reshape.vector_shapes is not None:
-        # Keep the explicitly set vector_shapes for inter-MMA shuffle
-        pass
-    else:
-        # Normal reshape: inherit from input and update with target_vector_shape
+    # shuffle), keep it. Otherwise, use the vector_shapes that were set by add_reshape_if_needed.
+    # DO NOT overwrite from input or target_vector_shape!
+    if not hasattr(reshape, 'vector_shapes') or reshape.vector_shapes is None:
+        # This shouldn't happen since add_reshape_if_needed always sets it,
+        # but handle it gracefully
+        print(f"    WARNING: reshape.vector_shapes not set, using input vector_shapes")
         reshape.vector_shapes = deepcopy(first_input.vector_shapes)
-        
-        # Update vector shapes based on target_vector_shape
-        for dim, size in reshape.target_vector_shape.items():
-            if dim in reshape.vector_shapes:
-                reshape.vector_shapes[dim] = size
     
     append_aliased_shapes(reshape, symbolic_constraints)
     

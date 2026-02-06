@@ -160,7 +160,8 @@ def get_mma_dimensional_mapping(
         with mma.graph.inserting_before(mma.fx_node):
             arg = mma.lhs if arg_index == 0 else mma.rhs
             arg_custom = get_custom(arg)
-            if is_reshape_needed(arg_custom, mma.vector_shapes, prev_mma.vector_shapes):
+            # Check if reshape is needed: compare prev_mma output with next mma input requirements
+            if is_reshape_needed(arg_custom, prev_mma.vector_shapes, mma.vector_shapes):
                 # Create reshape with target_vector_shape = prev_mma.vector_shapes
                 target_vector_shape = deepcopy(prev_mma.vector_shapes)
                 reshape_vector_shapes = deepcopy(mma.vector_shapes)
@@ -176,7 +177,7 @@ def get_mma_dimensional_mapping(
                         inter_mma_meta = custom_node.fx_node.meta.get("inter_mma_shuffle", None)
                         if inter_mma_meta:
                             has_inter_mma_shuffle = True
-                            # For inter-MMA shuffle:
+                            # For inter-MMA shuffle (32x32x16 → 32x32x16):
                             # - The shuffled vector has 16 elements
                             # - It needs to be sliced into 8-element pieces for next MMA
                             # - num_partitions = target_vector_shape / reshape_vector_shapes
@@ -195,9 +196,12 @@ def get_mma_dimensional_mapping(
                                 # RHS input: K is the second-to-last dimension  
                                 shuffle_dim = arg_custom.type.symbolic_shape[-2]
                             
+                            # Only apply special slicing if target dimension is 32
+                            # (for 32x32x16 MMA, not 32x32x8)
                             if (shuffle_dim in reshape_vector_shapes and 
                                 shuffle_dim in target_vector_shape and
-                                target_vector_shape[shuffle_dim] == 32):
+                                target_vector_shape[shuffle_dim] == 32 and
+                                reshape_vector_shapes[shuffle_dim] == 32):
                                 # Set reshape_vector_shapes to half to enable slicing
                                 # num_partitions = 32 / 16 = 2 (slices 16-elem vector into two 8-elem pieces)
                                 reshape_vector_shapes[shuffle_dim] = 16
