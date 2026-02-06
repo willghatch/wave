@@ -31,7 +31,7 @@ from .._support.regions import RegionGraph
 from ..lang.global_symbols import *
 from ..lang.kernel_buffer import AddressSpace
 from ..lang.wave_types import IndexMapping, Memory, Register
-from ..wave.constraints import Constraint
+from ..wave.constraints import Constraint, HardwareConstraint
 from .base import OpDispatcher
 
 if TYPE_CHECKING:
@@ -3219,8 +3219,9 @@ class Permute(CustomOp, ABC):
             self.vector_shapes is not None
         ), "`vector_shapes` must be set before calling this function"
 
-        # TODO - when feeding from an MMA that has 32x32xK layout to another MMA that is F32_32x32x16_F16, IE when marked for shuffling, must use the inter_mma_shuffle_index_offset and inter_mma_shuffle_index_size and inter_mma_shuffle_index_stride
-
+        # Check if this permute has inter_mma_shuffle metadata
+        inter_mma_meta = self.fx_node.meta.get("inter_mma_shuffle", None)
+        
         custom_src = get_custom(self.arg)
         src_shape = custom_src.type.symbolic_shape
         src_to_target = {
@@ -3238,12 +3239,71 @@ class Permute(CustomOp, ABC):
         # permuted, thus only the order of the indices must be updated.
         if non_unit_src == non_unit_tgt:
             return {k: index[k] for k in self.target_shape if k in index}
+        
         # Else, permute the strides.
         permuted_index = {
             k: IndexSequence(v.start, v.size, index[src_to_target[k]].stride)
             for k, v in index.items()
             if k in src_shape
         }
+        
+        # If this is an inter-MMA shuffle, update the index for the shuffled dimension
+        if inter_mma_meta is not None:
+            from ..lang.global_symbols import GPR_NUM, THREAD_0
+            from sympy import floor, Mod
+            
+            threads_per_wave = inter_mma_meta["threads_per_wave"]
+            source_mma_type = inter_mma_meta["source_mma_type"]
+            
+            # Compute lane symbolically (same as in HardwareConstraint.inter_mma_shuffle_index_offset)
+            lane = THREAD_0 % threads_per_wave
+            
+            # Get the shuffle offset, size, and stride for F32_32x32x16_F16
+            # Based on constraints.py inter_mma_shuffle_index_offset/size/stride
+            # These use GPR_NUM/2 and GPR_NUM%2 instead of GPR_NUM/4 and GPR_NUM%4
+            shuffle_offset = [
+                (8 * floor(GPR_NUM / 2) % 32) + 4 * floor(lane / 32) + (GPR_NUM % 2),  # M
+                lane % 32,  # N
+                8 * floor(lane / 32),  # K
+            ]
+            shuffle_size = [
+                8,  # M (8 consecutive elements instead of 16 with stride 32)
+                1,  # N
+                8,  # K
+            ]
+            shuffle_stride = [
+                32,  # M (stride across groups)
+                1,   # N
+                1,   # K
+            ]
+            
+            # Find the dimension that needs shuffling:
+            # It should have size 16 and stride 32 in the input (MMA output)
+            # and becomes stride 1 after permute (contiguous)
+            for dim in self.target_shape:
+                if dim not in index or dim not in permuted_index:
+                    continue
+                    
+                input_idx = index.get(dim)
+                permuted_idx = permuted_index[dim]
+                
+                # Check if this dimension needs shuffling:
+                # - Original size is 16 (4-element groups)
+                # - Original stride is 32 (non-contiguous)
+                # - After permute, stride becomes 1 (contiguous)
+                if (input_idx and input_idx.size == 16 and input_idx.stride == 32 
+                    and permuted_idx.stride == 1):
+                    # This is the dimension that needs the shuffle transformation
+                    # The dimension with size 16 and stride 32 in MMA output is the M dimension (index 0)
+                    dim_index = 0  # M dimension
+                    
+                    # Apply the shuffle transformation using the inter_mma_shuffle values
+                    permuted_index[dim] = IndexSequence(
+                        shuffle_offset[dim_index],
+                        shuffle_size[dim_index],
+                        shuffle_stride[dim_index]
+                    )
+        
         return permuted_index
     
     def transform_index_forward(
