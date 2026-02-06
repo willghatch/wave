@@ -53,6 +53,7 @@ from ...ops.wave_ops import (
     WorkgroupBarrier,
     Write,
     get_custom,
+    _to_sequence,
 )
 from ..utils.tag_utils import propagate_tag
 from ..constraints import (
@@ -747,19 +748,14 @@ def add_nodes_to_sources(
     sources: list[
         tuple[CustomOp, dict[IndexSymbol, IndexSequence], dict[IndexSymbol, int]]
     ],
-    is_backward: bool = None,
+    barriers: list[CustomOp],
 ) -> list[CustomOp]:
     """
     Populate the sources with the inputs and users of the source node.
     
-    Transform nodes (Permute, Reshape) transform indices during propagation:
-    - Forward propagation: Apply inverse transform (output → input layout)
-    - Backward propagation: Apply forward transform (input → output layout)
+    If a node is a barrier, add it to the barriers list instead of sources.
+    Non-barrier nodes are added to sources with the same index.
     """
-    # Determine direction if fn is one of the known functions
-    if is_backward is None:
-        is_backward = (fn.__name__ == 'get_inputs' if hasattr(fn, '__name__') else False)
-    
     for args, region in [fn(source.fx_node, None)]:
         logger.debug(f"{source.fx_node} -> {args}")
         if not args:
@@ -769,24 +765,14 @@ def add_nodes_to_sources(
             if isinstance(custom, Placeholder) and not isinstance(custom, IterArg):
                 continue
             
-            # Transform nodes: apply index transformation during propagation
-            if isinstance(custom, (Permute, Reshape)):
-                # Apply transformation based on propagation direction
-                if is_backward:
-                    # Backward: propagating from output to input
-                    # Need to transform from output layout to input layout
-                    transformed_index = custom.transform_index_backward(source_index)
-                else:
-                    # Forward: propagating from input to output
-                    # Need to transform from input layout to output layout
-                    transformed_index = custom.transform_index_forward(source_index)
-                
-                vector_shapes = (
-                    custom.vector_shapes if custom.vector_shapes else source_vector_shapes
-                )
-                sources.append((custom, transformed_index, vector_shapes))
+            # Check if this node is a barrier
+            if custom.is_index_barrier():
+                # Add to barriers list for later processing
+                if custom not in barriers:
+                    barriers.append(custom)
                 continue
             
+            # Non-barrier nodes: propagate index directly
             vector_shapes = (
                 custom.vector_shapes if custom.vector_shapes else source_vector_shapes
             )
@@ -851,6 +837,157 @@ def append_aliased_shapes(source: CustomOp, symbolic_constraints: list[SymbolicA
             )
 
 
+def process_barrier(
+    barrier: CustomOp,
+    visited: set[CustomOp],
+    sources: list[tuple[CustomOp, dict[IndexSymbol, IndexSequence], dict[IndexSymbol, int]]],
+    new_barriers: list[CustomOp],
+    symbolic_constraints: list[SymbolicAlias],
+) -> bool:
+    """
+    Process a barrier node by applying transformations or validating indices.
+    
+    Returns True if the barrier was successfully processed, False otherwise.
+    
+    For Permute: Applies forward transformation from input to output
+    For Reshape: Validates that indices exist on both input and output sides
+    """
+    if isinstance(barrier, Permute):
+        return process_permute_barrier(barrier, visited, sources, symbolic_constraints)
+    elif isinstance(barrier, Reshape):
+        return process_reshape_barrier(barrier, visited, sources, symbolic_constraints)
+    else:
+        raise NotImplementedError(f"Barrier type {type(barrier).__name__} not implemented")
+
+
+def process_permute_barrier(
+    permute: Permute,
+    visited: set[CustomOp],
+    sources: list[tuple[CustomOp, dict[IndexSymbol, IndexSequence], dict[IndexSymbol, int]]],
+    symbolic_constraints: list[SymbolicAlias],
+) -> bool:
+    """
+    Process a Permute barrier by applying forward transformation.
+    
+    Permute should transform from input layout to output layout.
+    We need the input node to have an index already.
+    """
+    input_custom = get_custom(permute.arg)
+    
+    # Check if input has index
+    if not hasattr(input_custom, 'index') or input_custom.index is None:
+        return False
+    
+    # Input has index, apply forward transformation
+    print(f"\n=== PERMUTE BARRIER: {permute.fx_node.name} ===")
+    print(f"  input: {permute.arg.name} ({type(input_custom).__name__})")
+    print(f"  input.index: {input_custom.index}")
+    print(f"  input.vector_shapes: {getattr(input_custom, 'vector_shapes', None)}")
+    print(f"  permute target_shape: {permute.target_shape}")
+    
+    # Set vector shapes from input
+    if input_custom.vector_shapes:
+        permute.vector_shapes = deepcopy(input_custom.vector_shapes)
+    
+    # Apply forward transformation from input to output
+    transformed_index = permute.transform_index_forward(input_custom.index)
+    print(f"  transformed_index: {transformed_index}")
+    
+    # Set the permute's index
+    permute.index = combine_indices(permute.index, transformed_index)
+    append_aliased_shapes(permute, symbolic_constraints)
+    
+    print(f"  permute.index (final): {permute.index}")
+    print(f"  permute.vector_shapes (final): {permute.vector_shapes}")
+    print(f"=== END PERMUTE BARRIER ===\n")
+    
+    # Add users of permute to sources for continued propagation
+    output_index = permute.index
+    output_vector_shapes = permute.vector_shapes
+    user_nodes, region = get_users(permute.fx_node, None)
+    for user in user_nodes:
+        user_custom = get_custom(user)
+        if user_custom in visited:
+            continue
+        if user_custom.is_index_barrier():
+            # Add to new_barriers instead
+            if user_custom not in new_barriers:
+                new_barriers.append(user_custom)
+        else:
+            sources.append((user_custom, output_index, output_vector_shapes))
+    
+    return True
+
+
+def process_reshape_barrier(
+    reshape: Reshape,
+    visited: set[CustomOp],
+    sources: list[tuple[CustomOp, dict[IndexSymbol, IndexSequence], dict[IndexSymbol, int]]],
+    symbolic_constraints: list[SymbolicAlias],
+) -> bool:
+    """
+    Process a Reshape barrier by validating indices on both sides.
+    
+    Reshape should not transform, but should validate that propagation
+    from other nodes has set indices on both input and output sides.
+    It then inherits the index from one side as appropriate.
+    """
+    args = _to_sequence(reshape.args)
+    
+    # Check if all inputs have indices
+    all_inputs_have_index = True
+    for arg in args:
+        input_custom = get_custom(arg)
+        if not hasattr(input_custom, 'index') or input_custom.index is None:
+            all_inputs_have_index = False
+            break
+    
+    if not all_inputs_have_index:
+        return False
+    
+    # All inputs have indices, validate and inherit
+    print(f"\n=== RESHAPE BARRIER: {reshape.fx_node.name} ===")
+    print(f"  target_vector_shape: {reshape.target_vector_shape}")
+    
+    # Take index from first input
+    first_input = get_custom(args[0])
+    print(f"  input: {args[0].name} ({type(first_input).__name__})")
+    print(f"  input.index: {first_input.index}")
+    print(f"  input.vector_shapes: {getattr(first_input, 'vector_shapes', None)}")
+    
+    # Inherit index and vector shapes from input
+    reshape.index = deepcopy(first_input.index)
+    reshape.vector_shapes = deepcopy(first_input.vector_shapes)
+    
+    # Update vector shapes based on target_vector_shape
+    for dim, size in reshape.target_vector_shape.items():
+        if dim in reshape.vector_shapes:
+            reshape.vector_shapes[dim] = size
+    
+    append_aliased_shapes(reshape, symbolic_constraints)
+    
+    print(f"  reshape.index (final): {reshape.index}")
+    print(f"  reshape.vector_shapes (final): {reshape.vector_shapes}")
+    print(f"=== END RESHAPE BARRIER ===\n")
+    
+    # Add users of reshape to sources for continued propagation
+    output_index = reshape.index
+    output_vector_shapes = reshape.vector_shapes
+    user_nodes, region = get_users(reshape.fx_node, None)
+    for user in user_nodes:
+        user_custom = get_custom(user)
+        if user_custom in visited:
+            continue
+        if user_custom.is_index_barrier():
+            # Add to new_barriers instead
+            if user_custom not in new_barriers:
+                new_barriers.append(user_custom)
+        else:
+            sources.append((user_custom, output_index, output_vector_shapes))
+    
+    return True
+
+
 def propagate_indices(
     sources: set[CustomOp],
     visited: set[CustomOp],
@@ -858,109 +995,99 @@ def propagate_indices(
 ):
     """
     Propagate the index and vector shapes through the graph
-    starting with priveleged nodes (like MMA, Read, Write).
+    starting with privileged nodes (like MMA, Read, Write).
     
-    Transform nodes (Permute, Reshape) transform indices during propagation.
+    Uses a barrier-based approach:
+    1. Regular propagation adds non-barrier nodes to worklist
+    2. Barrier nodes are collected in a separate list
+    3. When worklist is empty, process barriers and apply transformations
+    4. Continue until no progress can be made
     """
-    while sources:
-        source, source_index, source_vector_shapes = sources.pop(0)
-        if source in visited:
-            continue
-        
-        # Special handling for Transform nodes (Permute, Reshape)
-        if isinstance(source, (Permute, Reshape)):
-            if should_update_index(
-                source, source_index, source_vector_shapes, symbolic_constraints
-            ):
+    barriers = []
+    
+    while sources or barriers:
+        # First, process all non-barrier nodes
+        while sources:
+            source, source_index, source_vector_shapes = sources.pop(0)
+            if source in visited:
+                continue
+            
+            if not isinstance(source, (NestedRegionOp, MMABase)):
+                if not should_update_index(
+                    source, source_index, source_vector_shapes, symbolic_constraints
+                ):
+                    continue
+                # GetResults inherit their index from the Iterate node
+                # and hence we don't need to update their index.
                 source.vector_shapes = deepcopy(source_vector_shapes)
-                # For transform nodes, the source_index has already been transformed
-                # by add_nodes_to_sources, so we use it directly
-                print(f"\n=== TRANSFORM NODE: {type(source).__name__} {source.fx_node.name} ===")
-                print(f"  source_index (incoming): {source_index}")
-                print(f"  source_vector_shapes: {source_vector_shapes}")
-                print(f"  node.index (before): {source.index}")
-                if isinstance(source, Reshape):
-                    print(f"  reshape.chained_mma_shuffle_fix: {source.fx_node.meta.get('chained_mma_shuffle_fix', False)}")
-                    print(f"  reshape.shuffle_fix_index_update_needed: {source.fx_node.meta.get('shuffle_fix_index_update_needed', False)}")
-                    print(f"  reshape.target_vector_shape: {source.target_vector_shape}")
-                source.index = combine_indices(source.index, source_index)
-                # Update vector_shapes to match index sizes for non-trivial dimensions
-                for dim, idx_seq in source.index.items():
-                    if dim in source.vector_shapes and idx_seq.size > 1:
-                        source.vector_shapes[dim] = idx_seq.size
+                if not isinstance(source, GetResult):
+                    source_index = source.transform_index(source_index)
+                    source.index = combine_indices(source.index, source_index)
                 append_aliased_shapes(source, symbolic_constraints)
-                print(f"  node.index (after): {source.index}")
-                print(f"  node.vector_shapes (after): {source.vector_shapes}")
-                if isinstance(source, Permute):
-                    print(f"  permute.arg (input): {source.arg}")
-                    input_custom = get_custom(source.arg)
-                    print(f"  permute.arg.type: {type(input_custom).__name__}")
-                    if hasattr(input_custom, 'index'):
-                        print(f"  permute.arg.index: {input_custom.index}")
-                    if hasattr(input_custom, 'vector_shapes'):
-                        print(f"  permute.arg.vector_shapes: {input_custom.vector_shapes}")
-                print(f"=== END TRANSFORM NODE ===\n")
-                logger.debug(f"Set transform node {source.fx_node.name} index: index={source.index}, vector_shapes={source.vector_shapes}")
+                
+                # Debug output for key nodes (add, select, mask operations, self_index)
+                if isinstance(source, (BinaryPyOp, SelectOp, SelfIndex)) or (hasattr(source.fx_node, 'name') and 'mask' in source.fx_node.name.lower()):
+                    print(f"\n=== NODE: {type(source).__name__} {source.fx_node.name} ===")
+                    print(f"  index: {source.index}")
+                    print(f"  vector_shapes: {source.vector_shapes}")
+                    if isinstance(source, SelfIndex):
+                        print(f"  self_index.dim: {source.dim}")
+                        print(f"  self_index.dtype: {source.dtype}")
+                    if isinstance(source, BinaryPyOp):
+                        lhs_custom = get_custom(source.lhs)
+                        rhs_custom = get_custom(source.rhs)
+                        print(f"  lhs: {source.lhs} ({type(lhs_custom).__name__})")
+                        if hasattr(lhs_custom, 'index'):
+                            print(f"    lhs.index: {lhs_custom.index}")
+                        print(f"  rhs: {source.rhs} ({type(rhs_custom).__name__})")
+                        if hasattr(rhs_custom, 'index'):
+                            print(f"    rhs.index: {rhs_custom.index}")
+                    if isinstance(source, SelectOp):
+                        print(f"  cond: {source.cond} ({type(get_custom(source.cond)).__name__})")
+                        if hasattr(get_custom(source.cond), 'index'):
+                            print(f"    cond.index: {get_custom(source.cond).index}")
+                    print(f"=== END NODE ===\n")
             visited.add(source)
-            # Continue propagating through transform nodes
             for func in [get_inputs, get_users]:
-                is_backward = (func == get_inputs)
                 sources = add_nodes_to_sources(
                     source,
                     func,
                     source_index,
                     source_vector_shapes,
                     sources,
-                    is_backward,
+                    barriers,
                 )
-            continue
         
-        if not isinstance(source, (NestedRegionOp, MMABase)):
-            if not should_update_index(
-                source, source_index, source_vector_shapes, symbolic_constraints
-            ):
+        # Now process barriers
+        if not barriers:
+            break
+        
+        # Remember barrier list size to detect progress
+        prev_barrier_count = len(barriers)
+        new_barriers = []
+        
+        for barrier in barriers:
+            if barrier in visited:
                 continue
-            # GetResults inherit their index from the Iterate node
-            # and hence we don't need to update their index.
-            source.vector_shapes = deepcopy(source_vector_shapes)
-            if not isinstance(source, GetResult):
-                source_index = source.transform_index(source_index)
-                source.index = combine_indices(source.index, source_index)
-            append_aliased_shapes(source, symbolic_constraints)
             
-            # Debug output for key nodes (add, select, mask operations, self_index)
-            if isinstance(source, (BinaryPyOp, SelectOp, SelfIndex)) or (hasattr(source.fx_node, 'name') and 'mask' in source.fx_node.name.lower()):
-                print(f"\n=== NODE: {type(source).__name__} {source.fx_node.name} ===")
-                print(f"  index: {source.index}")
-                print(f"  vector_shapes: {source.vector_shapes}")
-                if isinstance(source, SelfIndex):
-                    print(f"  self_index.dim: {source.dim}")
-                    print(f"  self_index.dtype: {source.dtype}")
-                if isinstance(source, BinaryPyOp):
-                    lhs_custom = get_custom(source.lhs)
-                    rhs_custom = get_custom(source.rhs)
-                    print(f"  lhs: {source.lhs} ({type(lhs_custom).__name__})")
-                    if hasattr(lhs_custom, 'index'):
-                        print(f"    lhs.index: {lhs_custom.index}")
-                    print(f"  rhs: {source.rhs} ({type(rhs_custom).__name__})")
-                    if hasattr(rhs_custom, 'index'):
-                        print(f"    rhs.index: {rhs_custom.index}")
-                if isinstance(source, SelectOp):
-                    print(f"  cond: {source.cond} ({type(get_custom(source.cond)).__name__})")
-                    if hasattr(get_custom(source.cond), 'index'):
-                        print(f"    cond.index: {get_custom(source.cond).index}")
-                print(f"=== END NODE ===\n")
-        visited.add(source)
-        for func in [get_inputs, get_users]:
-            is_backward = (func == get_inputs)
-            sources = add_nodes_to_sources(
-                source,
-                func,
-                source_index,
-                source_vector_shapes,
-                sources,
-                is_backward,
+            # Try to process this barrier
+            if process_barrier(barrier, visited, sources, new_barriers, symbolic_constraints):
+                visited.add(barrier)
+            else:
+                # Can't process yet, keep in barrier list
+                new_barriers.append(barrier)
+        
+        barriers = new_barriers
+        
+        # Check if we made progress
+        if len(barriers) == prev_barrier_count and not sources:
+            # No progress made, we have unresolvable barriers
+            unresolved = [f"{type(b).__name__}:{b.fx_node.name}" for b in barriers]
+            raise RuntimeError(
+                f"Cannot resolve index propagation through barrier nodes: {unresolved}. "
+                f"These barriers don't support transformation in the required direction."
             )
+    
     return visited
 
 

@@ -666,6 +666,14 @@ class CustomOp(ABC):
     tkw_op_name: str = field(default="unknown", init=False)
     _tracing_function: Optional[Callable[..., Any]] = field(default=None, init=False)
 
+    def is_index_barrier(self) -> bool:
+        """
+        Returns True if this node acts as a barrier for index propagation.
+        Barrier nodes prevent direct propagation through them and require
+        explicit transformation logic.
+        """
+        return False
+
     @property
     def location(self) -> Optional[CapturedLocation]:
         return getattr(self.fx_node, "location", None)
@@ -3183,6 +3191,10 @@ class Permute(CustomOp, ABC):
     arg: fx.Node
     target_shape: Sequence[IndexExpr]
 
+    def is_index_barrier(self) -> bool:
+        """Permute is a barrier that transforms indices."""
+        return True
+
     @property
     def indexing_dims(self) -> list[IndexExpr]:
         return self.target_shape
@@ -3313,6 +3325,10 @@ class Reshape(CustomOp, ABC):
 
     args: fx.Node | Sequence[fx.Node]
     target_vector_shape: dict[IndexSymbol, int]
+
+    def is_index_barrier(self) -> bool:
+        """Reshape is a barrier that validates indices on both sides."""
+        return True
 
     @property
     def indexing_dims(self) -> list[IndexExpr]:
