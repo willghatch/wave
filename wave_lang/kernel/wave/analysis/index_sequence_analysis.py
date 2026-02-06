@@ -368,6 +368,42 @@ def set_node_indices_water_checked(
     _reset_water_id(trace)
 
 
+def concretize_mma_symbols(trace: CapturedTrace):
+    """
+    Post-processing step to concretize MMA symbols in all node indices.
+    
+    MMA operations create indices with Piecewise expressions conditioned on
+    $MMA_ACC, $MMA_LHS, $MMA_RHS to distinguish between operand roles during
+    index computation. After index propagation is complete, these symbols
+    should be resolved:
+    
+    - For MMA nodes themselves: specialize with MMA_ACC=1 (accumulator)
+    - For all other nodes: specialize with MMA_ACC=1 (treating as data output)
+    
+    This ensures downstream passes don't encounter Piecewise expressions.
+    """
+    def concretize_node(node: fx.Node):
+        custom = get_custom(node)
+        if not hasattr(custom, 'index') or custom.index is None:
+            return
+        
+        # Check if index has MMA symbols
+        has_mma_symbols = any(
+            idx_seq.has(MMA_ACC) or idx_seq.has(MMA_LHS) or idx_seq.has(MMA_RHS)
+            for idx_seq in custom.index.values()
+        )
+        
+        if has_mma_symbols:
+            # Specialize with MMA_ACC=1 (accumulator/output)
+            # This resolves Piecewise expressions to concrete values
+            custom.index = specialize_index(
+                custom.index, {MMA_LHS: 0, MMA_RHS: 0, MMA_ACC: 1}
+            )
+            logger.debug(f"Concretized MMA symbols for {node.name}: {custom.index}")
+    
+    trace.walk(concretize_node)
+
+
 def set_node_indices(
     trace: CapturedTrace,
     constraints: list[Constraint],
@@ -414,6 +450,7 @@ def set_node_indices(
         partial(set_derived_index, trace),
         partial(resolve_thread_shapes, trace, constraints),
         partial(resolve_scaled_indices, trace),
+        partial(concretize_mma_symbols, trace),  # Concretize MMA symbols after propagation
         partial(verify_nodes, trace, constraints),
     ]
     for p in graph_passes:
@@ -754,7 +791,10 @@ def add_nodes_to_sources(
     Populate the sources with the inputs and users of the source node.
     
     If a node is a barrier, add it to the barriers list instead of sources.
-    Non-barrier nodes are added to sources with the same index.
+    Non-barrier nodes are added to sources for propagation.
+    
+    Note: MMA symbol concretization happens in post-processing (concretize_mma_symbols),
+    not during propagation.
     """
     for args, region in [fn(source.fx_node, None)]:
         logger.debug(f"{source.fx_node} -> {args}")
@@ -871,6 +911,9 @@ def process_permute_barrier(
     
     Permute should transform from input layout to output layout.
     We need the input node to have an index already.
+    
+    MMA symbol concretization happens during normal propagation (in add_nodes_to_sources),
+    so the input index should already have concrete values if it came from an MMA.
     """
     input_custom = get_custom(permute.arg)
     
