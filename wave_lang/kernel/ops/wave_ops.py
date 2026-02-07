@@ -3192,8 +3192,14 @@ class Permute(CustomOp, ABC):
     target_shape: Sequence[IndexExpr]
 
     def is_index_barrier(self) -> bool:
-        """Permute is a barrier that transforms indices."""
-        return True
+        """
+        Permute is a barrier that transforms indices only if it needs inter-MMA shuffling.
+        
+        Regular permutes (without inter_mma_shuffle metadata) use normal index propagation.
+        Only permutes marked for inter-MMA shuffle between 32x32 MMAs require barrier-based
+        propagation to apply the shuffle transformation.
+        """
+        return self.fx_node.meta.get("inter_mma_shuffle", None) is not None
 
     @property
     def indexing_dims(self) -> list[IndexExpr]:
@@ -3303,6 +3309,7 @@ class Permute(CustomOp, ABC):
                         shuffle_size[dim_index],
                         shuffle_stride[dim_index]
                     )
+                    break
         
         return permuted_index
     
