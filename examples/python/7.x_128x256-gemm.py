@@ -17,6 +17,7 @@ Usage:
 
 import torch
 
+import wave_lang.kernel.lang as tkl
 from wave_lang.kernel.wave.compile import wave_compile
 from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
 from wave_lang.kernel.wave.templates import get_tagged_mxfp4_gemm_preshuffle_b
@@ -30,7 +31,7 @@ from wave_lang.kernel.wave.utils.mxfp_utils import (
 from utils import parse_args, list_tests, run_test
 
 
-def _run_mxfp_gemm_preshuffle_b(gemm, shape):
+def _run_mxfp_gemm_preshuffle_b(gemm, shape, out_torch_dtype=torch.float32):
     """Run compiled GEMM kernel with preshuffled B and scales, verify against reference."""
     x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(shape)
     torch_out = torchScaledGemmMXFP4(x, w, x_scales, w_scales)
@@ -42,7 +43,7 @@ def _run_mxfp_gemm_preshuffle_b(gemm, shape):
 
     x, w_t_ps = x.cuda(), w_t_ps.cuda()
     x_scales_ps, w_scales_ps = x_scales_ps.cuda(), w_scales_ps.cuda()
-    out = torch.zeros(x.shape[0], w_t_ps.shape[0], dtype=torch.float32).cuda()
+    out = torch.zeros(x.shape[0], w_t_ps.shape[0], dtype=out_torch_dtype).cuda()
 
     gemm(x, x_scales_ps, w_t_ps, w_scales_ps, out)
     torch.testing.assert_close(
@@ -63,6 +64,7 @@ def test_128x256_preshuffle_b_gemm(
       - A scale + B scale direct from global
       - Asymmetric schedule (A: triple-buffer depth-2, B: global-to-VGPR)
       - K-loop unrolling: not applied (aiter uses 8x; see notes below)
+      - Output dtype: f32 (see test_128x256_preshuffle_b_gemm_bf16 for bf16)
     Notes:
       - Unrolling the asymmetric schedule causes intermittent correctness
         failures because tkw.unroll duplicates the body but the
@@ -91,6 +93,35 @@ def test_128x256_preshuffle_b_gemm(
 
     _run_mxfp_gemm_preshuffle_b(gemm, shape)
     print("MXFP 128x256 BpreShuffle GEMM test passed!")
+
+
+def test_128x256_preshuffle_b_gemm_bf16(
+    is_debug=False, shape=(1024, 1024, 8192), block=(128, 256, 256)
+):
+    """128x256 MXFP4 GEMM with bf16 output, matching aiter's output dtype.
+
+    Same as test_128x256_preshuffle_b_gemm but outputs bf16 instead of f32.
+    The accumulator is still f32; the cast to bf16 happens at the final write.
+    This matches aiter's f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256 output.
+    """
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
+        shape, block, wave_shape=(1, 4), output_dtype=tkl.bf16
+    )
+    options.minimize_shared_allocs = True
+    options.linearize_shared_access = True
+    options.use_buffer_ops = True
+    options.dump_intermediates = "build/intermediates"
+    options.dump_binaries = "build/binaries"
+    options.print_mlir_file = "gemm_mxfp4_128x256_preshuffle_b_bf16.mlir"
+    options.print_mlir = True
+    schedule = get_mxfp4_asymmetric_schedule()
+
+    options.print_ir_after = "all" if is_debug else []
+    options = set_default_run_config(options)
+    gemm = wave_compile(options, gemm, schedule)
+
+    _run_mxfp_gemm_preshuffle_b(gemm, shape, out_torch_dtype=torch.bfloat16)
+    print("MXFP 128x256 BpreShuffle GEMM bf16 output test passed!")
 
 
 def test_128x256_preshuffle_b_gemm_8wave(

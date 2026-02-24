@@ -287,6 +287,7 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
     a_scale_preshuffle: bool = True,
     reorder_workgroups=True,
     group_size_n=32,
+    output_dtype: tkl.DataType = tkl.f32,
 ):
     """Return a tagged MXFP4 scaled GEMM kernel with preshuffled B and B_scale.
 
@@ -303,6 +304,9 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
         wave_shape: (WAVE_M, WAVE_N) waves per workgroup.
         mfma_variant: Scaled MMA instruction type.
         a_address_space: Address space for A and A_scale (typically SHARED).
+        output_dtype: Data type for the output tensor C (default f32).
+            The accumulator is always f32; this controls the memory layout
+            of the output.  Pass tkl.bf16 to match aiter's bf16 output.
 
     Returns:
         (kernel_function, WaveCompileOptions)
@@ -419,7 +423,7 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
         a_scale: tkl.Memory[M, K / 32, A_ADDRESS_SPACE, tkl.i8],
         b: tkl.Memory[N, K / 2, GLOBAL_ADDRESS_SPACE, tkl.i8],
         b_scale: tkl.Memory[N, K / 32, GLOBAL_ADDRESS_SPACE, tkl.i8],
-        c: tkl.Memory[M, N, C_ADDRESS_SPACE, tkl.f32],
+        c: tkl.Memory[M, N, C_ADDRESS_SPACE, output_dtype],
     ):
         c_reg = tkl.Register[M, N, tkl.f32](0.0)
 
