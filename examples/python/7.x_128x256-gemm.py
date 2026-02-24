@@ -56,11 +56,22 @@ def test_128x256_preshuffle_b_gemm(
     """128x256 MXFP4 GEMM matching aiter BpreShuffle_128x256 kernel.
 
     Matches aiter decisions:
-      - Tile 128x256, 8 waves (2Mx4N)
+      - Tile 128x256, 4 waves (1Mx4N) — see test_128x256_preshuffle_b_gemm_8wave
+        for the 8-wave variant matching aiter's 2Mx4N configuration
       - B + B_scale preshuffled (direct global reads, no LDS for B)
       - A through LDS (double-buffered / asymmetric prefetch)
       - A scale + B scale direct from global
       - Asymmetric schedule (A: triple-buffer depth-2, B: global-to-VGPR)
+      - K-loop unrolling: not applied (aiter uses 8x; see notes below)
+    Notes:
+      - Unrolling the asymmetric schedule causes intermittent correctness
+        failures because tkw.unroll duplicates the body but the
+        MemoryCounterWaitBarrier at the start of the kernel only fires once
+        per unrolled block.  Fixing this requires proper per-iteration barriers
+        inside the unrolled schedule.
+      - wave_shape=(2,4) for 8 waves (matching aiter) fails numerically; the
+        asymmetric schedule's M-partition logic assumes wave_size=BLOCK_M and
+        does not adapt to smaller per-wave M tiles.
     """
     gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
         shape, block, wave_shape=(1, 4)
@@ -80,6 +91,45 @@ def test_128x256_preshuffle_b_gemm(
 
     _run_mxfp_gemm_preshuffle_b(gemm, shape)
     print("MXFP 128x256 BpreShuffle GEMM test passed!")
+
+
+def test_128x256_preshuffle_b_gemm_8wave(
+    is_debug=False, shape=(1024, 1024, 8192), block=(128, 256, 256)
+):
+    """128x256 MXFP4 GEMM with 8 waves (2Mx4N) matching aiter exactly.
+
+    Matches aiter decisions:
+      - Tile 128x256, 8 waves (2Mx4N) — same as aiter BpreShuffle_128x256
+      - B + B_scale preshuffled (direct global reads, no LDS for B)
+      - A through LDS (double-buffered / asymmetric prefetch)
+      - A scale + B scale direct from global
+      - Asymmetric schedule (A: triple-buffer depth-2, B: global-to-VGPR)
+      - K-loop unrolling: not applied (see notes in test_128x256_preshuffle_b_gemm)
+    NOTE: This test currently fails numerically.  The asymmetric schedule's
+    M-partitioning (partition_by_dim(s2v_a, M, 2)) operates on the per-wave
+    tile, which is BLOCK_M / wave_shape[0].  With wave_shape=(1,4), each wave
+    covers 128 M-rows (the full BLOCK_M), so the 2-partition sees 64-row halves.
+    With wave_shape=(2,4), each wave covers 64 M-rows, so the 2-partition sees
+    32-row halves — requiring different schedule interleave parameters.
+    """
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
+        shape, block, wave_shape=(2, 4)
+    )
+    options.minimize_shared_allocs = True
+    options.linearize_shared_access = True
+    options.use_buffer_ops = True
+    options.dump_intermediates = "build/intermediates"
+    options.dump_binaries = "build/binaries"
+    options.print_mlir_file = "gemm_mxfp4_128x256_preshuffle_b_8wave.mlir"
+    options.print_mlir = True
+    schedule = get_mxfp4_asymmetric_schedule()
+
+    options.print_ir_after = "all" if is_debug else []
+    options = set_default_run_config(options)
+    gemm = wave_compile(options, gemm, schedule)
+
+    _run_mxfp_gemm_preshuffle_b(gemm, shape)
+    print("MXFP 128x256 BpreShuffle GEMM 8-wave test passed!")
 
 
 if __name__ == "__main__":

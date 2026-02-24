@@ -1142,7 +1142,7 @@ def get_mxfp4_dbuf_mixed_pingpong_shuffle_schedule(use_stagger: bool = True):
     return mxfp4_dbuf_schedule
 
 
-def get_mxfp4_asymmetric_schedule(is_bscale_shuffled: bool = False):
+def get_mxfp4_asymmetric_schedule(is_bscale_shuffled: bool = False, unroll_factor: int = 0):
     """Return an asymmetric-prefetch MXFP4 schedule for wave_compile().
 
     Asymmetric data paths:
@@ -1162,6 +1162,11 @@ def get_mxfp4_asymmetric_schedule(is_bscale_shuffled: bool = False):
       Second MMA half: interleaved with B_scale loads and next-iteration
                        first-partition A reads (plus G2S for the iteration
                        after next).
+
+    Args:
+        unroll_factor: If > 1, unroll the KERNEL body by this factor after
+            applying the pipeline schedule.  The iteration count (K / BLOCK_K)
+            must be divisible by unroll_factor.  0 or 1 means no unrolling.
     """
     M = tkl.sym.M
 
@@ -1542,8 +1547,6 @@ def get_mxfp4_asymmetric_schedule(is_bscale_shuffled: bool = False):
         tkw.reorder_graph(pipeline_loop.PROLOGUE, prologue_clusters)
         tkw.reorder_graph(pipeline_loop.KERNEL, clusters)
         # tkw.reorder_graph(pipeline_loop.EPILOGUE, epilogue_clusters_itr0)
-        unroll_factor = 2
-        tkw.unroll(pipeline_loop.KERNEL, unroll_factor)
 
         tkw.insert_at_start(
             pipeline_loop.KERNEL,
@@ -1552,5 +1555,8 @@ def get_mxfp4_asymmetric_schedule(is_bscale_shuffled: bool = False):
         tkw.insert_after(
             pipeline_loop.KERNEL, tkw.MemoryCounterWaitBarrier(load=0, ds=0)
         )
+
+        if unroll_factor > 1:
+            tkw.unroll(pipeline_loop.KERNEL, unroll_factor)
 
     return mxfp4_dbuf_schedule
