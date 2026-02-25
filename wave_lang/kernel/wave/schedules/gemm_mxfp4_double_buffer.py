@@ -1566,30 +1566,33 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
     """Return a preshuffle-B MXFP4 schedule for wave_compile().
 
     Designed for the preshuffle-B data path where:
-      - A (data + scale): global -> LDS (double-buffered) -> VGPRs
+      - A (data + scale): global -> LDS (triple-buffered) -> VGPRs
       - B (data + scale): global -> VGPRs directly (no LDS, preshuffle required)
 
-    2-stage pipeline (double buffer):
+    3-stage pipeline (triple buffer for A):
       Stage 0: Async GatherToLDS for A data and A scale.
-      Stage 1: All compute — B global loads, A LDS reads, bitcasts, scaled MMA.
+      Stage 1: Global-to-VGPR loads for B and B_scale;
+               LDS-to-VGPR loads for A and A_scale.
+      Stage 2: Bitcasts; scaled MMA accumulation.
 
-    The 2-stage design avoids the 3-stage prologue hazard where S2V_A reads
-    could race against cross-wave G2S writes.  With 2 stages the prologue only
-    issues G2S (no LDS reads), so there is no cross-wave data dependency until
-    the KERNEL where explicit MemoryCounterWait + WorkgroupBarrier gates every
-    iteration.
+    Prologue (2 fill iterations) and epilogue (2 drain iterations) are
+    explicitly scheduled with barriers via a single reorder_graph call
+    covering all three pipeline phases.  The prologue inserts a
+    MemoryCounterWaitBarrier before S2V_A reads to ensure cross-wave
+    visibility of G2S writes.  The epilogue inserts MemoryCounterWait +
+    WorkgroupBarrier before drain-iteration-0's S2V_A reads.
 
     K-dimension partitioning (not M) makes the schedule wave-count-agnostic:
     each wave always processes BLOCK_K/2 K-elements per partition regardless
     of wave_shape.  Works for both wave_shape=(1,4) and wave_shape=(2,4).
 
-    All barriers live inside cluster lists so tkw.unroll replicates them
-    correctly across unrolled iterations.
+    All KERNEL barriers live inside cluster lists so tkw.unroll replicates
+    them correctly across unrolled iterations.
 
     Args:
         unroll_factor: If > 1, unroll the KERNEL body by this factor after
-            scheduling.  K / BLOCK_K must be divisible by unroll_factor.
-            0 or 1 means no unrolling.
+            scheduling.  K / BLOCK_K must be divisible by
+            (unroll_factor * num_stages).  0 or 1 means no unrolling.
     """
     K = tkl.sym.K
 
@@ -1619,13 +1622,10 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
         scaled_mma = tkw.get_node_by_tag("scaled_mma")
 
         # =====================================================================
-        # 2-stage pipeline (double buffer).
+        # 3-stage pipeline (triple buffer for A).
         # Stage 0: Async G2S for A data and A scale.
-        # Stage 1: B global loads | A LDS reads + bitcasts | scaled MMA.
-        #
-        # g2v_b is in sub-group 0 (alongside g2s_a across stages) and
-        # s2v_a + bitcasts are in sub-group 1 to keep different memory
-        # address spaces in separate fusion groups.
+        # Stage 1: G2V for B + B_scale | S2V for A + A_scale.
+        # Stage 2: bitcasts | scaled MMA.
         # =====================================================================
         pipeline_loop = tkw.pipeline(k_loop)
 
@@ -1640,9 +1640,14 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
             pl.set_stage(
                 [
                     (g2v_b, g2v_b_scale),
+                    (s2v_a, s2v_a_scale),
+                    (),
+                ],
+            )
+            pl.set_stage(
+                [
+                    (),
                     (
-                        s2v_a,
-                        s2v_a_scale,
                         bitcast_a,
                         bitcast_a_scale,
                         bitcast_b,
@@ -1651,6 +1656,53 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
                     (scaled_mma,),
                 ],
             )
+
+        # =====================================================================
+        # PROLOGUE: 2 fill iterations.
+        #   Fill 0: G2S_A (iter 0).
+        #   Fill 1: G2S_A (iter 1) + G2V_B (iter 0) + S2V_A (iter 0).
+        #
+        # A MemoryCounterWaitBarrier gates the S2V_A reads so that iter-0's
+        # G2S writes are visible across all waves (vmcnt first, then
+        # s_barrier).  Iter-1 G2S and G2V_B may remain outstanding.
+        # =====================================================================
+        prologue_g2s_a = tkw.filter_nodes(
+            g2s_a, subgraph=pipeline_loop.PROLOGUE
+        )
+        prologue_g2s_a_scale = tkw.filter_nodes(
+            g2s_a_scale, subgraph=pipeline_loop.PROLOGUE
+        )
+        prologue_g2v_b = tkw.filter_nodes(
+            g2v_b, subgraph=pipeline_loop.PROLOGUE
+        )
+        prologue_g2v_b_scale = tkw.filter_nodes(
+            g2v_b_scale, subgraph=pipeline_loop.PROLOGUE
+        )
+        prologue_s2v_a = tkw.filter_nodes(
+            s2v_a, subgraph=pipeline_loop.PROLOGUE
+        )
+        prologue_s2v_a_scale = tkw.filter_nodes(
+            s2v_a_scale, subgraph=pipeline_loop.PROLOGUE
+        )
+
+        n_prologue_g2s = len(prologue_g2s_a) + len(prologue_g2s_a_scale)
+        n_prologue_g2v = len(prologue_g2v_b) + len(prologue_g2v_b_scale)
+        n_g2s_per_iter = n_prologue_g2s // 2
+        prologue_vmcnt = n_g2s_per_iter + n_prologue_g2v
+
+        prologue_clusters = [
+            tkw.cluster(
+                [
+                    prologue_g2s_a,
+                    prologue_g2s_a_scale,
+                    prologue_g2v_b,
+                    prologue_g2v_b_scale,
+                    tkw.MemoryCounterWaitBarrier(load=prologue_vmcnt),
+                    prologue_s2v_a,
+                    prologue_s2v_a_scale,
+                ]
+            ),
+        ]
 
         # =====================================================================
         # KERNEL: Partition by K for interleaved cluster layout.
@@ -1681,9 +1733,6 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
 
         loop_scaled_mma = tkw.filter_nodes(scaled_mma, subgraph=pipeline_loop.KERNEL)
 
-        # K-partition into two halves.  Bitcasts and s2v_a must also be
-        # K-partitioned to stay co-located with their producer loads;
-        # otherwise reorder_graph raises "Cannot find producer(s)".
         loop_mma_0, loop_mma_1 = tkw.partition_by_dim(
             loop_scaled_mma, dim=K, num_partitions=2
         )
@@ -1702,8 +1751,6 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
 
         n_g2v_b_loads = len(loop_g2v_b) + len(loop_g2v_b_scale)
 
-        # Interleave K=0 MFMAs with B global loads and K=1 LDS reads to
-        # hide memory latency during compute.
         interleaved_mma_0 = tkw.interleave_operations(
             base_ops=loop_mma_0,
             interleaved_ops=[
@@ -1725,7 +1772,7 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
         #   MemoryCounterWait(load=0) + WorkgroupBarrier -- ensure previous
         #     iteration's G2S writes are visible across ALL waves (vmcnt=0
         #     first, then s_barrier for cross-wave visibility).
-        #   G2S_A for the next iteration (start async prefetch early).
+        #   G2S_A for the next-next iteration (start async prefetch early).
         #   K=0 LDS reads + bitcasts.
         #   K=0 MFMAs interleaved with K=1 LDS reads + B global loads.
         #
@@ -1734,7 +1781,7 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
         #     LDS reads (lgkmcnt=0) before K=1 compute.
         #   K=1 bitcasts + K=1 MFMAs.
         # =====================================================================
-        clusters = [
+        kernel_clusters = [
             tkw.cluster(
                 [
                     tkw.MemoryCounterWait(load=0),
@@ -1765,10 +1812,102 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
             ),
         ]
 
-        tkw.insert_before(pipeline_loop.KERNEL, tkw.WorkgroupBarrier())
-        tkw.insert_after(pipeline_loop.KERNEL, tkw.SharedMemoryBarrier())
+        # =====================================================================
+        # EPILOGUE: 2 drain iterations.
+        #   Drain 0: Stage 1 (G2V_B, S2V_A) + Stage 2 (bitcasts, MMA).
+        #   Drain 1: Stage 2 only (bitcasts, MMA).
+        #
+        # Drain 0's S2V_A reads data written by the last KERNEL iteration's
+        # G2S, so MemoryCounterWait(load=0) + WorkgroupBarrier gates them.
+        # =====================================================================
+        epilogue_g2v_b = tkw.filter_nodes(
+            g2v_b, subgraph=pipeline_loop.EPILOGUE
+        )
+        epilogue_g2v_b_scale = tkw.filter_nodes(
+            g2v_b_scale, subgraph=pipeline_loop.EPILOGUE
+        )
+        epilogue_s2v_a = tkw.filter_nodes(
+            s2v_a, subgraph=pipeline_loop.EPILOGUE
+        )
+        epilogue_s2v_a_scale = tkw.filter_nodes(
+            s2v_a_scale, subgraph=pipeline_loop.EPILOGUE
+        )
+        epilogue_bitcast_a = tkw.filter_nodes(
+            bitcast_a, subgraph=pipeline_loop.EPILOGUE
+        )
+        epilogue_bitcast_a_scale = tkw.filter_nodes(
+            bitcast_a_scale, subgraph=pipeline_loop.EPILOGUE
+        )
+        epilogue_bitcast_b = tkw.filter_nodes(
+            bitcast_b, subgraph=pipeline_loop.EPILOGUE
+        )
+        epilogue_bitcast_b_scale = tkw.filter_nodes(
+            bitcast_b_scale, subgraph=pipeline_loop.EPILOGUE
+        )
+        epilogue_mma = tkw.filter_nodes(
+            scaled_mma, subgraph=pipeline_loop.EPILOGUE
+        )
 
-        tkw.reorder_graph(pipeline_loop.KERNEL, clusters)
+        def split_by_iteration(nodes, key="name"):
+            itr0, itr1 = [], []
+            for node in nodes:
+                value = getattr(node, key)
+                if "1_2" in value:
+                    itr0.append(node)
+                elif "2_2" in value:
+                    itr1.append(node)
+                else:
+                    raise ValueError(f"Unknown {key} for node: {value}")
+            return itr0, itr1
+
+        epilogue_mma_itr0, epilogue_mma_itr1 = split_by_iteration(epilogue_mma)
+        epilogue_bitcast_a_itr0, epilogue_bitcast_a_itr1 = split_by_iteration(
+            epilogue_bitcast_a
+        )
+        epilogue_bitcast_a_scale_itr0, epilogue_bitcast_a_scale_itr1 = (
+            split_by_iteration(epilogue_bitcast_a_scale)
+        )
+        epilogue_bitcast_b_itr0, epilogue_bitcast_b_itr1 = split_by_iteration(
+            epilogue_bitcast_b
+        )
+        epilogue_bitcast_b_scale_itr0, epilogue_bitcast_b_scale_itr1 = (
+            split_by_iteration(epilogue_bitcast_b_scale)
+        )
+
+        epilogue_clusters = [
+            tkw.cluster(
+                [
+                    tkw.MemoryCounterWait(load=0),
+                    tkw.WorkgroupBarrier(),
+                    epilogue_g2v_b,
+                    epilogue_g2v_b_scale,
+                    epilogue_s2v_a,
+                    epilogue_s2v_a_scale,
+                    epilogue_bitcast_a_itr0,
+                    epilogue_bitcast_a_scale_itr0,
+                    epilogue_bitcast_b_itr0,
+                    epilogue_bitcast_b_scale_itr0,
+                    tkw.SchedulingBarrier([]),
+                    epilogue_mma_itr0,
+                ]
+            ),
+            tkw.cluster(
+                [
+                    epilogue_bitcast_a_itr1,
+                    epilogue_bitcast_a_scale_itr1,
+                    epilogue_bitcast_b_itr1,
+                    epilogue_bitcast_b_scale_itr1,
+                    tkw.SchedulingBarrier([]),
+                    epilogue_mma_itr1,
+                ]
+            ),
+        ]
+
+        # =====================================================================
+        # Apply cluster-based reordering for all stages in a single call.
+        # =====================================================================
+        clusters = kernel_clusters + epilogue_clusters + prologue_clusters
+        tkw.reorder_graph(pipeline_loop.EPILOGUE, clusters)
 
         if unroll_factor > 1:
             tkw.unroll(pipeline_loop.KERNEL, unroll_factor)

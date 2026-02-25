@@ -58,12 +58,13 @@ def test_128x256_preshuffle_b_gemm(
 ):
     """128x256 MXFP4 GEMM matching aiter BpreShuffle_128x256 kernel (4-wave).
 
-    Uses the K-partitioned preshuffle-B schedule with a 2-stage pipeline:
+    Uses the K-partitioned preshuffle-B schedule with a 3-stage pipeline:
       - Tile 128x256, 4 waves (1Mx4N)
       - B + B_scale preshuffled (direct global reads, no LDS for B)
-      - A through LDS (double-buffered)
+      - A through LDS (triple-buffered)
       - K-partition interleaving (wave-count-agnostic)
       - Output dtype: f32 (see test_128x256_preshuffle_b_gemm_bf16 for bf16)
+      - unroll_factor=2 for better compute/memory overlap (matching aiter).
     """
     gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
         shape, block, wave_shape=(1, 4)
@@ -75,7 +76,7 @@ def test_128x256_preshuffle_b_gemm(
     options.dump_binaries = "build/binaries"
     options.print_mlir_file = "gemm_mxfp4_128x256_preshuffle_b.mlir"
     options.print_mlir = True
-    schedule = get_mxfp4_preshuffle_b_schedule()
+    schedule = get_mxfp4_preshuffle_b_schedule(unroll_factor=2)
 
     options.print_ir_after = "all" if is_debug else []
     options = set_default_run_config(options)
@@ -163,6 +164,7 @@ def test_128x256_preshuffle_b_gemm_8wave(
       - A through LDS (double-buffered)
       - A scale + B scale direct from global
       - K-partitioned schedule (matches aiter's loop structure)
+      - unroll_factor=2 for better compute/memory overlap (matching aiter).
     """
     gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
         shape, block, wave_shape=(2, 4)
@@ -174,7 +176,7 @@ def test_128x256_preshuffle_b_gemm_8wave(
     options.dump_binaries = "build/binaries"
     options.print_mlir_file = "gemm_mxfp4_128x256_preshuffle_b_8wave.mlir"
     options.print_mlir = True
-    schedule = get_mxfp4_preshuffle_b_schedule()
+    schedule = get_mxfp4_preshuffle_b_schedule(unroll_factor=2)
 
     options.print_ir_after = "all" if is_debug else []
     options = set_default_run_config(options)
