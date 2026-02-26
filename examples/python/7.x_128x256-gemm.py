@@ -64,7 +64,9 @@ def test_128x256_preshuffle_b_gemm(
       - A through LDS (triple-buffered)
       - K-partition interleaving (wave-count-agnostic)
       - Output dtype: f32 (see test_128x256_preshuffle_b_gemm_bf16 for bf16)
-      - unroll_factor=2 for better compute/memory overlap (matching aiter).
+      - unroll_factor=6: K/BLOCK_K=32, 3-stage pipeline peels 2 for prologue
+        leaving 30 KERNEL iterations; 30/6=5 loop iterations.  Aiter uses 8x
+        but 30 is not divisible by 8, so 6 is the closest viable factor.
     """
     gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
         shape, block, wave_shape=(1, 4)
@@ -76,7 +78,7 @@ def test_128x256_preshuffle_b_gemm(
     options.dump_binaries = "build/binaries"
     options.print_mlir_file = "gemm_mxfp4_128x256_preshuffle_b.mlir"
     options.print_mlir = True
-    schedule = get_mxfp4_preshuffle_b_schedule(unroll_factor=2)
+    schedule = get_mxfp4_preshuffle_b_schedule(unroll_factor=6)
 
     options.print_ir_after = "all" if is_debug else []
     options = set_default_run_config(options)
@@ -164,7 +166,8 @@ def test_128x256_preshuffle_b_gemm_8wave(
       - A through LDS (double-buffered)
       - A scale + B scale direct from global
       - K-partitioned schedule (matches aiter's loop structure)
-      - unroll_factor=2 for better compute/memory overlap (matching aiter).
+      - unroll_factor=6: 30 KERNEL iterations / 6 = 5 loop iterations.
+        Aiter uses 8x but 30 is not divisible by 8.
     """
     gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
         shape, block, wave_shape=(2, 4)
@@ -176,7 +179,7 @@ def test_128x256_preshuffle_b_gemm_8wave(
     options.dump_binaries = "build/binaries"
     options.print_mlir_file = "gemm_mxfp4_128x256_preshuffle_b_8wave.mlir"
     options.print_mlir = True
-    schedule = get_mxfp4_preshuffle_b_schedule(unroll_factor=2)
+    schedule = get_mxfp4_preshuffle_b_schedule(unroll_factor=6)
 
     options.print_ir_after = "all" if is_debug else []
     options = set_default_run_config(options)
