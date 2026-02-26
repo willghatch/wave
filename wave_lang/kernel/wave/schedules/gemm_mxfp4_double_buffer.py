@@ -1566,13 +1566,14 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
     """Return a preshuffle-B MXFP4 schedule for wave_compile().
 
     Designed for the preshuffle-B data path where:
-      - A (data + scale): global -> LDS (triple-buffered) -> VGPRs
+      - A data: global -> LDS (triple-buffered) -> VGPRs
+      - A scale: global -> LDS -> VGPRs (4-wave) or global -> VGPRs (8-wave)
       - B (data + scale): global -> VGPRs directly (no LDS, preshuffle required)
 
-    3-stage pipeline (triple buffer for A):
-      Stage 0: Async GatherToLDS for A data and A scale.
-      Stage 1: Global-to-VGPR loads for B and B_scale;
-               LDS-to-VGPR loads for A and A_scale.
+    3-stage pipeline (triple buffer for A data):
+      Stage 0: Async GatherToLDS for A data (and A scale if through LDS).
+      Stage 1: Global-to-VGPR loads for B, B_scale (and A_scale if global);
+               LDS-to-VGPR loads for A data (and A_scale if through LDS).
       Stage 2: Bitcasts; scaled MMA accumulation.
 
     Prologue (2 fill iterations) and epilogue (2 drain iterations) are
@@ -1610,6 +1611,7 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
         all_read_a_scale = tkw.get_node_by_tag("read_a_scale")
         g2s_a_scale = tkw.filter_nodes(all_read_a_scale, node_type=tkw.GatherToLDS)
         s2v_a_scale = tkw.filter_nodes(all_read_a_scale, node_type=tkw.Read)
+        a_scale_through_lds = len(g2s_a_scale) > 0
 
         g2v_b = tkw.get_node_by_tag("read_b")
         g2v_b_scale = tkw.get_node_by_tag("read_b_scale")
@@ -1622,17 +1624,19 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
         scaled_mma = tkw.get_node_by_tag("scaled_mma")
 
         # =====================================================================
-        # 3-stage pipeline (triple buffer for A).
-        # Stage 0: Async G2S for A data and A scale.
-        # Stage 1: G2V for B + B_scale | S2V for A + A_scale.
+        # 3-stage pipeline (triple buffer for A data).
+        # Stage 0: Async G2S for A data (and A scale if through LDS).
+        # Stage 1: G2V for B + B_scale (+ A_scale if global) | S2V for A.
         # Stage 2: bitcasts | scaled MMA.
         # =====================================================================
         pipeline_loop = tkw.pipeline(k_loop)
 
+        stage_0_ops = (g2s_a, g2s_a_scale) if a_scale_through_lds else (g2s_a,)
+
         with pipeline_loop as pl:
             pl.set_stage(
                 [
-                    (g2s_a, g2s_a_scale),
+                    stage_0_ops,
                     (),
                     (),
                 ],
@@ -1659,18 +1663,22 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
 
         # =====================================================================
         # PROLOGUE: 2 fill iterations.
-        #   Fill 0: G2S_A (iter 0).
-        #   Fill 1: G2S_A (iter 1) + G2V_B (iter 0) + S2V_A (iter 0).
+        #   Fill 0: G2S_A (iter 0), and G2S_A_scale (iter 0) if through LDS.
+        #   Fill 1: G2S_A (iter 1) + G2V_B (iter 0) + S2V_A (iter 0)
+        #           + A_scale (iter 0, global reads or LDS reads).
         #
         # A MemoryCounterWaitBarrier gates the S2V_A reads so that iter-0's
         # G2S writes are visible across all waves (vmcnt first, then
-        # s_barrier).  Iter-1 G2S and G2V_B may remain outstanding.
+        # s_barrier).  Iter-1 G2S, G2V_B, and A_scale reads may remain
+        # outstanding.
         # =====================================================================
         prologue_g2s_a = tkw.filter_nodes(
             g2s_a, subgraph=pipeline_loop.PROLOGUE
         )
-        prologue_g2s_a_scale = tkw.filter_nodes(
-            g2s_a_scale, subgraph=pipeline_loop.PROLOGUE
+        prologue_g2s_a_scale = (
+            tkw.filter_nodes(g2s_a_scale, subgraph=pipeline_loop.PROLOGUE)
+            if a_scale_through_lds
+            else []
         )
         prologue_g2v_b = tkw.filter_nodes(
             g2v_b, subgraph=pipeline_loop.PROLOGUE
@@ -1690,26 +1698,42 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
         n_g2s_per_iter = n_prologue_g2s // 2
         prologue_vmcnt = n_g2s_per_iter + n_prologue_g2v
 
-        prologue_clusters = [
-            tkw.cluster(
-                [
-                    prologue_g2s_a,
-                    prologue_g2s_a_scale,
-                    prologue_g2v_b,
-                    prologue_g2v_b_scale,
-                    tkw.MemoryCounterWaitBarrier(load=prologue_vmcnt),
-                    prologue_s2v_a,
-                    prologue_s2v_a_scale,
-                ]
-            ),
-        ]
+        if a_scale_through_lds:
+            prologue_clusters = [
+                tkw.cluster(
+                    [
+                        prologue_g2s_a,
+                        prologue_g2s_a_scale,
+                        prologue_g2v_b,
+                        prologue_g2v_b_scale,
+                        tkw.MemoryCounterWaitBarrier(load=prologue_vmcnt),
+                        prologue_s2v_a,
+                        prologue_s2v_a_scale,
+                    ]
+                ),
+            ]
+        else:
+            prologue_clusters = [
+                tkw.cluster(
+                    [
+                        prologue_g2s_a,
+                        prologue_g2v_b,
+                        prologue_g2v_b_scale,
+                        prologue_s2v_a_scale,
+                        tkw.MemoryCounterWaitBarrier(load=prologue_vmcnt),
+                        prologue_s2v_a,
+                    ]
+                ),
+            ]
 
         # =====================================================================
         # KERNEL: Partition by K for interleaved cluster layout.
         # =====================================================================
         loop_g2s_a = tkw.filter_nodes(g2s_a, subgraph=pipeline_loop.KERNEL)
-        loop_g2s_a_scale = tkw.filter_nodes(
-            g2s_a_scale, subgraph=pipeline_loop.KERNEL
+        loop_g2s_a_scale = (
+            tkw.filter_nodes(g2s_a_scale, subgraph=pipeline_loop.KERNEL)
+            if a_scale_through_lds
+            else []
         )
 
         loop_g2v_b = tkw.filter_nodes(g2v_b, subgraph=pipeline_loop.KERNEL)
@@ -1772,22 +1796,24 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
         #   MemoryCounterWait(load=0) + WorkgroupBarrier -- ensure previous
         #     iteration's G2S writes are visible across ALL waves (vmcnt=0
         #     first, then s_barrier for cross-wave visibility).
-        #   G2S_A for the next-next iteration (start async prefetch early).
-        #   K=0 LDS reads + bitcasts.
-        #   K=0 MFMAs interleaved with K=1 LDS reads + B global loads.
+        #   G2S_A (+ G2S_A_scale if through LDS) for the next-next iteration.
+        #   K=0 LDS/global reads + bitcasts.
+        #   K=0 MFMAs interleaved with K=1 reads + B global loads.
         #
         # Cluster 1:
         #   MemoryCounterWaitBarrier(load=n_g2v_b, ds=0) -- wait for K=1
-        #     LDS reads (lgkmcnt=0) before K=1 compute.
+        #     reads before K=1 compute.
         #   K=1 bitcasts + K=1 MFMAs.
         # =====================================================================
+        cluster_0_g2s = [loop_g2s_a, loop_g2s_a_scale] if a_scale_through_lds else [loop_g2s_a]
         kernel_clusters = [
             tkw.cluster(
                 [
                     tkw.MemoryCounterWait(load=0),
                     tkw.WorkgroupBarrier(),
-                    loop_g2s_a,
-                    loop_g2s_a_scale,
+                ]
+                + cluster_0_g2s
+                + [
                     tkw.SchedulingBarrier([]),
                     loop_s2v_a_0,
                     loop_s2v_a_scale_0,

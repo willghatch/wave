@@ -293,8 +293,10 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
 
     B data is read directly from global memory using a preshuffle mapping
     (aiter shuffle_weight permutation).  B scales are also read from global
-    memory using an e8m0 scale preshuffle mapping.  A and A_scale go through
-    shared memory (LDS) as usual.
+    memory using an e8m0 scale preshuffle mapping.  A data goes through
+    shared memory (LDS).  A scale is read directly from global memory
+    (matching aiter, and avoiding GatherToLDS oversubscription with > 4
+    waves where the scale tile is too small for all threads).
 
     All ops are tagged for use with MXFP4 schedule functions.
 
@@ -303,7 +305,7 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
         block_shape: (BLOCK_M, BLOCK_N, BLOCK_K) tile sizes.
         wave_shape: (WAVE_M, WAVE_N) waves per workgroup.
         mfma_variant: Scaled MMA instruction type.
-        a_address_space: Address space for A and A_scale (typically SHARED).
+        a_address_space: Address space for A data (typically SHARED).
         output_dtype: Data type for the output tensor C (default f32).
             The accumulator is always f32; this controls the memory layout
             of the output.  Pass tkl.bf16 to match aiter's bf16 output.
@@ -417,10 +419,20 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
         outputs={K: k_s, N: n_s},
     )
 
+    # Determine whether a_scale can go through LDS.  GatherToLDS requires
+    # every thread to load at least 4 bytes (one dword).  If the a_scale tile
+    # is smaller than (num_threads * 4), use global reads instead.  This
+    # avoids out-of-bounds LDS writes with >4 waves.
+    A_SCALE_ADDRESS_SPACE = tkl.sym.A_SCALE_ADDRESS_SPACE
+    total_threads = wave_shape[0] * wave_shape[1] * 64
+    a_scale_tile_bytes = block_shape[0] * (block_shape[2] // 32)
+    a_scale_fits_lds = total_threads * 4 <= a_scale_tile_bytes
+    a_scale_address_space = a_address_space if a_scale_fits_lds else GLOBAL_ADDRESS_SPACE
+
     @tkw.wave(constraints)
     def gemm(
         a: tkl.Memory[M, K / 2, A_ADDRESS_SPACE, tkl.i8],
-        a_scale: tkl.Memory[M, K / 32, A_ADDRESS_SPACE, tkl.i8],
+        a_scale: tkl.Memory[M, K / 32, A_SCALE_ADDRESS_SPACE, tkl.i8],
         b: tkl.Memory[N, K / 2, GLOBAL_ADDRESS_SPACE, tkl.i8],
         b_scale: tkl.Memory[N, K / 32, GLOBAL_ADDRESS_SPACE, tkl.i8],
         c: tkl.Memory[M, N, C_ADDRESS_SPACE, output_dtype],
@@ -448,6 +460,7 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
 
     hyperparams = {
         A_ADDRESS_SPACE: a_address_space,
+        A_SCALE_ADDRESS_SPACE: a_scale_address_space,
         C_ADDRESS_SPACE: GLOBAL_ADDRESS_SPACE,
         BLOCK_M: block_shape[0],
         BLOCK_N: block_shape[1],
