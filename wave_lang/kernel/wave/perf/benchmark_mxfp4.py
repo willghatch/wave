@@ -13,6 +13,14 @@ Shapes from CSV with required columns M, N, K, MT_M, MT_N, and MT_K:
 
   python -u wave_lang/kernel/wave/perf/benchmark_mxfp4.py --shapes wave_lang/kernel/wave/perf/mxfp4_shapes_macrotiles.csv -o results.csv
 
+Preshuffle-B template (128x256 kernel from examples/python/7.x_128x256-gemm.py):
+
+  python -u wave_lang/kernel/wave/perf/benchmark_mxfp4.py \\
+      --template mxfp4_preshuffle_b \\
+      --wave-shape 1,4 --unroll-factor 6 \\
+      --shapes wave_lang/kernel/wave/perf/mxfp4_128x256_shapes.csv \\
+      -o results.csv
+
 Optional env: ATT_LIBRARY_PATH=/path/to/rocprof-trace-decoder/rocm/lib. If set, passed to rocprofv3 (--att --att-library-path).
 """
 
@@ -29,13 +37,21 @@ from typing import Optional
 
 import torch
 from wave_lang.kernel.wave.compile import wave_compile
-from wave_lang.kernel.wave.schedules import get_mxfp4_dbuf_schedule
-from wave_lang.kernel.wave.templates.tagged_mxfp4_gemm import get_tagged_mxfp4_gemm
+from wave_lang.kernel.wave.schedules import (
+    get_mxfp4_dbuf_schedule,
+    get_mxfp4_preshuffle_b_schedule,
+)
+from wave_lang.kernel.wave.templates.tagged_mxfp4_gemm import (
+    get_tagged_mxfp4_gemm,
+    get_tagged_mxfp4_gemm_preshuffle_b,
+)
 from wave_lang.kernel.lang.global_symbols import *
 from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
 from wave_lang.kernel.wave.utils.mxfp_utils import (
     generate_gemm_afp4wfp4_inputs,
     torchScaledGemmMXFP4,
+    b_preshuffle,
+    e8m0_shuffle,
 )
 from wave_lang.kernel.wave.perf.utils import (
     find_rocprof_outputs,
@@ -56,6 +72,25 @@ def get_mxfp4_gemm_wave(
     schedule = get_mxfp4_dbuf_schedule(use_stagger=True)
     options = set_default_run_config(options)
 
+    compiled_gemm = wave_compile(options, gemm, schedule)
+    return compiled_gemm
+
+
+def get_mxfp4_preshuffle_b_gemm_wave(
+    shape: tuple[int, int, int],
+    macrotiles: tuple[int, int, int],
+    wave_shape: tuple[int, int] = (1, 4),
+    unroll_factor: int = 6,
+):
+    """Compile the preshuffle-B MXFP4 GEMM (examples/python/7.x_128x256-gemm.py)."""
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
+        shape, macrotiles, wave_shape=wave_shape
+    )
+    options.minimize_shared_allocs = True
+    options.linearize_shared_access = True
+    options.use_buffer_ops = True
+    schedule = get_mxfp4_preshuffle_b_schedule(unroll_factor=unroll_factor)
+    options = set_default_run_config(options)
     compiled_gemm = wave_compile(options, gemm, schedule)
     return compiled_gemm
 
@@ -143,16 +178,31 @@ def run_worker(
     macrotiles: tuple[int, int, int],
     warmup_iters: int = 0,
     benchmark_iters: int = 1,
+    template: str = "mxfp4",
+    wave_shape: tuple[int, int] = (1, 4),
+    unroll_factor: int = 6,
 ) -> None:
     """Worker entry: compile GEMM with wave_runtime, run torch benchmark, print MEAN_US to stdout."""
     m, n, k = shape
-    gemm_rt = get_mxfp4_gemm_wave(shape, macrotiles)
-
     device = torch.device("cuda")
-    x, w, x_scale, w_scale = generate_gemm_afp4wfp4_inputs((m, n, k), device)
-    w_t = w.T.contiguous()
-    wave_out = torch.empty(m, n, device=device, dtype=torch.float32)
-    inputs = (x, x_scale, w_t, w_scale, wave_out)
+
+    if template == "mxfp4_preshuffle_b":
+        gemm_rt = get_mxfp4_preshuffle_b_gemm_wave(
+            shape, macrotiles, wave_shape=wave_shape, unroll_factor=unroll_factor
+        )
+        x, w, x_scale, w_scale = generate_gemm_afp4wfp4_inputs((m, n, k), device)
+        w_t = w.T.contiguous()
+        w_t_ps = b_preshuffle(w_t)
+        x_scale_ps = e8m0_shuffle(x_scale)
+        w_scale_ps = e8m0_shuffle(w_scale)
+        wave_out = torch.empty(m, w_t_ps.shape[0], device=device, dtype=torch.float32)
+        inputs = (x, x_scale_ps, w_t_ps, w_scale_ps, wave_out)
+    else:
+        gemm_rt = get_mxfp4_gemm_wave(shape, macrotiles)
+        x, w, x_scale, w_scale = generate_gemm_afp4wfp4_inputs((m, n, k), device)
+        w_t = w.T.contiguous()
+        wave_out = torch.empty(m, n, device=device, dtype=torch.float32)
+        inputs = (x, x_scale, w_t, w_scale, wave_out)
 
     mean_us = _run_torch_benchmark(
         gemm_rt, inputs, warmup_iters=warmup_iters, benchmark_iters=benchmark_iters
@@ -160,18 +210,35 @@ def run_worker(
     print(f"MEAN_US: {mean_us}")
 
 
-def validate_mxfp4_gemm(shape: tuple[int, int, int], compiled_gemm) -> bool:
+def validate_mxfp4_gemm(
+    shape: tuple[int, int, int],
+    compiled_gemm,
+    template: str = "mxfp4",
+) -> bool:
     """Run compiled Wave GEMM (with wave_runtime=True) and compare to torch reference."""
     m, n, k = shape
     try:
         device = torch.device("cuda")
         x, w, x_scale, w_scale = generate_gemm_afp4wfp4_inputs(shape, device)
-        w_t = w.T.contiguous()
-        wave_out = torch.zeros(m, n, device=device, dtype=torch.float32)
-
-        compiled_gemm(x, x_scale, w_t, w_scale, wave_out)
         torch_ref = torchScaledGemmMXFP4(x, w, x_scale, w_scale)
-        torch.testing.assert_close(wave_out, torch_ref, check_device=False)
+
+        if template == "mxfp4_preshuffle_b":
+            w_t = w.T.contiguous()
+            w_t_ps = b_preshuffle(w_t)
+            x_scale_ps = e8m0_shuffle(x_scale)
+            w_scale_ps = e8m0_shuffle(w_scale)
+            wave_out = torch.zeros(
+                m, w_t_ps.shape[0], device=device, dtype=torch.float32
+            )
+            compiled_gemm(x, x_scale_ps, w_t_ps, w_scale_ps, wave_out)
+        else:
+            w_t = w.T.contiguous()
+            wave_out = torch.zeros(m, n, device=device, dtype=torch.float32)
+            compiled_gemm(x, x_scale, w_t, w_scale, wave_out)
+
+        torch.testing.assert_close(
+            wave_out, torch_ref, check_dtype=False, check_device=False
+        )
         return True
     except Exception as e:
         raise RuntimeError(f"Validation failed for shape {shape}: {e}") from e
@@ -186,6 +253,9 @@ def benchmark_mxfp4_gemm_rocprof(
     timeout: Optional[float] = None,
     warmup_iters: int = 0,
     benchmark_iters: int = 1,
+    template: str = "mxfp4",
+    wave_shape: tuple[int, int] = (1, 4),
+    unroll_factor: int = 6,
 ) -> float:
     """Run self as worker under rocprofv3 (torch benchmark); return mean runtime in microseconds.
 
@@ -214,6 +284,12 @@ def benchmark_mxfp4_gemm_rocprof(
         str(warmup_iters),
         "--benchmark-iters",
         str(benchmark_iters),
+        "--template",
+        template,
+        "--wave-shape",
+        f"{wave_shape[0]},{wave_shape[1]}",
+        "--unroll-factor",
+        str(unroll_factor),
     ]
     full_cmd = profile_prefix + worker_cmd
     try:
@@ -262,6 +338,9 @@ def run_validate_and_benchmark(
     kernel_regex: str = "gemm",
     warmup_iters: int = 0,
     benchmark_iters: int = 1,
+    template: str = "mxfp4",
+    wave_shape: tuple[int, int] = (1, 4),
+    unroll_factor: int = 6,
 ) -> tuple[Optional[float], Optional[float], str]:
     """
     Compile with wave_runtime and validate; then benchmark via torch worker under rocprofv3.
@@ -274,7 +353,12 @@ def run_validate_and_benchmark(
 
     # Compile for validation (wave_runtime=True)
     try:
-        gemm_rt = get_mxfp4_gemm_wave(shape, macrotiles)
+        if template == "mxfp4_preshuffle_b":
+            gemm_rt = get_mxfp4_preshuffle_b_gemm_wave(
+                shape, macrotiles, wave_shape=wave_shape, unroll_factor=unroll_factor
+            )
+        else:
+            gemm_rt = get_mxfp4_gemm_wave(shape, macrotiles)
     except Exception as e:
         raise BenchmarkError(
             f"Compilation failed for shape {shape}: {e}", stage="compile_failed"
@@ -288,7 +372,7 @@ def run_validate_and_benchmark(
 
     # Validate numerics
     try:
-        validate_mxfp4_gemm(shape, gemm_rt)
+        validate_mxfp4_gemm(shape, gemm_rt, template=template)
     except Exception as e:
         raise BenchmarkError(
             f"Validation failed for shape {shape}: {e}", stage="validation_failed"
@@ -305,6 +389,9 @@ def run_validate_and_benchmark(
             kernel_regex=kernel_regex,
             warmup_iters=warmup_iters,
             benchmark_iters=benchmark_iters,
+            template=template,
+            wave_shape=wave_shape,
+            unroll_factor=unroll_factor,
         )
     except RuntimeError as e:
         raise BenchmarkError(str(e), stage="benchmark_failed") from e
@@ -316,6 +403,15 @@ def run_validate_and_benchmark(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+def _parse_wave_shape(s: str) -> tuple[int, int]:
+    parts = s.split(",")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(
+            f"wave-shape must be two comma-separated ints, got {s!r}"
+        )
+    return (int(parts[0]), int(parts[1]))
 
 
 def parse_args():
@@ -346,6 +442,29 @@ def parse_args():
         type=Path,
         metavar="CSV",
         help="CSV path with header M,N,K (optional columns MT_M, MT_N, MT_K for macrotile sizes)",
+    )
+    p.add_argument(
+        "--template",
+        type=str,
+        choices=["mxfp4", "mxfp4_preshuffle_b"],
+        default="mxfp4",
+        help="Kernel template: 'mxfp4' (default, non-preshuffle) or "
+        "'mxfp4_preshuffle_b' (128x256 preshuffle-B kernel)",
+    )
+    p.add_argument(
+        "--wave-shape",
+        type=_parse_wave_shape,
+        default=(1, 4),
+        metavar="M,N",
+        help="Wave shape as M,N (default: 1,4 for 4-wave). "
+        "Only used with --template mxfp4_preshuffle_b",
+    )
+    p.add_argument(
+        "--unroll-factor",
+        type=int,
+        default=6,
+        help="K-loop unroll factor (default: 6). "
+        "Only used with --template mxfp4_preshuffle_b",
     )
     p.add_argument(
         "--warmup-iters",
@@ -459,6 +578,9 @@ def main():
             macrotiles,
             warmup_iters=args.warmup_iters,
             benchmark_iters=args.benchmark_iters,
+            template=args.template,
+            wave_shape=args.wave_shape,
+            unroll_factor=args.unroll_factor,
         )
         return
 
@@ -475,6 +597,15 @@ def main():
     kernel_regex = args.kernel_regex
     warmup_iters = args.warmup_iters
     benchmark_iters = args.benchmark_iters
+    template = args.template
+    wave_shape = args.wave_shape
+    unroll_factor = args.unroll_factor
+
+    if template == "mxfp4_preshuffle_b":
+        print(
+            f"Template: mxfp4_preshuffle_b, "
+            f"wave_shape={wave_shape}, unroll_factor={unroll_factor}"
+        )
 
     # --shapes mode
     if not args.shapes.exists():
@@ -509,6 +640,9 @@ def main():
                 kernel_regex=kernel_regex,
                 warmup_iters=warmup_iters,
                 benchmark_iters=benchmark_iters,
+                template=template,
+                wave_shape=wave_shape,
+                unroll_factor=unroll_factor,
             )
         except BenchmarkError as e:
             print(f"  {e}", file=sys.stderr)
