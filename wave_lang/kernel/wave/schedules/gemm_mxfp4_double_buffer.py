@@ -1774,6 +1774,7 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
         )
 
         n_g2v_b_loads = len(loop_g2v_b) + len(loop_g2v_b_scale)
+        n_g2s_per_kernel_iter = len(loop_g2s_a) + len(loop_g2s_a_scale)
 
         interleaved_mma_0 = tkw.interleave_operations(
             base_ops=loop_mma_0,
@@ -1793,9 +1794,10 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
         # replicates them correctly across unrolled iterations.
         #
         # Cluster 0:
-        #   MemoryCounterWait(load=0) + WorkgroupBarrier -- ensure previous
-        #     iteration's G2S writes are visible across ALL waves (vmcnt=0
-        #     first, then s_barrier for cross-wave visibility).
+        #   MemoryCounterWait(load=n_g2s) + WorkgroupBarrier -- ensure the
+        #     G2S writes from TWO iterations ago are complete (triple-buffer
+        #     correctness) while allowing the PREVIOUS iteration's G2S to
+        #     remain in-flight (it targets a different LDS slot).
         #   G2S_A (+ G2S_A_scale if through LDS) for the next-next iteration.
         #   K=0 LDS/global reads + bitcasts.
         #   K=0 MFMAs interleaved with K=1 reads + B global loads.
@@ -1809,7 +1811,7 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
         kernel_clusters = [
             tkw.cluster(
                 [
-                    tkw.MemoryCounterWait(load=0),
+                    tkw.MemoryCounterWait(load=n_g2s_per_kernel_iter),
                     tkw.WorkgroupBarrier(),
                 ]
                 + cluster_0_g2s
@@ -1843,8 +1845,9 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
         #   Drain 0: Stage 1 (G2V_B, S2V_A) + Stage 2 (bitcasts, MMA).
         #   Drain 1: Stage 2 only (bitcasts, MMA).
         #
-        # Drain 0's S2V_A reads data written by the last KERNEL iteration's
-        # G2S, so MemoryCounterWait(load=0) + WorkgroupBarrier gates them.
+        # Drain 0's S2V_A reads data written by the second-to-last KERNEL
+        # iteration's G2S.  The last KERNEL iteration's G2S targets a
+        # different LDS slot (triple buffering) and can remain in-flight.
         # =====================================================================
         epilogue_g2v_b = tkw.filter_nodes(
             g2v_b, subgraph=pipeline_loop.EPILOGUE
@@ -1903,7 +1906,7 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
         epilogue_clusters = [
             tkw.cluster(
                 [
-                    tkw.MemoryCounterWait(load=0),
+                    tkw.MemoryCounterWait(load=n_g2s_per_kernel_iter),
                     tkw.WorkgroupBarrier(),
                     epilogue_g2v_b,
                     epilogue_g2v_b_scale,
