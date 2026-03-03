@@ -2239,12 +2239,21 @@ ProgramOp createProgramFromGPUFunc(gpu::GPUFuncOp gpuFunc, OpBuilder &builder,
   auto abiAttr =
       KernelABIAttr::get(ctx, 0, 0, std::nullopt, std::nullopt, std::nullopt);
 
+  // Extract workgroup_size from gpu.func if present
+  ArrayAttr workgroupSizeAttr;
+  if (auto wgAttr = gpuFunc->getAttrOfType<DenseI64ArrayAttr>("workgroup_size")) {
+    SmallVector<Attribute> sizes;
+    for (int64_t v : wgAttr.asArrayRef())
+      sizes.push_back(builder.getI64IntegerAttr(v));
+    workgroupSizeAttr = builder.getArrayAttr(sizes);
+  }
+
   // Create program
   auto program =
       ProgramOp::create(builder, loc, gpuFunc.getName(), targetAttr, abiAttr,
                         /*vgprs=*/int64_t{256},
                         /*sgprs=*/int64_t{104},
-                        /*workgroup_size=*/ArrayAttr{},
+                        /*workgroup_size=*/workgroupSizeAttr,
                         /*lds_size=*/IntegerAttr{});
 
   // Ensure the body region has a block

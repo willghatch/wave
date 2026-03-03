@@ -275,7 +275,9 @@ MetadataEmitter::emitKernelDescriptor(int64_t peakVGPRs, int64_t peakSGPRs,
         wgZ = intAttr.getInt();
       }
     }
-    if (wgY > 1 || wgZ > 1) {
+    if (wgZ > 1) {
+      systemVgprWorkitemId = 2;
+    } else if (wgY > 1) {
       systemVgprWorkitemId = 1;
     }
   }
