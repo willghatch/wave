@@ -37,6 +37,8 @@ class KernelModuleCompiler:
     targetid: str = "gfx942"
     codeobj: str = "5"
     mma_type: Optional["MMAType"] = None
+    max_vgprs: int = 512
+    max_agprs: int = 512
 
     def compile_mlir_string(self, mlir_text: str) -> str:
         """
@@ -194,6 +196,7 @@ class KernelModuleCompiler:
                     num_kernargs=num_args,
                     kernel_name=kernel_name,
                     architecture=self.targetid,
+                    max_vgprs=self.max_vgprs,
                 )
 
                 # Emit kernarg loading at the start of kernel IR

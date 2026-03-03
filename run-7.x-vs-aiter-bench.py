@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Benchmark Wave MXFP4 preshuffle-B GEMM (4-wave) vs aiter gemm_a4w4.
 
-Uses the same compilation pipeline as benchmark_mxfp4.py (called by
-run-bench.sh) with wave_runtime=True so that both scripts produce the
-same Wave kernel binary.
+Uses the same kernel template and compile options as benchmark_mxfp4.py
+(called by run-bench.sh), compiled through the C++ waveasm-translate
+backend and launched via wave_runtime.
 
 Usage:
     python run-7.x-vs-aiter-bench.py --shapes-csv wave_lang/kernel/wave/perf/mxfp4_128x256_shapes.csv
@@ -27,7 +27,7 @@ import torch
 
 DEFAULT_BLOCK = (128, 256, 256)
 DEFAULT_WAVE_SHAPE = (1, 4)
-DEFAULT_UNROLL_FACTOR = 6
+DEFAULT_UNROLL_FACTOR = 1
 
 _PRESHUFFLE_B_PIPELINE_STAGES = 3
 _PRESHUFFLE_B_PEELED_ITERS = _PRESHUFFLE_B_PIPELINE_STAGES - 1  # 2
@@ -77,15 +77,21 @@ def load_shapes_csv(path):
     return entries
 
 
-def compile_wave_kernel(shape, macrotiles, wave_shape, unroll_factor):
-    """Compile via wave_compile -- same path as benchmark_mxfp4.py.
+def compile_wave_kernel_waveasm(shape, macrotiles, wave_shape, unroll_factor):
+    """Compile the same kernel template as benchmark_mxfp4.py via C++ waveasm-translate.
 
-    Returns a callable WaveKernel or None on failure.
+    Returns (gpu_func, grid_size, workgroup_size, lds_size) or raises on failure.
     """
-    from wave_lang.kernel.wave.compile import wave_compile
+    sys.path.insert(0, "wave_lang/kernel/wave/asm/wave_asm/test/e2e")
+    from waveasm_e2e import WaveASMCompiler, capture_wave_kernel_info
+    import wave_runtime
+
     from wave_lang.kernel.wave.schedules import get_mxfp4_preshuffle_b_schedule
     from wave_lang.kernel.wave.templates import get_tagged_mxfp4_gemm_preshuffle_b
-    from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
+    from wave_lang.kernel.wave.utils.run_utils import (
+        set_default_run_config,
+        get_default_arch,
+    )
 
     _M, _N, K = shape
     _MT_M, _MT_N, BLOCK_K = macrotiles
@@ -107,9 +113,27 @@ def compile_wave_kernel(shape, macrotiles, wave_shape, unroll_factor):
     options.use_buffer_ops = True
     schedule = get_mxfp4_preshuffle_b_schedule(unroll_factor=effective_unroll)
     options = set_default_run_config(options)
+    options.backend = "asm"
     options.wave_runtime = True
 
-    return wave_compile(options, gemm, schedule)
+    kernel_info = capture_wave_kernel_info(options, gemm, schedule=schedule)
+
+    compiler = WaveASMCompiler(target=get_default_arch(), keep_temp_files=True)
+    cpp_result = compiler.compile_full(
+        kernel_info.mlir_text, kernel_info.workgroup_size
+    )
+    if not cpp_result.success:
+        raise RuntimeError(
+            f"waveasm-translate compile failed: {cpp_result.error_message[:500]}"
+        )
+
+    wave_runtime.load_hip_functions()
+    kernel_name = cpp_result.get_kernel_name() or kernel_info.kernel_name
+    gpu_binary, gpu_func = wave_runtime.load_binary(
+        str(cpp_result.binary_path), kernel_name
+    )
+
+    return (gpu_func, kernel_info.grid_size, kernel_info.workgroup_size, kernel_info.lds_size)
 
 
 def main():
@@ -149,6 +173,9 @@ def main():
     wave_kernels = {}
 
     if not args.skip_wave:
+        import wave_runtime
+        wave_runtime.load_hip_functions()
+
         for idx, (shape, block) in enumerate(entries):
             label = "wave-4w"
             key = (shape, block, label)
@@ -156,12 +183,12 @@ def main():
                 continue
             print(
                 f"[{idx+1}/{len(entries)}] Compiling {label} "
-                f"shape={shape} block={block} [wave_runtime]...",
+                f"shape={shape} block={block} [waveasm-translate]...",
                 flush=True,
             )
             t0 = time.time()
             try:
-                compiled = compile_wave_kernel(
+                compiled = compile_wave_kernel_waveasm(
                     shape, block,
                     wave_shape=DEFAULT_WAVE_SHAPE,
                     unroll_factor=DEFAULT_UNROLL_FACTOR,
@@ -193,6 +220,8 @@ def main():
     # Run benchmarks
     # ------------------------------------------------------------------
 
+    import wave_runtime as _wr
+
     results = []
 
     for idx, (shape, block) in enumerate(entries):
@@ -218,7 +247,7 @@ def main():
             if key not in wave_kernels:
                 print(f"  {label:>12s}:  SKIPPED (compilation failed)")
             else:
-                compiled_gemm = wave_kernels[key]
+                gpu_func, grid, wg_size, lds_size = wave_kernels[key]
                 device = torch.device("cuda")
                 x, w, x_scale, w_scale = generate_gemm_afp4wfp4_inputs(shape, device)
                 w_t = w.T.contiguous()
@@ -229,11 +258,23 @@ def main():
                     M, w_t_ps.shape[0], dtype=torch.float32, device=device
                 )
 
-                def run_wave(
-                    _gemm=compiled_gemm, _x=x, _xs=x_scale_ps,
-                    _w=w_t_ps, _ws=w_scale_ps, _out=wave_out,
-                ):
-                    _gemm(_x, _xs, _w, _ws, _out)
+                stream = torch.cuda.current_stream().cuda_stream
+                launch_info = _wr.KernelLaunchInfo(
+                    stream, gpu_func, lds_size,
+                    grid[0], grid[1], grid[2],
+                    wg_size[0], wg_size[1], wg_size[2],
+                    1, 1, 1,
+                )
+                kern_args = _wr.Int64Vector([
+                    x.data_ptr(),
+                    x_scale_ps.data_ptr(),
+                    w_t_ps.data_ptr(),
+                    w_scale_ps.data_ptr(),
+                    wave_out.data_ptr(),
+                ])
+
+                def run_wave(_li=launch_info, _ka=kern_args):
+                    _wr.launch(_li, _ka, [], [])
 
                 us = bench_cuda_events(run_wave, warmup, iters)
                 tf = calc_tflops(M, N, K, us)

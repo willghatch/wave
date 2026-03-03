@@ -637,13 +637,48 @@ class _MemoryHandlers:
         result_ssa = str(operation.results[0])
         ctx.ssa_to_reg[result_ssa] = result_regs
 
+    def _resolve_binding_use(self, kernel_info, memref_ssa):
+        """Resolve a memref SSA through cast/buffer chains back to its BindingUse.
+
+        With use_buffer_ops=True, loads reference the result of
+        amdgpu.fat_raw_buffer_cast rather than the reinterpret_cast
+        registered in kernel_info.subspans.  This helper follows:
+          fat_raw_buffer_cast -> memref.cast -> reinterpret_cast -> subspans
+        """
+        if memref_ssa in kernel_info.subspans:
+            return kernel_info.subspans[memref_ssa]
+
+        visited = {memref_ssa}
+        current = memref_ssa
+
+        fat_sources = getattr(self.walker, "_fat_buffer_sources", {})
+        cast_sources = getattr(self.walker, "_memref_cast_sources", {})
+
+        while True:
+            if current in fat_sources:
+                current = fat_sources[current]["source_ssa"]
+            elif current in cast_sources:
+                current = cast_sources[current]
+            else:
+                break
+            if current in visited:
+                break
+            visited.add(current)
+            if current in kernel_info.subspans:
+                return kernel_info.subspans[current]
+
+        raise KeyError(
+            f"Cannot resolve memref {memref_ssa} to a stream.binding.subspan. "
+            f"Checked subspans, _fat_buffer_sources, and _memref_cast_sources."
+        )
+
     def _ensure_global_load_srd(self, kernel_info, memref_ssa):
         """Ensure SRD is set up for a global load."""
         # Kernel IR mode: use kernel_ctx SRD tracking
         if memref_ssa in self.walker.kernel_ctx.srd_ranges:
             return
 
-        binding_use = kernel_info.subspans[memref_ssa]
+        binding_use = self._resolve_binding_use(kernel_info, memref_ssa)
         if not binding_use.memref_info:
             raise ValueError(
                 f"Cannot determine memref information for {memref_ssa}. "
@@ -897,12 +932,11 @@ class _MemoryHandlers:
 
     def _ensure_global_store_srd(self, kernel_info, memref_ssa):
         """Ensure SRD is set up for a global store."""
-        binding_use = kernel_info.subspans[memref_ssa]
-
         # Kernel IR mode: use kernel_ctx SRD tracking
         if memref_ssa in self.walker.kernel_ctx.srd_ranges:
             return
 
+        binding_use = self._resolve_binding_use(kernel_info, memref_ssa)
         if not binding_use.memref_info:
             raise ValueError(
                 f"Cannot determine memref information for {memref_ssa}. "
