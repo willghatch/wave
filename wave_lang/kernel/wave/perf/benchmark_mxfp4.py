@@ -77,7 +77,7 @@ def get_mxfp4_gemm_wave(
 
 
 _PRESHUFFLE_B_PIPELINE_STAGES = 3
-_PRESHUFFLE_B_PEELED_ITERS = 2 * (_PRESHUFFLE_B_PIPELINE_STAGES - 1)  # 4
+_PRESHUFFLE_B_PEELED_ITERS = _PRESHUFFLE_B_PIPELINE_STAGES - 1  # 2 (prologue only)
 
 
 def _pick_unroll_factor(kernel_iters: int, preferred: int) -> int:
@@ -99,10 +99,12 @@ def get_mxfp4_preshuffle_b_gemm_wave(
 ):
     """Compile the preshuffle-B MXFP4 GEMM (examples/python/7.x_128x256-gemm.py).
 
-    The 3-stage pipeline peels 4 iterations (2 prologue + 2 epilogue), so the
-    KERNEL loop body runs for ``K / BLOCK_K - 4`` iterations.  The unroll
-    factor must divide that count evenly.  If the requested unroll_factor does
-    not divide, we fall back to the largest factor <= the requested value.
+    The 3-stage pipeline peels ``num_stages - 1 = 2`` prologue iterations from
+    the KERNEL loop count (the epilogue drains after the loop ends without
+    reducing its count).  So the KERNEL loop body runs for
+    ``K / BLOCK_K - 2`` iterations.  The unroll factor must divide that count
+    evenly.  If the requested unroll_factor does not divide, we fall back to
+    the largest factor <= the requested value.
     """
     _M, _N, K = shape
     _MT_M, _MT_N, BLOCK_K = macrotiles
