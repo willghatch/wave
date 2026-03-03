@@ -76,20 +76,53 @@ def get_mxfp4_gemm_wave(
     return compiled_gemm
 
 
+_PRESHUFFLE_B_PIPELINE_STAGES = 3
+_PRESHUFFLE_B_PEELED_ITERS = 2 * (_PRESHUFFLE_B_PIPELINE_STAGES - 1)  # 4
+
+
+def _pick_unroll_factor(kernel_iters: int, preferred: int) -> int:
+    """Return the largest factor of kernel_iters that is <= preferred.
+
+    Falls back to 1 (no unrolling) if nothing else divides evenly.
+    """
+    for f in range(preferred, 1, -1):
+        if kernel_iters % f == 0:
+            return f
+    return 1
+
+
 def get_mxfp4_preshuffle_b_gemm_wave(
     shape: tuple[int, int, int],
     macrotiles: tuple[int, int, int],
     wave_shape: tuple[int, int] = (1, 4),
     unroll_factor: int = 6,
 ):
-    """Compile the preshuffle-B MXFP4 GEMM (examples/python/7.x_128x256-gemm.py)."""
+    """Compile the preshuffle-B MXFP4 GEMM (examples/python/7.x_128x256-gemm.py).
+
+    The 3-stage pipeline peels 4 iterations (2 prologue + 2 epilogue), so the
+    KERNEL loop body runs for ``K / BLOCK_K - 4`` iterations.  The unroll
+    factor must divide that count evenly.  If the requested unroll_factor does
+    not divide, we fall back to the largest factor <= the requested value.
+    """
+    _M, _N, K = shape
+    _MT_M, _MT_N, BLOCK_K = macrotiles
+    total_iters = K // BLOCK_K
+    kernel_iters = total_iters - _PRESHUFFLE_B_PEELED_ITERS
+    effective_unroll = _pick_unroll_factor(kernel_iters, unroll_factor)
+    if effective_unroll != unroll_factor:
+        print(
+            f"  Note: unroll_factor {unroll_factor} does not divide "
+            f"kernel_iters={kernel_iters} (K/BLOCK_K={total_iters} - "
+            f"{_PRESHUFFLE_B_PEELED_ITERS} peeled); using {effective_unroll}"
+        )
+
     gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
         shape, macrotiles, wave_shape=wave_shape
     )
     options.minimize_shared_allocs = True
     options.linearize_shared_access = True
     options.use_buffer_ops = True
-    schedule = get_mxfp4_preshuffle_b_schedule(unroll_factor=unroll_factor)
+    schedule = get_mxfp4_preshuffle_b_schedule(unroll_factor=effective_unroll)
     options = set_default_run_config(options)
     compiled_gemm = wave_compile(options, gemm, schedule)
     return compiled_gemm
