@@ -132,10 +132,13 @@ private:
     // generates v_mov_b32 v15, <literal> before such instructions.
     reservedVGPRs.insert(15);
 
-    // Note: ABI SGPRs (kernarg ptr, preload regs, workgroup IDs, SRDs) are
+    // ABI SGPRs (kernarg ptr, preload regs, workgroup IDs, SRDs) are
     // reserved via PrecoloredSRegOp ops emitted during translation. The
     // collection loop below picks those up and adds their indices to
     // reservedSGPRs automatically -- no manual reservation needed here.
+    // Workgroup ID SGPRs are additionally marked as permanently reserved
+    // in LinearScanRegAlloc::allocate() to prevent them from being freed
+    // back to the pool after the SSA value's live range ends.
 
     bool collectFailed = false;
     program.walk([&](Operation *op) {
@@ -331,6 +334,48 @@ private:
         if (i < bodyBlock.getNumArguments()) {
           loopOp->getResult(i).setType(bodyBlock.getArgument(i).getType());
         }
+      }
+    });
+
+    // Fix permuted yields: when the condition's iter_args have different
+    // physical register types than the loop's block arguments (e.g. triple-
+    // buffered LDS where arg[53]=old_arg[54], arg[54]=old_arg[55], etc.),
+    // the verifier requires them to match. Insert copies to fix the mismatch.
+    program.walk([&](LoopOp loopOp) {
+      Block &bodyBlock = loopOp.getBodyBlock();
+      auto condOp = dyn_cast<ConditionOp>(bodyBlock.getTerminator());
+      if (!condOp)
+        return;
+
+      OpBuilder builder(condOp);
+      auto loc = condOp.getLoc();
+
+      for (unsigned i = 0; i < condOp.getIterArgs().size(); ++i) {
+        if (i >= bodyBlock.getNumArguments())
+          break;
+
+        Value iterArg = condOp.getIterArgs()[i];
+        Type targetType = bodyBlock.getArgument(i).getType();
+
+        if (iterArg.getType() == targetType)
+          continue;
+
+        // Insert a copy to fix the type mismatch.
+        Value copy;
+        if (isa<PSRegType>(targetType)) {
+          int64_t size = getRegSize(targetType);
+          if (size == 1)
+            copy = S_MOV_B32::create(builder, loc, targetType, iterArg);
+          else if (size == 2)
+            copy = S_MOV_B64::create(builder, loc, targetType, iterArg);
+          else
+            continue; // Unsupported SGPR size
+        } else {
+          // VGPR or AGPR: V_MOV_B32 handles both
+          copy = V_MOV_B32::create(builder, loc, targetType, iterArg);
+        }
+
+        condOp->setOperand(i + 1, copy);
       }
     });
 

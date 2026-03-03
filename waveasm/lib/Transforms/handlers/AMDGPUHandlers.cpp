@@ -370,9 +370,83 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
       hasCacheSwizzle = (swizzleStride > 0);
     }
   }
-
   if (!hasCacheSwizzle) {
-    ctx.getMapper().mapValue(op->getResult(0), *srcMapped);
+    bool hasResetOffset = op->hasAttr("resetOffset");
+    std::optional<Value> validBytesMapped;
+    bool hasDynamicValidBytes = false;
+    if (hasResetOffset && op->getNumOperands() >= 2) {
+      validBytesMapped = ctx.getMapper().getMapped(op->getOperand(1));
+      if (validBytesMapped &&
+          (isVGPRType(validBytesMapped->getType()) ||
+           isSGPRType(validBytesMapped->getType()) ||
+           isa<ImmType>(validBytesMapped->getType())))
+        hasDynamicValidBytes = true;
+    }
+
+    if (!hasDynamicValidBytes) {
+      ctx.getMapper().mapValue(op->getResult(0), *srcMapped);
+      if (auto boff = ctx.getBufferBaseOffset(op->getOperand(0)))
+        ctx.setBufferBaseOffset(op->getResult(0), *boff);
+      return success();
+    }
+
+    // Dynamic validBytes path: construct a new SRD with updated num_records.
+    int64_t srcSrdBase = -1;
+    if (auto defOp = srcMapped->getDefiningOp()) {
+      if (defOp->getName().getStringRef() == "waveasm.precolored.sreg") {
+        if (auto indexAttr = defOp->getAttrOfType<IntegerAttr>("index"))
+          srcSrdBase = indexAttr.getInt();
+      }
+    }
+    if (srcSrdBase < 0) {
+      if (auto psreg = dyn_cast<PSRegType>(srcMapped->getType()))
+        srcSrdBase = psreg.getIndex();
+    }
+    if (srcSrdBase < 0) {
+      if (auto srcSrdIdx = ctx.getSRDIndex(op->getOperand(0)))
+        srcSrdBase = *srcSrdIdx;
+    }
+    if (srcSrdBase < 0) {
+      ctx.getMapper().mapValue(op->getResult(0), *srcMapped);
+      if (auto boff = ctx.getBufferBaseOffset(op->getOperand(0)))
+        ctx.setBufferBaseOffset(op->getResult(0), *boff);
+      return success();
+    }
+
+    int64_t newSrdBase = ctx.getNextSwizzleSRDIndex();
+
+    // Copy base address (words 0-1) from source SRD using SSA ops.
+    auto srcW0Type = PSRegType::get(builder.getContext(), srcSrdBase, 1);
+    auto srcW0 =
+        PrecoloredSRegOp::create(builder, loc, srcW0Type, srcSrdBase, 1);
+    S_MOV_TO_SRD::create(builder, loc, srcW0, newSrdBase);
+
+    auto srcW1Type =
+        PSRegType::get(builder.getContext(), srcSrdBase + 1, 1);
+    auto srcW1 =
+        PrecoloredSRegOp::create(builder, loc, srcW1Type, srcSrdBase + 1, 1);
+    S_MOV_TO_SRD::create(builder, loc, srcW1, newSrdBase + 1);
+
+    // Set SRD word 2 (num_records) from dynamic validBytes
+    if (isVGPRType(validBytesMapped->getType())) {
+      V_READFIRSTLANE_TO_SRD::create(builder, loc, *validBytesMapped,
+                                     newSrdBase + 2);
+    } else {
+      S_MOV_TO_SRD::create(builder, loc, *validBytesMapped, newSrdBase + 2);
+    }
+
+    // Word 3: stride descriptor
+    auto strideImm = ctx.createImmType(0x20000);
+    auto strideConst = ConstantOp::create(builder, loc, strideImm, 0x20000);
+    S_MOV_TO_SRD::create(builder, loc, strideConst, newSrdBase + 3);
+
+    // Reserve the new SRD in regalloc and map result
+    auto srdType = ctx.createSRegType(4, 4);
+    auto newSrd =
+        PrecoloredSRegOp::create(builder, loc, srdType, newSrdBase, 4);
+    ctx.getMapper().mapValue(op->getResult(0), newSrd);
+    if (auto boff = ctx.getBufferBaseOffset(op->getOperand(0)))
+      ctx.setBufferBaseOffset(op->getResult(0), *boff);
     return success();
   }
 
@@ -401,33 +475,69 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
 
   if (srcSrdBase < 0) {
     ctx.getMapper().mapValue(op->getResult(0), *srcMapped);
+    if (auto boff = ctx.getBufferBaseOffset(op->getOperand(0)))
+      ctx.setBufferBaseOffset(op->getResult(0), *boff);
     return success();
   }
 
-  std::string mov0 = "s_mov_b32 s" + std::to_string(newSrdBase) + ", s" +
-                     std::to_string(srcSrdBase);
-  RawOp::create(builder, loc, mov0);
+  // Word 0: copy base address from source SRD.
+  auto srcW0Type = PSRegType::get(builder.getContext(), srcSrdBase, 1);
+  auto srcW0 =
+      PrecoloredSRegOp::create(builder, loc, srcW0Type, srcSrdBase, 1);
+  S_MOV_TO_SRD::create(builder, loc, srcW0, newSrdBase);
 
-  std::string and1 = "s_and_b32 s" + std::to_string(newSrdBase + 1) + ", s" +
-                     std::to_string(srcSrdBase + 1) + ", 0xffff";
-  RawOp::create(builder, loc, and1);
+  // Word 1: upper 16 bits = (swizzle_enable << 14) | stride, lower 16 from
+  // source.  Matches LLVM: stride_i16 = cacheSwizzleStride | (1 << 14),
+  // placed into word1 bits [31:16].
+  auto srcW1Type = PSRegType::get(builder.getContext(), srcSrdBase + 1, 1);
+  auto srcW1 =
+      PrecoloredSRegOp::create(builder, loc, srcW1Type, srcSrdBase + 1, 1);
+  auto sregType = ctx.createSRegType();
+  auto maskImm = ctx.createImmType(0xffff);
+  auto maskConst = ConstantOp::create(builder, loc, maskImm, 0xffff);
+  Value w1Masked = S_AND_B32::create(builder, loc, sregType, srcW1, maskConst);
+  int64_t swizzleCfg =
+      static_cast<int64_t>((swizzleStride | (1 << 14)) & 0xffff) << 16;
+  auto cfgImm = ctx.createImmType(swizzleCfg);
+  auto cfgConst = ConstantOp::create(builder, loc, cfgImm, swizzleCfg);
+  Value w1Final = S_OR_B32::create(builder, loc, sregType, w1Masked, cfgConst);
+  S_MOV_TO_SRD::create(builder, loc, w1Final, newSrdBase + 1);
 
-  std::string or1 = "s_or_b32 s" + std::to_string(newSrdBase + 1) + ", s" +
-                    std::to_string(newSrdBase + 1) + ", 0x40400000";
-  RawOp::create(builder, loc, or1);
+  // Word 2: num_records. Use dynamic validBytes if available (epilogue
+  // elimination), otherwise the maximum value.
+  bool usedDynamicValidBytes = false;
+  if (op->hasAttr("resetOffset") && op->getNumOperands() >= 2) {
+    auto vbMapped = ctx.getMapper().getMapped(op->getOperand(1));
+    if (vbMapped) {
+      if (isVGPRType(vbMapped->getType())) {
+        V_READFIRSTLANE_TO_SRD::create(builder, loc, *vbMapped,
+                                       newSrdBase + 2);
+        usedDynamicValidBytes = true;
+      } else if (isSGPRType(vbMapped->getType()) ||
+                 isa<ImmType>(vbMapped->getType())) {
+        S_MOV_TO_SRD::create(builder, loc, *vbMapped, newSrdBase + 2);
+        usedDynamicValidBytes = true;
+      }
+    }
+  }
+  if (!usedDynamicValidBytes) {
+    auto maxImm = ctx.createImmType(0x7ffffffd);
+    auto maxConst = ConstantOp::create(builder, loc, maxImm, 0x7ffffffd);
+    S_MOV_TO_SRD::create(builder, loc, maxConst, newSrdBase + 2);
+  }
 
-  std::string mov2 =
-      "s_mov_b32 s" + std::to_string(newSrdBase + 2) + ", 0x7ffffffd";
-  RawOp::create(builder, loc, mov2);
-
-  std::string mov3 =
-      "s_mov_b32 s" + std::to_string(newSrdBase + 3) + ", 0x27000";
-  RawOp::create(builder, loc, mov3);
+  // Word 3: stride descriptor.
+  auto strideImm = ctx.createImmType(0x27000);
+  auto strideConst = ConstantOp::create(builder, loc, strideImm, 0x27000);
+  S_MOV_TO_SRD::create(builder, loc, strideConst, newSrdBase + 3);
 
   auto srdType = ctx.createSRegType(4, 4);
   auto newSrd = PrecoloredSRegOp::create(builder, loc, srdType, newSrdBase, 4);
   ctx.getMapper().mapValue(op->getResult(0), newSrd);
   ctx.setCacheSwizzleStride(op->getResult(0), swizzleStride);
+
+  if (auto boff = ctx.getBufferBaseOffset(op->getOperand(0)))
+    ctx.setBufferBaseOffset(op->getResult(0), *boff);
 
   return success();
 }

@@ -67,14 +67,16 @@ bool isVALUOp(Operation *op) {
     return false;
 
   // Exclude v_readfirstlane (it's the consumer in the hazard, not the producer)
-  if (isa<V_READFIRSTLANE_B32>(op))
+  if (isa<V_READFIRSTLANE_B32, V_READFIRSTLANE_TO_SRD>(op))
     return false;
 
   return true;
 }
 
 /// Check if an operation is v_readfirstlane
-bool isReadfirstlaneOp(Operation *op) { return isa<V_READFIRSTLANE_B32>(op); }
+bool isReadfirstlaneOp(Operation *op) {
+  return isa<V_READFIRSTLANE_B32, V_READFIRSTLANE_TO_SRD>(op);
+}
 
 /// Get the set of VGPRs written by an operation
 llvm::DenseSet<Value> getVGPRDefs(Operation *op) {

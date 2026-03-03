@@ -302,8 +302,63 @@ LogicalResult handleArithCmpI(Operation *op, TranslationContext &ctx) {
     return failure();
   }
 
-  // Emit comparison based on predicate
-  // These operations set VCC implicitly (no SSA result)
+  bool lhsScalar = !isVGPRType(lhs->getType());
+  bool rhsScalar = !isVGPRType(rhs->getType());
+
+  // Promote VGPR operands to SGPR when the other is already scalar.
+  // This commonly occurs for epilogue elimination guards where
+  // affine.apply on the scalar loop IV produces a VGPR.
+  if (!lhsScalar && rhsScalar) {
+    auto sregType = ctx.createSRegType();
+    *lhs = V_READFIRSTLANE_B32::create(builder, loc, sregType, *lhs);
+    lhsScalar = true;
+  } else if (lhsScalar && !rhsScalar) {
+    auto sregType = ctx.createSRegType();
+    *rhs = V_READFIRSTLANE_B32::create(builder, loc, sregType, *rhs);
+    rhsScalar = true;
+  }
+  bool useScalar = lhsScalar && rhsScalar;
+
+  if (useScalar) {
+    auto sregType = ctx.createSRegType();
+    Value sccResult;
+    switch (cmpOp.getPredicate()) {
+    case arith::CmpIPredicate::eq:
+      sccResult = S_CMP_EQ_U32::create(builder, loc, sregType, *lhs, *rhs);
+      break;
+    case arith::CmpIPredicate::ne:
+      sccResult = S_CMP_NE_U32::create(builder, loc, sregType, *lhs, *rhs);
+      break;
+    case arith::CmpIPredicate::slt:
+      sccResult = S_CMP_LT_I32::create(builder, loc, sregType, *lhs, *rhs);
+      break;
+    case arith::CmpIPredicate::sle:
+      sccResult = S_CMP_LE_I32::create(builder, loc, sregType, *lhs, *rhs);
+      break;
+    case arith::CmpIPredicate::sgt:
+      sccResult = S_CMP_GT_I32::create(builder, loc, sregType, *lhs, *rhs);
+      break;
+    case arith::CmpIPredicate::sge:
+      sccResult = S_CMP_GE_I32::create(builder, loc, sregType, *lhs, *rhs);
+      break;
+    case arith::CmpIPredicate::ult:
+      sccResult = S_CMP_LT_U32::create(builder, loc, sregType, *lhs, *rhs);
+      break;
+    case arith::CmpIPredicate::ule:
+      sccResult = S_CMP_LE_U32::create(builder, loc, sregType, *lhs, *rhs);
+      break;
+    case arith::CmpIPredicate::ugt:
+      sccResult = S_CMP_GT_U32::create(builder, loc, sregType, *lhs, *rhs);
+      break;
+    case arith::CmpIPredicate::uge:
+      sccResult = S_CMP_GE_U32::create(builder, loc, sregType, *lhs, *rhs);
+      break;
+    }
+    ctx.getMapper().mapValue(cmpOp.getResult(), sccResult);
+    return success();
+  }
+
+  // Vector path: emit v_cmp which sets VCC implicitly (no SSA result)
   switch (cmpOp.getPredicate()) {
   case arith::CmpIPredicate::eq:
     V_CMP_EQ_U32::create(builder, loc, *lhs, *rhs);
@@ -348,7 +403,6 @@ LogicalResult handleArithSelect(Operation *op, TranslationContext &ctx) {
   auto selectOp = cast<arith::SelectOp>(op);
   auto &builder = ctx.getBuilder();
   auto loc = op->getLoc();
-  auto vregType = ctx.createVRegType();
 
   auto cond = ctx.getMapper().getMapped(selectOp.getCondition());
   auto trueVal = ctx.getMapper().getMapped(selectOp.getTrueValue());
@@ -358,6 +412,55 @@ LogicalResult handleArithSelect(Operation *op, TranslationContext &ctx) {
     return op->emitError("operands not mapped");
   }
 
+  // If the condition is from an s_cmp (SGPR result), re-emit the compare
+  // immediately before the s_cselect to ensure SCC is fresh. Other SALU
+  // instructions (s_add_u32, etc.) between the original s_cmp and this
+  // select will clobber SCC.
+  if (isSGPRType(cond->getType())) {
+    if (auto defOp = cond->getDefiningOp()) {
+      if (defOp->getNumOperands() >= 2) {
+        auto sregType = ctx.createSRegType();
+        Value src0 = defOp->getOperand(0);
+        Value src1 = defOp->getOperand(1);
+        Value freshScc;
+        if (isa<S_CMP_LT_I32>(defOp))
+          freshScc = S_CMP_LT_I32::create(builder, loc, sregType, src0, src1);
+        else if (isa<S_CMP_LT_U32>(defOp))
+          freshScc = S_CMP_LT_U32::create(builder, loc, sregType, src0, src1);
+        else if (isa<S_CMP_EQ_U32>(defOp))
+          freshScc = S_CMP_EQ_U32::create(builder, loc, sregType, src0, src1);
+        else if (isa<S_CMP_LE_I32>(defOp))
+          freshScc = S_CMP_LE_I32::create(builder, loc, sregType, src0, src1);
+        else if (isa<S_CMP_GT_I32>(defOp))
+          freshScc = S_CMP_GT_I32::create(builder, loc, sregType, src0, src1);
+        else if (isa<S_CMP_GE_I32>(defOp))
+          freshScc = S_CMP_GE_I32::create(builder, loc, sregType, src0, src1);
+        else if (isa<S_CMP_LE_U32>(defOp))
+          freshScc = S_CMP_LE_U32::create(builder, loc, sregType, src0, src1);
+        else if (isa<S_CMP_GT_U32>(defOp))
+          freshScc = S_CMP_GT_U32::create(builder, loc, sregType, src0, src1);
+        else if (isa<S_CMP_GE_U32>(defOp))
+          freshScc = S_CMP_GE_U32::create(builder, loc, sregType, src0, src1);
+        else if (isa<S_CMP_NE_U32>(defOp))
+          freshScc = S_CMP_NE_U32::create(builder, loc, sregType, src0, src1);
+        else if (isa<S_CMP_EQ_I32>(defOp))
+          freshScc = S_CMP_EQ_I32::create(builder, loc, sregType, src0, src1);
+        else if (isa<S_CMP_NE_I32>(defOp))
+          freshScc = S_CMP_NE_I32::create(builder, loc, sregType, src0, src1);
+        if (freshScc)
+          *cond = freshScc;
+      }
+    }
+    auto sregType = ctx.createSRegType();
+    auto result =
+        S_CSELECT_B32::create(builder, loc, sregType, *trueVal, *falseVal,
+                              *cond);
+    ctx.getMapper().mapValue(selectOp.getResult(), result);
+    return success();
+  }
+
+  // Vector path: v_cndmask_b32 dst, falseVal, trueVal (implicit VCC)
+  auto vregType = ctx.createVRegType();
   auto result =
       V_CNDMASK_B32::create(builder, loc, vregType, *falseVal, *trueVal, *cond);
   ctx.getMapper().mapValue(selectOp.getResult(), result);

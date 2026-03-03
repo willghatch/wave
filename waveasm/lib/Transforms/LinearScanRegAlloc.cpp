@@ -226,6 +226,18 @@ LinearScanRegAlloc::allocate(ProgramOp program) {
   RegPool sgprPool(RegClass::SGPR, maxSGPRs, reservedSGPRs);
   RegPool agprPool(RegClass::AGPR, maxAGPRs, reservedAGPRs);
 
+  // Permanently reserve workgroup ID SGPRs so they are never freed
+  // back to the pool, even after the SSA value's last use.
+  if (auto wgIdAttr = program->getAttrOfType<mlir::ArrayAttr>(
+          "waveasm.workgroup_id_sgprs")) {
+    for (auto attr : wgIdAttr) {
+      if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(attr)) {
+        int64_t idx = intAttr.getInt();
+        sgprPool.markPermanentlyReserved(idx);
+      }
+    }
+  }
+
   // Step 4: Handle precolored values (from ABI args like tid, kernarg)
   for (const auto &[value, physIdx] : precoloredValues) {
     if (isVGPRType(value.getType())) {

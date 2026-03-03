@@ -948,6 +948,41 @@ LogicalResult handleVectorLoad(Operation *op, TranslationContext &ctx) {
     // Global load - buffer_load_dwordx* with splitting for large vectors
     auto [voffset, instOffset] =
         computeVOffsetFromIndices(memrefType, loadOp.getIndices(), ctx, loc);
+
+    // Add buffer base element offset from memref.reinterpret_cast, scaled
+    // to bytes.  This carries the workgroup-level tile offset that was
+    // embedded in the memref's dynamic offset.
+    if (auto baseOff = ctx.getBufferBaseOffset(loadOp.getBase())) {
+      Type elementType = memrefType.getElementType();
+      int64_t elementBytes = (elementType.getIntOrFloatBitWidth() + 7) / 8;
+      Value byteOffset;
+      if (elementBytes == 1) {
+        byteOffset = *baseOff;
+      } else if ((elementBytes & (elementBytes - 1)) == 0) {
+        int shift = 0;
+        int64_t tmp = elementBytes;
+        while (tmp > 1) {
+          shift++;
+          tmp >>= 1;
+        }
+        auto shiftImm =
+            ConstantOp::create(builder, loc, ctx.createImmType(shift), shift);
+        byteOffset = V_LSHLREV_B32::create(builder, loc, ctx.createVRegType(),
+                                            shiftImm, *baseOff);
+      } else {
+        auto strideImm = ConstantOp::create(
+            builder, loc, ctx.createImmType(elementBytes), elementBytes);
+        byteOffset = V_MUL_LO_U32::create(builder, loc, ctx.createVRegType(),
+                                           *baseOff, strideImm);
+      }
+      if (voffset) {
+        voffset = V_ADD_U32::create(builder, loc, ctx.createVRegType(), voffset,
+                                    byteOffset);
+      } else {
+        voffset = byteOffset;
+      }
+    }
+
     Value srd = lookupSRD(loadOp.getBase(), ctx, loc);
     auto loadResults =
         emitBufferLoads(srd, voffset, instOffset, numBytes, ctx, loc);
@@ -988,6 +1023,40 @@ LogicalResult handleVectorMaskedLoad(Operation *op, TranslationContext &ctx) {
 
   auto [voffset, instOffset] = computeVOffsetFromIndices(
       memrefType, maskedLoadOp.getIndices(), ctx, loc);
+
+  // Add buffer base element offset from memref.reinterpret_cast.
+  if (auto baseOff = ctx.getBufferBaseOffset(maskedLoadOp.getBase())) {
+    auto &builderRef = ctx.getBuilder();
+    Type elementType = memrefType.getElementType();
+    int64_t elementBytes = (elementType.getIntOrFloatBitWidth() + 7) / 8;
+    Value byteOffset;
+    if (elementBytes == 1) {
+      byteOffset = *baseOff;
+    } else if ((elementBytes & (elementBytes - 1)) == 0) {
+      int shift = 0;
+      int64_t tmp = elementBytes;
+      while (tmp > 1) {
+        shift++;
+        tmp >>= 1;
+      }
+      auto shiftImm =
+          ConstantOp::create(builderRef, loc, ctx.createImmType(shift), shift);
+      byteOffset = V_LSHLREV_B32::create(
+          builderRef, loc, ctx.createVRegType(), shiftImm, *baseOff);
+    } else {
+      auto strideImm = ConstantOp::create(
+          builderRef, loc, ctx.createImmType(elementBytes), elementBytes);
+      byteOffset = V_MUL_LO_U32::create(
+          builderRef, loc, ctx.createVRegType(), *baseOff, strideImm);
+    }
+    if (voffset) {
+      voffset = V_ADD_U32::create(builderRef, loc, ctx.createVRegType(),
+                                  voffset, byteOffset);
+    } else {
+      voffset = byteOffset;
+    }
+  }
+
   Value srd = lookupSRD(maskedLoadOp.getBase(), ctx, loc);
   auto loadResults =
       emitBufferLoads(srd, voffset, instOffset, numBytes, ctx, loc);
@@ -1290,6 +1359,34 @@ LogicalResult handleVectorStore(Operation *op, TranslationContext &ctx) {
     if (!voffset) {
       auto immType = ctx.createImmType(0);
       voffset = ConstantOp::create(builder, loc, immType, 0);
+    }
+
+    // Add buffer base element offset from memref.reinterpret_cast, scaled
+    // to bytes.  This carries the workgroup-level tile offset that was
+    // embedded in the memref's dynamic offset.
+    if (auto baseOff = ctx.getBufferBaseOffset(storeOp.getBase())) {
+      Value byteOffset;
+      if (elementBytes == 1) {
+        byteOffset = *baseOff;
+      } else if ((elementBytes & (elementBytes - 1)) == 0) {
+        int shift = 0;
+        int64_t tmp = elementBytes;
+        while (tmp > 1) {
+          shift++;
+          tmp >>= 1;
+        }
+        auto shiftImm =
+            ConstantOp::create(builder, loc, ctx.createImmType(shift), shift);
+        byteOffset = V_LSHLREV_B32::create(builder, loc, ctx.createVRegType(),
+                                            shiftImm, *baseOff);
+      } else {
+        auto strideImm = ConstantOp::create(
+            builder, loc, ctx.createImmType(elementBytes), elementBytes);
+        byteOffset = V_MUL_LO_U32::create(builder, loc, ctx.createVRegType(),
+                                           *baseOff, strideImm);
+      }
+      voffset = V_ADD_U32::create(builder, loc, ctx.createVRegType(), voffset,
+                                  byteOffset);
     }
 
     // Get SRD for this memref - look up from binding or use tracked SRD
@@ -1790,6 +1887,23 @@ LogicalResult translateModule(ModuleOp module, StringRef targetId) {
       program->setAttr("lds_size", builder.getI64IntegerAttr(ldsSize));
     }
 
+    // Record workgroup ID SGPR indices for permanent reservation.
+    {
+      llvm::SmallVector<mlir::Attribute> wgIdSgprs;
+      if (ctx.getUsesWorkgroupIdX())
+        wgIdSgprs.push_back(
+            builder.getI64IntegerAttr(ctx.getWorkgroupIdSgprIndex(0)));
+      if (ctx.getUsesWorkgroupIdY())
+        wgIdSgprs.push_back(
+            builder.getI64IntegerAttr(ctx.getWorkgroupIdSgprIndex(1)));
+      if (ctx.getUsesWorkgroupIdZ())
+        wgIdSgprs.push_back(
+            builder.getI64IntegerAttr(ctx.getWorkgroupIdSgprIndex(2)));
+      if (!wgIdSgprs.empty())
+        program->setAttr("waveasm.workgroup_id_sgprs",
+                         builder.getArrayAttr(wgIdSgprs));
+    }
+
     // Erase the original GPU function to avoid symbol collision
     gpuFunc.erase();
   }
@@ -1885,6 +1999,23 @@ LogicalResult translateModule(ModuleOp module, StringRef targetId) {
     int64_t ldsSize = ctx.getTotalLDSSize();
     if (ldsSize > 0) {
       program->setAttr("lds_size", builder.getI64IntegerAttr(ldsSize));
+    }
+
+    // Record workgroup ID SGPR indices for permanent reservation.
+    {
+      llvm::SmallVector<mlir::Attribute> wgIdSgprs;
+      if (ctx.getUsesWorkgroupIdX())
+        wgIdSgprs.push_back(
+            builder.getI64IntegerAttr(ctx.getWorkgroupIdSgprIndex(0)));
+      if (ctx.getUsesWorkgroupIdY())
+        wgIdSgprs.push_back(
+            builder.getI64IntegerAttr(ctx.getWorkgroupIdSgprIndex(1)));
+      if (ctx.getUsesWorkgroupIdZ())
+        wgIdSgprs.push_back(
+            builder.getI64IntegerAttr(ctx.getWorkgroupIdSgprIndex(2)));
+      if (!wgIdSgprs.empty())
+        program->setAttr("waveasm.workgroup_id_sgprs",
+                         builder.getArrayAttr(wgIdSgprs));
     }
 
     // Erase the original func.func to avoid symbol name collision
@@ -2068,6 +2199,25 @@ LogicalResult translateModule(ModuleOp module,
     int64_t ldsSize = transCtx.getTotalLDSSize();
     if (ldsSize > 0) {
       program->setAttr("lds_size", builder.getI64IntegerAttr(ldsSize));
+    }
+
+    // Record workgroup ID SGPR indices so the register allocator can
+    // permanently reserve them.  These ABI registers must never be
+    // reused, even after the SSA value's last use.
+    {
+      llvm::SmallVector<mlir::Attribute> wgIdSgprs;
+      if (transCtx.getUsesWorkgroupIdX())
+        wgIdSgprs.push_back(
+            builder.getI64IntegerAttr(transCtx.getWorkgroupIdSgprIndex(0)));
+      if (transCtx.getUsesWorkgroupIdY())
+        wgIdSgprs.push_back(
+            builder.getI64IntegerAttr(transCtx.getWorkgroupIdSgprIndex(1)));
+      if (transCtx.getUsesWorkgroupIdZ())
+        wgIdSgprs.push_back(
+            builder.getI64IntegerAttr(transCtx.getWorkgroupIdSgprIndex(2)));
+      if (!wgIdSgprs.empty())
+        program->setAttr("waveasm.workgroup_id_sgprs",
+                         builder.getArrayAttr(wgIdSgprs));
     }
 
     // Erase original function

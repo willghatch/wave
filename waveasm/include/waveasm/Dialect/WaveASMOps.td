@@ -304,7 +304,7 @@ def WaveASM_ProgramOp : WAVEASMOp<"program", [
 // Precolored Register Definitions (ABI Registers)
 //===----------------------------------------------------------------------===//
 
-def WaveASM_PrecoloredVRegOp : WAVEASMOp<"precolored.vreg", [Pure]> {
+def WaveASM_PrecoloredVRegOp : WAVEASMOp<"precolored.vreg", [WaveASM_SpecialRegOp]> {
   let summary = "Define a precolored physical VGPR";
   let description = [{
     Defines a VGPR at a specific physical register index.
@@ -322,7 +322,7 @@ def WaveASM_PrecoloredVRegOp : WAVEASMOp<"precolored.vreg", [Pure]> {
   let assemblyFormat = "$index (`,` $size^)? attr-dict `:` type($result)";
 }
 
-def WaveASM_PrecoloredSRegOp : WAVEASMOp<"precolored.sreg", [Pure]> {
+def WaveASM_PrecoloredSRegOp : WAVEASMOp<"precolored.sreg", [WaveASM_SpecialRegOp]> {
   let summary = "Define a precolored physical SGPR";
   let description = [{
     Defines an SGPR at a specific physical register index.
@@ -340,7 +340,7 @@ def WaveASM_PrecoloredSRegOp : WAVEASMOp<"precolored.sreg", [Pure]> {
   let assemblyFormat = "$index (`,` $size^)? attr-dict `:` type($result)";
 }
 
-def WaveASM_PrecoloredARegOp : WAVEASMOp<"precolored.areg", [Pure]> {
+def WaveASM_PrecoloredARegOp : WAVEASMOp<"precolored.areg", [WaveASM_SpecialRegOp]> {
   let summary = "Define a precolored physical AGPR";
   let description = [{
     Defines an AGPR at a specific physical register index.
@@ -768,6 +768,22 @@ def WaveASM_S_CMP_EQ_U64 : SALUCmpOp<"s_cmp_eq_u64">;
 def WaveASM_S_CMP_NE_U64 : SALUCmpOp<"s_cmp_ne_u64">;
 
 //===----------------------------------------------------------------------===//
+// SALU Conditional Select Instructions
+//===----------------------------------------------------------------------===//
+
+def WaveASM_S_CSELECT_B32 : WAVEASMOp<"s_cselect_b32"> {
+  let summary = "Scalar conditional select (SCC-based)";
+  let description = [{
+    dst = SCC ? src0 : src1.  Must immediately follow an s_cmp_* that sets SCC.
+    Not marked Pure because it depends on implicit SCC state.
+  }];
+  let arguments = (ins WaveASM_SRegOrImm:$src0, WaveASM_SRegOrImm:$src1,
+                       WaveASM_AnySGPR:$scc_dep);
+  let results = (outs WaveASM_AnySGPR:$dst);
+  let assemblyFormat = "$src0 `,` $src1 `,` $scc_dep attr-dict `:` type($src0) `,` type($src1) `,` type($scc_dep) `->` type($dst)";
+}
+
+//===----------------------------------------------------------------------===//
 // MFMA Instructions (Matrix Fused Multiply-Add)
 // All have TiedResult<0, 2> - result tied to accumulator input
 //===----------------------------------------------------------------------===//
@@ -906,6 +922,37 @@ def WaveASM_S_MOV_B32_M0 : WAVEASMOp<"s_mov_b32_m0", [WaveASM_SpecialRegOp]> {
   }];
   let arguments = (ins WaveASM_SRegOrImm:$src);
   let assemblyFormat = "$src attr-dict `:` type($src)";
+}
+
+def WaveASM_V_READFIRSTLANE_TO_SRD : WAVEASMOp<"v_readfirstlane_to_srd",
+    [WaveASM_SpecialRegOp]> {
+  let summary = "Read first lane of VGPR into an SRD word";
+  let description = [{
+    Reads the first-lane value from a VGPR and writes it to a specific word
+    of a precolored SRD (Scalar Resource Descriptor).  This is used by the
+    epilogue-elimination pattern, which needs to dynamically update the SRD's
+    num_records field based on a branchless guard condition.
+
+    The operation is NOT Pure: it mutates precolored SGPR state that is
+    visible to subsequent buffer load instructions.
+  }];
+  let arguments = (ins WaveASM_AnyVGPR:$src, I64Attr:$srd_sgpr_index);
+  let assemblyFormat = "$src `,` $srd_sgpr_index attr-dict `:` type($src)";
+}
+
+def WaveASM_S_MOV_TO_SRD : WAVEASMOp<"s_mov_to_srd",
+    [WaveASM_SpecialRegOp]> {
+  let summary = "Move SGPR/immediate value into an SRD word";
+  let description = [{
+    Writes an SGPR or immediate value to a specific word of a precolored SRD.
+    Used for the epilogue-elimination pattern when the guard condition is
+    already scalar (e.g. from s_cmp + s_cselect).
+
+    The operation is NOT Pure: it mutates precolored SGPR state that is
+    visible to subsequent buffer load instructions.
+  }];
+  let arguments = (ins WaveASM_SRegOrImm:$src, I64Attr:$srd_sgpr_index);
+  let assemblyFormat = "$src `,` $srd_sgpr_index attr-dict `:` type($src)";
 }
 
 //===----------------------------------------------------------------------===//

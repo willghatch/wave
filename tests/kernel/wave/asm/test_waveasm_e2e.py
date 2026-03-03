@@ -1502,6 +1502,183 @@ def test_dbuf_8wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
 
 
 # =============================================================================
+# Test: MXFP4 Preshuffle-B with Epilogue Elimination
+# =============================================================================
+
+
+def test_dbuf_4wave_mxfp4_preshuffle_b_epilogue_elim_cpp_backend(
+    compiler, backend, dump_asm
+):
+    """End-to-end test for preshuffle-B MXFP4 GEMM with epilogue elimination.
+
+    Mirrors: test_dbuf_4wave_mxfp_preshuffle_b_gemm from 7.1_schedule.py
+    with eliminate_epilogue=True.
+
+    Epilogue elimination removes the epilogue from the pipelined K-loop
+    by running for the full trip count and relying on OOB buffer loads
+    returning zero (GFX950 hardware guarantee).
+    """
+    if not is_cdna4():
+        pytest.skip("Epilogue elimination + MXFP4 only supported on gfx950+")
+
+    skip_if_no_gpu()
+    skip_if_no_wave_lang()
+
+    import torch
+
+    from wave_lang.kernel.wave.templates import get_tagged_mxfp4_gemm_preshuffle_b
+    from wave_lang.kernel.wave.schedules import get_mxfp4_asymmetric_schedule
+    from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
+    from wave_lang.kernel.wave.utils.mxfp_utils import (
+        generate_gemm_afp4wfp4_inputs,
+        torchScaledGemmMXFP4,
+        b_preshuffle,
+        e8m0_shuffle,
+    )
+
+    shape = (1024, 1024, 8192)
+    block = (128, 256, 256)
+
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
+        shape, block, wave_shape=(1, 4)
+    )
+
+    options.minimize_shared_allocs = True
+    options.linearize_shared_access = True
+    options.use_buffer_ops = True
+    options.eliminate_epilogue = True
+    options.backend = "asm"
+    options.wave_runtime = True
+    options.compile_to_mlir = False
+    schedule = get_mxfp4_asymmetric_schedule(eliminate_epilogue=True)
+
+    options = set_default_run_config(options)
+
+    x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(shape)
+    torch_out = torchScaledGemmMXFP4(x, w, x_scales, w_scales)
+
+    x, w = x.cuda(), w.cuda()
+    x_scales, w_scales = x_scales.cuda(), w_scales.cuda()
+    c = torch.zeros(shape[0], shape[1], dtype=torch.float32).cuda()
+
+    kernel_info = capture_wave_kernel_info(options, gemm, schedule=schedule)
+
+    assert (
+        "amdgpu.scaled_mfma" in kernel_info.mlir_text
+    ), "Expected amdgpu.scaled_mfma operation in MLIR"
+
+    m, n, k = shape
+    test_id = f"mxfp4_preshuffle_b_epilogue_elim_{m}x{n}x{k}"
+
+    cpp_result = compiler.compile_full(
+        kernel_info.mlir_text, kernel_info.workgroup_size
+    )
+
+    if cpp_result.asm_text:
+        with open(f"/tmp/{test_id}_cpp.s", "w") as f:
+            f.write(cpp_result.asm_text)
+    with open(f"/tmp/{test_id}.mlir", "w") as f:
+        f.write(kernel_info.mlir_text)
+
+    if not cpp_result.success:
+        pytest.fail(f"C++ compilation failed: {cpp_result.error_message}")
+
+    assert (
+        "v_mfma_scale_f32_16x16x128_f8f6f4" in cpp_result.asm_text
+    ), "Expected v_mfma_scale_f32_16x16x128_f8f6f4 instruction in assembly"
+
+    assert "v_readfirstlane_b32" in cpp_result.asm_text, (
+        "Expected v_readfirstlane_b32 for dynamic SRD guard in epilogue elim"
+    )
+
+    kernel_name = cpp_result.get_kernel_name() or kernel_info.kernel_name
+
+    w_input = b_preshuffle(w.T.contiguous()).contiguous()
+    x_scales_input = e8m0_shuffle(x_scales).contiguous()
+    w_scales_input = e8m0_shuffle(w_scales).contiguous()
+
+    run_with_wave_runtime(
+        binary_path=cpp_result.binary_path,
+        inputs=[x, x_scales_input, w_input, w_scales_input],
+        outputs=[c],
+        grid=kernel_info.grid_size,
+        block=kernel_info.workgroup_size,
+        shared_memory_bytes=kernel_info.lds_size,
+        func_name=kernel_name,
+    )
+
+    c_cpu = c.cpu()
+    torch_out_cpu = torch_out.cpu() if torch_out.is_cuda else torch_out
+
+    diff = (torch_out_cpu.float() - c_cpu.float()).abs()
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+    rel_diff = (diff / (torch_out_cpu.float().abs() + 1e-8)).max().item()
+    print(f"\nNumerical comparison ({m}x{n}x{k} {backend}):")
+    print(f"  max abs diff: {max_diff}")
+    print(f"  mean abs diff: {mean_diff}")
+    print(f"  max rel diff: {rel_diff}")
+    print(f"  torch_out range: [{torch_out_cpu.min().item()}, {torch_out_cpu.max().item()}]")
+    print(f"  c range: [{c_cpu.min().item()}, {c_cpu.max().item()}]")
+    nonzero_out = (torch_out_cpu != 0).sum().item()
+    nonzero_c = (c_cpu != 0).sum().item()
+    print(f"  nonzero elements: torch_out={nonzero_out}, c={nonzero_c}")
+
+    # Tile-level analysis: show which 128x256 tiles are nonzero
+    m_tile, n_tile = 128, 256
+    for mi in range(0, m, m_tile):
+        for ni in range(0, n, n_tile):
+            tile = c_cpu[mi:mi+m_tile, ni:ni+n_tile]
+            tile_nz = (tile != 0).sum().item()
+            if tile_nz > 0:
+                ref_tile = torch_out_cpu[mi:mi+m_tile, ni:ni+n_tile]
+                tile_diff = (tile.float() - ref_tile.float()).abs().max().item()
+                print(f"  tile [{mi}:{mi+m_tile}, {ni}:{ni+n_tile}]: "
+                      f"nonzero={tile_nz}, max_diff_vs_ref={tile_diff:.4f}")
+
+    # Sorted diff check
+    c_sorted = c_cpu.float().flatten().sort().values
+    ref_sorted = torch_out_cpu.float().flatten().sort().values
+    sorted_diff = (c_sorted - ref_sorted).abs().max().item()
+    print(f"\n  max diff after sorting: {sorted_diff:.6f}")
+
+    # Check if c is just transposed
+    c_T = c_cpu.T
+    c_T_diff = (torch_out_cpu.float() - c_T.float()).abs().max().item()
+    c_T_corr = torch.corrcoef(torch.stack([c_T.float().flatten(), torch_out_cpu.float().flatten()]))[0,1].item()
+    print(f"  max diff (c.T vs ref): {c_T_diff:.6f}, corr: {c_T_corr:.6f}")
+
+    # Check tile [0:128, 0:256] -- try every possible tile mapping
+    tile_c = c_cpu[0:128, 0:256].float()
+    best_match = None
+    best_diff = float('inf')
+    for mi in range(0, 1024, 128):
+        for ni in range(0, 1024, 256):
+            ref_tile = torch_out_cpu[mi:mi+128, ni:ni+256].float()
+            td = (tile_c - ref_tile).abs().max().item()
+            if td < best_diff:
+                best_diff = td
+                best_match = (mi, ni)
+    print(f"  c[0:128,0:256] best matches ref[{best_match[0]}:{best_match[0]+128},{best_match[1]}:{best_match[1]+256}] diff={best_diff:.4f}")
+
+    # Check if within first tile, data is permuted
+    first_tile_c = c_cpu[0:128, 0:256].float()
+    first_tile_ref = torch_out_cpu[0:128, 0:256].float()
+    first_sorted_diff = (first_tile_c.flatten().sort().values - first_tile_ref.flatten().sort().values).abs().max().item()
+    print(f"  first tile sorted diff: {first_sorted_diff:.6f}")
+    first_corr = torch.corrcoef(torch.stack([first_tile_c.flatten(), first_tile_ref.flatten()]))[0,1].item()
+    print(f"  first tile corr: {first_corr:.6f}")
+
+    torch.testing.assert_close(
+        torch_out_cpu,
+        c_cpu,
+        check_dtype=False,
+        msg=f"MXFP4 preshuffle-B epilogue-elim GEMM {m}x{n}x{k} "
+        f"({backend}) failed numerical validation",
+    )
+
+
+# =============================================================================
 # Test: GEMM with Pipelining (PREFETCH Schedule)
 # =============================================================================
 

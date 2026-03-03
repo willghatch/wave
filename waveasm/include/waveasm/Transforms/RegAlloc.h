@@ -80,6 +80,13 @@ public:
     }
   }
 
+  /// Mark registers that must never be returned to the free list.
+  /// Use this for ABI registers (e.g. workgroup IDs) whose hardware
+  /// values must survive the entire kernel execution.
+  void markPermanentlyReserved(int64_t reg) {
+    permanentlyReserved.insert(reg);
+  }
+
   /// Check if a register is currently in the free list
   bool isFree(int64_t reg) const {
     return std::find(freeList.begin(), freeList.end(), reg) != freeList.end();
@@ -149,9 +156,12 @@ public:
     return -1; // Allocation failed
   }
 
-  /// Free a single register
+  /// Free a single register.  Permanently reserved registers stay
+  /// allocated -- they are never returned to the free list.
   void freeSingle(int64_t reg) {
     if (!allocated.contains(reg))
+      return;
+    if (permanentlyReserved.contains(reg))
       return;
 
     allocated.erase(reg);
@@ -186,6 +196,7 @@ private:
   int64_t maxRegs;
   llvm::SmallVector<int64_t> freeList; // Sorted
   llvm::DenseSet<int64_t> allocated;
+  llvm::DenseSet<int64_t> permanentlyReserved;
   int64_t peak = 0;
 };
 

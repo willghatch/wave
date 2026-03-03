@@ -89,6 +89,15 @@ KernelGenerator::generateOpWithLiteralHandling(Operation *op) {
     return lines;
   }
 
+  // v_cndmask_b32 has a dedicated TypeSwitch handler that drops the
+  // condition operand and materializes literals itself.
+  if (mnemonic == "v_cndmask_b32") {
+    if (auto line = generateOp(op)) {
+      lines.push_back(*line);
+    }
+    return lines;
+  }
+
   // SALU instructions support 32-bit literals natively
   if (mnemonic.starts_with("s_")) {
     if (auto line = generateOp(op)) {

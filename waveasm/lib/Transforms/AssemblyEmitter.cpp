@@ -469,6 +469,29 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
         return result;
       })
 
+      .Case<V_READFIRSTLANE_TO_SRD>(
+          [&](V_READFIRSTLANE_TO_SRD op) -> std::optional<std::string> {
+            int64_t srdIdx = op.getSrdSgprIndex();
+            return "  v_readfirstlane_b32 s" + std::to_string(srdIdx) +
+                   ", " + resolveValue(op.getSrc());
+          })
+
+      .Case<S_MOV_TO_SRD>(
+          [&](S_MOV_TO_SRD op) -> std::optional<std::string> {
+            int64_t srdIdx = op.getSrdSgprIndex();
+            return "  s_mov_b32 s" + std::to_string(srdIdx) +
+                   ", " + resolveScalarValue(op.getSrc());
+          })
+
+      .Case<S_CSELECT_B32>(
+          [&](S_CSELECT_B32 op) -> std::optional<std::string> {
+            llvm::SmallVector<std::string> operands;
+            operands.push_back(resolveValue(op.getDst()));
+            operands.push_back(resolveScalarValue(op.getSrc0()));
+            operands.push_back(resolveScalarValue(op.getSrc1()));
+            return formatter.format("s_cselect_b32", operands);
+          })
+
       .Case<S_BRANCH>([&](S_BRANCH branchOp) {
         return std::string("  s_branch ") +
                branchOp.getTarget().getRootReference().str();
@@ -681,6 +704,10 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
             break;
           }
 
+          if (auto rawOp = dyn_cast<RawOp>(&bodyOp)) {
+            os << generateRaw(rawOp) << "\n";
+            continue;
+          }
           auto instrLines = generateOpWithLiteralHandling(&bodyOp);
           for (const auto &line : instrLines) {
             os << line << "\n";
@@ -706,6 +733,10 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
         for (Operation &thenOp : ifOp.getThenBlock()) {
           if (isa<YieldOp>(&thenOp))
             continue;
+          if (auto rawOp = dyn_cast<RawOp>(&thenOp)) {
+            os << generateRaw(rawOp) << "\n";
+            continue;
+          }
           auto instrLines = generateOpWithLiteralHandling(&thenOp);
           for (const auto &line : instrLines) {
             os << line << "\n";
@@ -718,6 +749,10 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
           for (Operation &elseOp : *ifOp.getElseBlock()) {
             if (isa<YieldOp>(&elseOp))
               continue;
+            if (auto rawOp = dyn_cast<RawOp>(&elseOp)) {
+              os << generateRaw(rawOp) << "\n";
+              continue;
+            }
             auto instrLines = generateOpWithLiteralHandling(&elseOp);
             for (const auto &line : instrLines) {
               os << line << "\n";
