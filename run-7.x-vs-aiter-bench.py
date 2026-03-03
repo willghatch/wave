@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark Wave MXFP4 preshuffle-B GEMM (4-wave) vs aiter gemm_a4w4.
+"""Benchmark Wave MXFP4 preshuffle-B GEMM (4-wave and 8-wave) vs aiter gemm_a4w4.
 
 Uses the same kernel template and compile options as benchmark_mxfp4.py
 (called by run-bench.sh), compiled through the C++ waveasm-translate
@@ -172,34 +172,39 @@ def main():
 
     wave_kernels = {}
 
+    WAVE_VARIANTS = [
+        ("wave-4w", (1, 4)),
+        ("wave-8w", (2, 4)),
+    ]
+
     if not args.skip_wave:
         import wave_runtime
         wave_runtime.load_hip_functions()
 
         for idx, (shape, block) in enumerate(entries):
-            label = "wave-4w"
-            key = (shape, block, label)
-            if key in wave_kernels:
-                continue
-            print(
-                f"[{idx+1}/{len(entries)}] Compiling {label} "
-                f"shape={shape} block={block} [waveasm-translate]...",
-                flush=True,
-            )
-            t0 = time.time()
-            try:
-                compiled = compile_wave_kernel_waveasm(
-                    shape, block,
-                    wave_shape=DEFAULT_WAVE_SHAPE,
-                    unroll_factor=DEFAULT_UNROLL_FACTOR,
+            for label, wave_shape in WAVE_VARIANTS:
+                key = (shape, block, label)
+                if key in wave_kernels:
+                    continue
+                print(
+                    f"[{idx+1}/{len(entries)}] Compiling {label} "
+                    f"shape={shape} block={block} [waveasm-translate]...",
+                    flush=True,
                 )
-                elapsed = time.time() - t0
-                print(f"  compiled in {elapsed:.1f}s", flush=True)
-                wave_kernels[key] = compiled
-            except Exception as e:
-                elapsed = time.time() - t0
-                print(f"  FAILED in {elapsed:.1f}s: {e}", flush=True)
-                traceback.print_exc()
+                t0 = time.time()
+                try:
+                    compiled = compile_wave_kernel_waveasm(
+                        shape, block,
+                        wave_shape=wave_shape,
+                        unroll_factor=DEFAULT_UNROLL_FACTOR,
+                    )
+                    elapsed = time.time() - t0
+                    print(f"  compiled in {elapsed:.1f}s", flush=True)
+                    wave_kernels[key] = compiled
+                except Exception as e:
+                    elapsed = time.time() - t0
+                    print(f"  FAILED in {elapsed:.1f}s: {e}", flush=True)
+                    traceback.print_exc()
 
     # ------------------------------------------------------------------
     # Check aiter availability
@@ -234,7 +239,7 @@ def main():
         print(f"Warmup={warmup}, Iterations={iters}")
         print(f"{'='*70}")
 
-        # --- Wave kernel ---
+        # --- Wave kernels ---
         if not args.skip_wave:
             from wave_lang.kernel.wave.utils.mxfp_utils import (
                 generate_gemm_afp4wfp4_inputs,
@@ -242,18 +247,20 @@ def main():
                 e8m0_shuffle,
             )
 
-            label = "wave-4w"
-            key = (shape, block, label)
-            if key not in wave_kernels:
-                print(f"  {label:>12s}:  SKIPPED (compilation failed)")
-            else:
+            device = torch.device("cuda")
+            x, w, x_scale, w_scale = generate_gemm_afp4wfp4_inputs(shape, device)
+            w_t = w.T.contiguous()
+            w_t_ps = b_preshuffle(w_t)
+            x_scale_ps = e8m0_shuffle(x_scale)
+            w_scale_ps = e8m0_shuffle(w_scale)
+
+            for label, _ws in WAVE_VARIANTS:
+                key = (shape, block, label)
+                if key not in wave_kernels:
+                    print(f"  {label:>12s}:  SKIPPED (compilation failed)")
+                    continue
+
                 gpu_func, grid, wg_size, lds_size = wave_kernels[key]
-                device = torch.device("cuda")
-                x, w, x_scale, w_scale = generate_gemm_afp4wfp4_inputs(shape, device)
-                w_t = w.T.contiguous()
-                w_t_ps = b_preshuffle(w_t)
-                x_scale_ps = e8m0_shuffle(x_scale)
-                w_scale_ps = e8m0_shuffle(w_scale)
                 wave_out = torch.zeros(
                     M, w_t_ps.shape[0], dtype=torch.float32, device=device
                 )
@@ -284,8 +291,10 @@ def main():
                 })
                 print(f"  {label:>12s}:  {us:8.1f} us  {tf:8.2f} TFLOPS")
 
-                del x, w_t, w_t_ps, x_scale, w_scale, x_scale_ps, w_scale_ps, wave_out
-                torch.cuda.empty_cache()
+                del wave_out
+
+            del x, w_t, w_t_ps, x_scale, w_scale, x_scale_ps, w_scale_ps
+            torch.cuda.empty_cache()
 
         # --- aiter kernel ---
         if aiter_mod is not None:
