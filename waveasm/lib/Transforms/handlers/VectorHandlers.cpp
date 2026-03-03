@@ -190,6 +190,70 @@ LogicalResult handleVectorReduction(Operation *op, TranslationContext &ctx) {
   return success();
 }
 
+LogicalResult handleVectorFromElements(Operation *op,
+                                       TranslationContext &ctx) {
+  auto fromElemsOp = cast<vector::FromElementsOp>(op);
+  auto &builder = ctx.getBuilder();
+  auto loc = op->getLoc();
+
+  auto resultType = fromElemsOp.getType();
+  auto elemType = resultType.getElementType();
+  int64_t numElems = resultType.getNumElements();
+  int64_t elemBits = elemType.getIntOrFloatBitWidth();
+
+  if (elemBits > 32) {
+    return op->emitError("vector.from_elements: element > 32 bits unsupported");
+  }
+
+  int64_t elemsPerDword = 32 / elemBits;
+  int64_t numDwords = (numElems + elemsPerDword - 1) / elemsPerDword;
+
+  SmallVector<Value, 8> dwords;
+  for (int64_t d = 0; d < numDwords; ++d) {
+    Value packed;
+    for (int64_t e = 0; e < elemsPerDword; ++e) {
+      int64_t idx = d * elemsPerDword + e;
+      if (idx >= numElems)
+        break;
+
+      auto operandMapped = ctx.getMapper().getMapped(fromElemsOp.getElements()[idx]);
+      if (!operandMapped) {
+        return op->emitError("vector.from_elements: operand ")
+               << idx << " not mapped";
+      }
+
+      Value elem = *operandMapped;
+      int64_t shiftAmt = e * elemBits;
+
+      if (shiftAmt > 0) {
+        auto shiftImm = ConstantOp::create(builder, loc,
+                                           ctx.createImmType(shiftAmt),
+                                           shiftAmt);
+        elem = V_LSHLREV_B32::create(builder, loc, ctx.createVRegType(),
+                                     shiftImm, elem);
+      }
+
+      if (!packed) {
+        packed = elem;
+      } else {
+        packed = V_OR_B32::create(builder, loc, ctx.createVRegType(),
+                                 packed, elem);
+      }
+    }
+    dwords.push_back(packed);
+  }
+
+  if (numDwords == 1) {
+    ctx.getMapper().mapValue(fromElemsOp.getResult(), dwords[0]);
+  } else {
+    auto vregType = ctx.createVRegType(numDwords, numDwords);
+    auto concatOp =
+        ConcatOp::create(builder, loc, vregType, dwords);
+    ctx.getMapper().mapValue(fromElemsOp.getResult(), concatOp.getResult());
+  }
+  return success();
+}
+
 LogicalResult handleVectorExtractStridedSlice(Operation *op,
                                               TranslationContext &ctx) {
   auto extractOp = cast<vector::ExtractStridedSliceOp>(op);
