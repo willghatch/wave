@@ -1624,6 +1624,11 @@ def test_dbuf_4wave_mxfp4_preshuffle_b_epilogue_elim_cpp_backend(
     nonzero_c = (c_cpu != 0).sum().item()
     print(f"  nonzero elements: torch_out={nonzero_out}, c={nonzero_c}")
 
+    total_elems = c_cpu.numel()
+    correct_elems = (diff < 1e-4).sum().item()
+    correct_pct = 100.0 * correct_elems / total_elems
+    print(f"  {correct_elems} / {total_elems} correct ({correct_pct:.2f}%)")
+
     # Tile-level analysis: show which 128x256 tiles are nonzero
     m_tile, n_tile = 128, 256
     for mi in range(0, m, m_tile):
