@@ -1349,6 +1349,8 @@ def _dbuf_mxfp4_helper(
     from wave_lang.kernel.wave.utils.mxfp_utils import (
         generate_gemm_afp4wfp4_inputs,
         torchScaledGemmMXFP4,
+        b_preshuffle,
+        e8m0_shuffle,
     )
 
     # Get tagged kernel + options (same as 7.1_schedule.py)
@@ -1467,6 +1469,23 @@ def test_dbuf_4wave_mxfp4_gemm_cpp_backend(compiler, backend, dump_asm):
     _dbuf_mxfp4_helper(
         shape=(1024, 1024, 8192),
         block=(256, 256, 256),
+        num_waves=4,
+        use_stagger=False,
+        compiler=compiler,
+        backend=backend,
+        dump_asm=dump_asm,
+    )
+
+
+def test_dbuf_4wave_mxfp4_gemm_cpp_backend_smaller(compiler, backend, dump_asm):
+    """Smaller-block variant of test_dbuf_4wave_mxfp4_gemm_cpp_backend.
+
+    Uses block=(128, 256, 256) instead of (256, 256, 256) to fit within
+    the 256 VGPR hardware encoding limit.
+    """
+    _dbuf_mxfp4_helper(
+        shape=(1024, 1024, 8192),
+        block=(128, 256, 256),
         num_waves=4,
         use_stagger=False,
         compiler=compiler,

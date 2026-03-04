@@ -246,10 +246,8 @@ LogicalResult handleVectorFromElements(Operation *op,
   if (numDwords == 1) {
     ctx.getMapper().mapValue(fromElemsOp.getResult(), dwords[0]);
   } else {
-    auto vregType = ctx.createVRegType(numDwords, numDwords);
-    auto concatOp =
-        ConcatOp::create(builder, loc, vregType, dwords);
-    ctx.getMapper().mapValue(fromElemsOp.getResult(), concatOp.getResult());
+    return op->emitError("vector.from_elements with multi-dword result "
+                         "not yet supported");
   }
   return success();
 }

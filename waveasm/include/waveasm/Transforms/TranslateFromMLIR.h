@@ -511,6 +511,21 @@ public:
     return ldsBaseOffsetMap.contains(memref);
   }
 
+  //===--------------------------------------------------------------------===//
+  // Buffer Base Offset Tracking (for reinterpret_cast element offsets)
+  //===--------------------------------------------------------------------===//
+
+  void setBufferBaseOffset(mlir::Value memref, mlir::Value offset) {
+    bufferBaseOffsetMap[memref] = offset;
+  }
+
+  std::optional<mlir::Value> getBufferBaseOffset(mlir::Value memref) const {
+    auto it = bufferBaseOffsetMap.find(memref);
+    if (it != bufferBaseOffsetMap.end())
+      return it->second;
+    return std::nullopt;
+  }
+
   /// Track a pending per-workgroup SRD base adjustment for a linearized memref
   struct PendingSRDBaseAdjust {
     mlir::Value elementOffset;
@@ -671,6 +686,8 @@ private:
       constOffsetMap; // value -> constant offset (for buffer store offset:N)
   llvm::DenseMap<mlir::Value, mlir::Value>
       ldsBaseOffsetMap; // memref -> LDS byte offset from memref.view
+  llvm::DenseMap<mlir::Value, mlir::Value>
+      bufferBaseOffsetMap; // memref -> element offset from reinterpret_cast
 
   llvm::DenseMap<mlir::Value, PendingSRDBaseAdjust> pendingSRDBaseAdjustMap;
   llvm::SmallVector<PendingSRD, 4> pendingSRDs;
