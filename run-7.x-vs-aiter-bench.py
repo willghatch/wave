@@ -82,8 +82,7 @@ def compile_wave_kernel_waveasm(shape, macrotiles, wave_shape, unroll_factor):
 
     Returns (gpu_func, grid_size, workgroup_size, lds_size) or raises on failure.
     """
-    sys.path.insert(0, "wave_lang/kernel/wave/asm/wave_asm/test/e2e")
-    from waveasm_e2e import WaveASMCompiler, capture_wave_kernel_info
+    from wave_lang.kernel.wave.asm.waveasm_e2e import WaveASMCompiler, capture_wave_kernel_info
     import wave_runtime
 
     from wave_lang.kernel.wave.schedules import get_mxfp4_preshuffle_b_schedule

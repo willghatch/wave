@@ -1933,10 +1933,14 @@ def get_mxfp4_preshuffle_b_schedule(unroll_factor: int = 0):
         ]
 
         # =====================================================================
-        # Apply cluster-based reordering for all stages in a single call.
+        # Apply cluster-based reordering for each pipeline stage separately.
+        # KERNEL lives in a subgraph; PROLOGUE and EPILOGUE live in the root
+        # graph.  Mixing them in a single reorder_graph call fails because
+        # _reorder_parent_graph cannot find subgraph nodes in the root graph.
         # =====================================================================
-        clusters = kernel_clusters + epilogue_clusters + prologue_clusters
-        tkw.reorder_graph(pipeline_loop.EPILOGUE, clusters)
+        tkw.reorder_graph(pipeline_loop.PROLOGUE, prologue_clusters)
+        tkw.reorder_graph(pipeline_loop.KERNEL, kernel_clusters)
+        tkw.reorder_graph(pipeline_loop.EPILOGUE, epilogue_clusters)
 
         if unroll_factor > 1:
             tkw.unroll(pipeline_loop.KERNEL, unroll_factor)
