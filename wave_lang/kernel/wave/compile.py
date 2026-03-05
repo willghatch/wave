@@ -1287,7 +1287,6 @@ def _generate_asm_code_waveasm(mlir_asm, options):
         mlir_path = mlir_file.name
 
     import shutil
-    shutil.copy(mlir_path, "/tmp/waveasm_input.mlir")
 
     try:
         cmd = [
@@ -1319,11 +1318,17 @@ def _generate_asm_code_waveasm(mlir_asm, options):
             f"--workgroup-size-z={wg[2]}",
             mlir_path,
         ]
+        import sys
+        print(f"[DEBUG] waveasm cmd: {' '.join(cmd)}", file=sys.stderr)
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
             raise RuntimeError(f"waveasm-translate failed:\n{result.stderr}")
+        # Save assembly for debugging
+        with open("/tmp/waveasm_output.s", "w") as f:
+            f.write(result.stdout)
         asm_text = result.stdout
     finally:
+        shutil.copy(mlir_path, "/tmp/waveasm_input.mlir")
         os.unlink(mlir_path)
 
     if options.dump_intermediates:

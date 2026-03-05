@@ -7,20 +7,17 @@
 //===----------------------------------------------------------------------===//
 // Loop Invariant Sinking Pass
 //
-// Selectively sinks cheap-to-recompute loop-invariant operations back into
-// loop bodies to reduce register pressure.  Intended to run after LICM when
+// Selectively sinks cheap-to-recompute loop-invariant operations into loop
+// bodies to reduce register pressure.  Intended to run after LICM when
 // hoisting has pushed VGPR pressure above the hardware limit.
 //
-// Only sinks operations that:
-//   - Have the ArithmeticOp trait (pure VALU/SALU instructions)
-//   - Produce a single VGPR result (not SGPR, not multi-result)
-//   - Have all operands available inside the loop (either loop-invariant
-//     values that dominate the loop, or block arguments)
-//   - Are used only inside the loop body (not used outside)
+// For ops used ONLY inside the loop: moves them into the loop body.
+// The value is recomputed each iteration, but its live range shrinks
+// from [def, loop_terminator] to [new_position, use_within_iteration].
 //
-// Net effect: trades a small amount of extra VALU work per iteration for
-// reduced register pressure, since the sunk value is live only for the
-// span of its uses within the loop body rather than the entire loop.
+// For ops used both inside and outside the loop: clones them into the
+// loop body.  In-loop uses are rewired to the clone, splitting the live
+// range so the original need not survive across the loop body.
 //===----------------------------------------------------------------------===//
 
 #include "waveasm/Dialect/WaveASMDialect.h"
@@ -44,8 +41,6 @@ namespace waveasm {
 
 namespace {
 
-// An op is a candidate for sinking if it has the ArithmeticOp trait,
-// produces exactly one VGPR result, and is not an MFMA.
 static bool isCheapVALUOp(Operation *op) {
   if (!op->hasTrait<mlir::OpTrait::ArithmeticOp>())
     return false;
@@ -56,49 +51,30 @@ static bool isCheapVALUOp(Operation *op) {
   return isVGPRType(op->getResult(0).getType());
 }
 
-// True if all uses of val are inside the loop region (including nested
-// regions like IfOp bodies).
-static bool allUsesInsideLoop(Value val, LoopOp loopOp) {
-  Region *loopRegion = &loopOp.getBodyRegion();
+static bool hasUseInsideRegion(Value val, Region *region) {
   for (OpOperand &use : val.getUses()) {
-    Operation *user = use.getOwner();
-    if (!loopRegion->isAncestor(user->getParentRegion()))
+    if (region->isAncestor(use.getOwner()->getParentRegion()))
+      return true;
+  }
+  return false;
+}
+
+static bool allUsesInsideRegion(Value val, Region *region) {
+  for (OpOperand &use : val.getUses()) {
+    if (!region->isAncestor(use.getOwner()->getParentRegion()))
       return false;
   }
   return true;
 }
 
-// Find the first use of `val` in the loop body's top-level op list.
-// Returns nullptr if no use is found directly in the body block.
 static Operation *findFirstUseInBody(Value val, Block &body) {
   for (Operation &op : body) {
-    // Check if this op directly uses val
-    for (Value operand : op.getOperands()) {
+    for (Value operand : op.getOperands())
       if (operand == val)
         return &op;
-    }
-    // Check nested regions (for IfOp, inner LoopOp, etc.) -- if val is
-    // used inside a nested region, we want to sink to just before the
-    // parent region-holding op in the body.
-    for (Region &region : op.getRegions()) {
-      for (Block &block : region) {
-        for (Operation &nested : block) {
-          SmallVector<Operation *, 4> worklist;
-          worklist.push_back(&nested);
-          while (!worklist.empty()) {
-            Operation *cur = worklist.pop_back_val();
-            for (Value operand : cur->getOperands()) {
-              if (operand == val)
-                return &op;
-            }
-            for (Region &r : cur->getRegions())
-              for (Block &b : r)
-                for (Operation &child : b)
-                  worklist.push_back(&child);
-          }
-        }
-      }
-    }
+    for (Region &region : op.getRegions())
+      if (hasUseInsideRegion(val, &region))
+        return &op;
   }
   return nullptr;
 }
@@ -108,48 +84,75 @@ static unsigned sinkIntoLoop(LoopOp loopOp) {
   Region *loopRegion = &loopOp.getBodyRegion();
   unsigned numSunk = 0;
 
-  // Collect ops to sink: ops defined immediately before the loop that are
-  // cheap VALU, used only inside the loop, with all operands available.
-  // We scan backwards from the loop to catch chains of sinkable ops.
-  SmallVector<Operation *> toSink;
-
-  // Gather all values used inside the loop that are defined outside it
-  // by cheap VALU ops.
   llvm::DenseSet<Operation *> candidates;
   body.walk([&](Operation *op) {
     for (Value operand : op->getOperands()) {
       Operation *defOp = operand.getDefiningOp();
       if (!defOp)
         continue;
-      if (!loopRegion->isAncestor(defOp->getParentRegion()) &&
-          isCheapVALUOp(defOp) && allUsesInsideLoop(defOp->getResult(0), loopOp))
-        candidates.insert(defOp);
+      if (loopRegion->isAncestor(defOp->getParentRegion()))
+        continue;
+      if (!isCheapVALUOp(defOp))
+        continue;
+      candidates.insert(defOp);
     }
   });
+
+  llvm::errs() << "[SINKING] Loop at " << loopOp.getLoc()
+               << ": " << candidates.size() << " candidates\n";
 
   if (candidates.empty())
     return 0;
 
-  // Topologically order the candidates so that if A's result feeds B,
-  // A is sunk before B.
-  // Walk the block containing the loop; candidates in the same block
-  // are already in program order.
-  Block *loopParentBlock = loopOp->getBlock();
-  for (Operation &op : *loopParentBlock) {
-    if (candidates.count(&op))
-      toSink.push_back(&op);
+  // Collect candidates in topological (program) order.  Candidates may
+  // live in any ancestor block, so gather all blocks from the loop's
+  // parent up to the ProgramOp and walk each.
+  SmallVector<Block *> ancestorBlocks;
+  {
+    Operation *cur = loopOp.getOperation();
+    while (cur) {
+      if (Block *b = cur->getBlock())
+        ancestorBlocks.push_back(b);
+      cur = cur->getParentOp();
+    }
+  }
+  // Reverse so outermost blocks come first (program order).
+  std::reverse(ancestorBlocks.begin(), ancestorBlocks.end());
+
+  SmallVector<Operation *> toSink;
+  for (Block *block : ancestorBlocks) {
+    for (Operation &op : *block) {
+      if (candidates.count(&op))
+        toSink.push_back(&op);
+    }
   }
 
-  for (Operation *op : toSink) {
-    Value result = op->getResult(0);
+  // Track cloned/moved values so chains can be rewired.
+  llvm::DenseMap<Value, Value> inLoopValues;
 
-    // Find insertion point: just before the first use in the body.
-    Operation *firstUser = findFirstUseInBody(result, body);
+  for (Operation *op : toSink) {
+    Value origResult = op->getResult(0);
+    if (!hasUseInsideRegion(origResult, loopRegion))
+      continue;
+
+    Operation *firstUser = findFirstUseInBody(origResult, body);
     if (!firstUser)
       continue;
 
-    // Move the op into the loop body, just before its first user.
+    if (!allUsesInsideRegion(origResult, loopRegion)) {
+      llvm::errs() << "[SINKING]   Skip (has outside uses): " << *op << "\n";
+      continue;
+    }
+
+    // Move the op into the loop.  Rewire operands to in-loop versions
+    // of any previously sunk values.
     op->moveBefore(firstUser);
+    for (unsigned i = 0; i < op->getNumOperands(); ++i) {
+      auto it = inLoopValues.find(op->getOperand(i));
+      if (it != inLoopValues.end())
+        op->setOperand(i, it->second);
+    }
+    inLoopValues[origResult] = origResult;
     ++numSunk;
   }
 
@@ -164,10 +167,8 @@ struct LoopSinkingPass
     SmallVector<LoopOp> loops;
     getOperation()->walk<WalkOrder::PostOrder>(
         [&](LoopOp loopOp) { loops.push_back(loopOp); });
-    for (auto loopOp : loops) {
-      unsigned sunk = sinkIntoLoop(loopOp);
-      numOpsSunk += sunk;
-    }
+    for (auto loopOp : loops)
+      numOpsSunk += sinkIntoLoop(loopOp);
   }
 };
 

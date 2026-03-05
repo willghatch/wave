@@ -413,32 +413,13 @@ LivenessInfo computeLiveness(ProgramOp program) {
               it->second.start = std::min(it->second.start, loopIt->second);
             }
           }
-        } else if (auto ifOp = dyn_cast<IfOp>(parent)) {
-          if (!isDefinedInside(ifOp)) {
-            // Only extend to the branch that actually contains this use,
-            // not both branches.  Only one branch executes at runtime, so
-            // a value used only in the then-branch need not be live during
-            // the else-branch (and vice versa).
-            Region *useRegion = useOp->getParentRegion();
-            while (useRegion &&
-                   useRegion->getParentOp() != ifOp.getOperation())
-              useRegion = useRegion->getParentOp()->getParentRegion();
-
-            if (useRegion) {
-              for (Block &block : *useRegion) {
-                if (auto *term = block.getTerminator()) {
-                  auto termIt = opToIdx.find(term);
-                  if (termIt != opToIdx.end())
-                    it->second.end =
-                        std::max(it->second.end, termIt->second);
-                }
-              }
-            }
-            auto ifIt = opToIdx.find(ifOp.getOperation());
-            if (ifIt != opToIdx.end()) {
-              it->second.start = std::min(it->second.start, ifIt->second);
-            }
-          }
+        } else if (isa<IfOp>(parent)) {
+          // No extension needed for IfOp.  Unlike a loop, each branch
+          // executes at most once, in the same sequential order the
+          // linear scan allocator processes.  The value's natural range
+          // [defPoint, lastUsePoint] from Pass 2 already covers the use
+          // inside the branch.  Since the value is defined outside the
+          // IfOp, defPoint <= ifOp index, so start is also correct.
         }
         parent = parent->getParentOp();
       }
@@ -704,6 +685,44 @@ LivenessInfo computeLiveness(ProgramOp program) {
   info.maxVRegPressure = computeMaxPressure(info.vregRanges, info.tiedClasses);
   info.maxSRegPressure = computeMaxPressure(info.sregRanges, info.tiedClasses);
   info.maxARegPressure = computeMaxPressure(info.aregRanges, info.tiedClasses);
+
+  int64_t vregPeakPoint = 0;
+  computeMaxPressure(info.vregRanges, info.tiedClasses, &vregPeakPoint);
+  llvm::errs() << "[LIVENESS] Peak pressure: VGPR=" << info.maxVRegPressure
+               << " SGPR=" << info.maxSRegPressure
+               << " AGPR=" << info.maxARegPressure
+               << " (VGPR peak at op " << vregPeakPoint;
+  if (vregPeakPoint >= 0 && vregPeakPoint < static_cast<int64_t>(ops.size())) {
+    llvm::errs() << ": " << ops[vregPeakPoint]->getName();
+  }
+  llvm::errs() << ")\n";
+
+  // Dump VGPR ranges alive at peak
+  llvm::errs() << "[LIVENESS] VGPR ranges alive at peak " << vregPeakPoint << ":\n";
+  llvm::DenseSet<int64_t> emittedClasses;
+  int64_t totalRegsAtPeak = 0;
+  for (const auto &r : info.vregRanges) {
+    bool atPeak = false;
+    if (r.tiedClassId >= 0) {
+      const auto &cls = info.tiedClasses.classes[r.tiedClassId];
+      atPeak = (cls.envelopeStart <= vregPeakPoint && cls.envelopeEnd >= vregPeakPoint);
+      if (atPeak && !emittedClasses.insert(r.tiedClassId).second)
+        continue;  // already counted this class
+      if (atPeak) totalRegsAtPeak += cls.size;
+    } else {
+      atPeak = (r.start <= vregPeakPoint && r.end >= vregPeakPoint);
+      if (atPeak) totalRegsAtPeak += r.size;
+    }
+    if (atPeak) {
+      llvm::StringRef defName = "<block_arg>";
+      if (auto defOp = r.reg.getDefiningOp())
+        defName = defOp->getName().getStringRef();
+      llvm::errs() << "  [" << r.start << ", " << r.end << "] size=" << r.size
+                   << " tied=" << r.tiedClassId
+                   << " def=" << defName << "\n";
+    }
+  }
+  llvm::errs() << "[LIVENESS] Total VGPR regs at peak: " << totalRegsAtPeak << "\n";
 
   return info;
 }
