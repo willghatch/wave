@@ -1121,8 +1121,8 @@ LogicalResult handleROCDLSchedBarrier(Operation *op, TranslationContext &ctx) {
     mask = maskAttr.getInt();
   }
 
-  RawOp::create(builder, loc,
-                "s_sched_barrier 0x" + llvm::utohexstr(mask));
+  CommentOp::create(builder, loc,
+                    "s_sched_barrier 0x" + llvm::utohexstr(mask));
   return success();
 }
 
