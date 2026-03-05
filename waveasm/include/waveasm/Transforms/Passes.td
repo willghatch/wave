@@ -239,4 +239,28 @@ def WAVEASMMemoryOffsetOpt : Pass<"waveasm-memory-offset-opt"> {
   let dependentDialects = ["::waveasm::WaveASMDialect"];
 }
 
+//===----------------------------------------------------------------------===//
+// Loop Invariant Sinking Pass
+//===----------------------------------------------------------------------===//
+
+def WAVEASMLoopSinking : Pass<"waveasm-loop-sinking"> {
+  let summary = "Sink loop-invariant operations to reduce register pressure";
+  let description = [{
+    Selectively sinks cheap-to-recompute loop-invariant operations back into
+    loop bodies to reduce register pressure.  Runs after LICM when hoisting
+    has pushed VGPR pressure above the hardware limit.
+
+    Only sinks operations that:
+    - Are single VALU instructions (shifts, adds, etc.)
+    - Have all operands available inside the loop
+    - Are used only inside the loop (not outside)
+  }];
+
+  let statistics = [
+    Statistic<"numOpsSunk", "Operations sunk into loops", "count">
+  ];
+
+  let dependentDialects = ["::waveasm::WaveASMDialect"];
+}
+
 #endif // WaveASM_TRANSFORMS_PASSES

@@ -31,6 +31,7 @@ add_mlir_dialect_library(MLIRWaveASMTransforms
   ScalePackElimination.cpp
   BufferLoadStrengthReduction.cpp
   LoopAddressPromotion.cpp
+  LoopInvariantSinking.cpp
   ${HANDLERS_FULL_PATHS}
 
   ADDITIONAL_HEADER_DIRS

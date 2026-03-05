@@ -415,11 +415,25 @@ LivenessInfo computeLiveness(ProgramOp program) {
           }
         } else if (auto ifOp = dyn_cast<IfOp>(parent)) {
           if (!isDefinedInside(ifOp)) {
-            // Extend to cover both branches (conservative: only one
-            // executes at runtime, but the linear scan allocator
-            // flattens both into a single instruction stream).
-            extendToRegionEnd(ifOp);
-            // Extend start back to the if op.
+            // Only extend to the branch that actually contains this use,
+            // not both branches.  Only one branch executes at runtime, so
+            // a value used only in the then-branch need not be live during
+            // the else-branch (and vice versa).
+            Region *useRegion = useOp->getParentRegion();
+            while (useRegion &&
+                   useRegion->getParentOp() != ifOp.getOperation())
+              useRegion = useRegion->getParentOp()->getParentRegion();
+
+            if (useRegion) {
+              for (Block &block : *useRegion) {
+                if (auto *term = block.getTerminator()) {
+                  auto termIt = opToIdx.find(term);
+                  if (termIt != opToIdx.end())
+                    it->second.end =
+                        std::max(it->second.end, termIt->second);
+                }
+              }
+            }
             auto ifIt = opToIdx.find(ifOp.getOperation());
             if (ifIt != opToIdx.end()) {
               it->second.start = std::min(it->second.start, ifIt->second);

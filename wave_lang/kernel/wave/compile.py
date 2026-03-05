@@ -1301,6 +1301,7 @@ def _generate_asm_code_waveasm(mlir_asm, options):
             "--canonicalize",
             "--waveasm-scoped-cse",
             "--waveasm-loop-address-promotion",
+            "--waveasm-loop-sinking",
             "--waveasm-linear-scan=max-vgprs=512 max-agprs=512",
             # Regalloc replaces virtual types with physical types that differ
             # in register index but match in class/size.  LoopLikeOpInterface
