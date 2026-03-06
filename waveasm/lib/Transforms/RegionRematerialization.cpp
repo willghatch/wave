@@ -26,6 +26,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "waveasm/Dialect/WaveASMDialect.h"
+#include "waveasm/Dialect/WaveASMInterfaces.h"
 #include "waveasm/Dialect/WaveASMOps.h"
 #include "waveasm/Dialect/WaveASMTypes.h"
 #include "waveasm/Transforms/Passes.h"
@@ -53,7 +54,7 @@ namespace {
 static bool isCheapVALUOp(Operation *op) {
   if (!op->hasTrait<mlir::OpTrait::ArithmeticOp>())
     return false;
-  if (op->hasTrait<mlir::OpTrait::MFMAOp>())
+  if (isa<MFMAOpInterface>(op))
     return false;
   if (op->getNumResults() != 1)
     return false;
