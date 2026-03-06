@@ -243,6 +243,24 @@ def WAVEASMMemoryOffsetOpt : Pass<"waveasm-memory-offset-opt"> {
 // Loop Invariant Sinking Pass
 //===----------------------------------------------------------------------===//
 
+def WAVEASMRegionRematerialization
+    : Pass<"waveasm-region-rematerialization"> {
+  let summary = "Clone cheap ops into regions to reduce register pressure";
+  let description = [{
+    Clones cheap VALU ops defined before IfOp/LoopOp regions into the
+    regions where they are used, shortening live ranges.  Targets the
+    dynamic-shape pattern where an IfOp guard is followed by a remainder
+    loop, and address/scale computations defined before the IfOp have
+    live ranges spanning the entire if + remainder structure.
+  }];
+
+  let statistics = [
+    Statistic<"numOpsRematerialized", "Operations rematerialized", "count">
+  ];
+
+  let dependentDialects = ["::waveasm::WaveASMDialect"];
+}
+
 def WAVEASMLoopSinking : Pass<"waveasm-loop-sinking"> {
   let summary = "Sink loop-invariant operations to reduce register pressure";
   let description = [{

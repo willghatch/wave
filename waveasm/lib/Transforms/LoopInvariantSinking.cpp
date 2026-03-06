@@ -11,13 +11,13 @@
 // bodies to reduce register pressure.  Intended to run after LICM when
 // hoisting has pushed VGPR pressure above the hardware limit.
 //
-// For ops used ONLY inside the loop: moves them into the loop body.
-// The value is recomputed each iteration, but its live range shrinks
-// from [def, loop_terminator] to [new_position, use_within_iteration].
+// Uses CLONE semantics: candidates are cloned into the loop body with
+// in-loop uses rewired to the clones.  Originals are erased if dead.
 //
-// For ops used both inside and outside the loop: clones them into the
-// loop body.  In-loop uses are rewired to the clone, splitting the live
-// range so the original need not survive across the loop body.
+// Safety: only sinks an op when doing so does not create new cross-loop
+// VGPR live ranges.  An op's VGPR operand is "safe" if it is:
+//   (a) already used inside the loop, OR
+//   (b) defined by another op that will also be sunk (transitive closure)
 //===----------------------------------------------------------------------===//
 
 #include "waveasm/Dialect/WaveASMDialect.h"
@@ -26,6 +26,7 @@
 #include "waveasm/Transforms/Passes.h"
 
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
@@ -42,10 +43,11 @@ namespace waveasm {
 
 namespace {
 
-static bool isCheapVALUOp(Operation *op) {
-  if (!op->hasTrait<mlir::OpTrait::ArithmeticOp>())
-    return false;
-  if (op->hasTrait<mlir::OpTrait::MFMAOp>())
+static bool isSinkableOp(Operation *op) {
+  if (!isa<V_LSHRREV_B32, V_AND_B32, V_LSHLREV_B32, V_SUB_U32,
+           V_BFE_U32, V_MUL_LO_U32, V_MIN_I32, V_ADD_U32,
+           V_OR_B32, V_XOR_B32, V_LSHL_ADD_U32, V_CNDMASK_B32,
+           V_LSHL_OR_B32>(op))
     return false;
   if (op->getNumResults() != 1)
     return false;
@@ -60,54 +62,17 @@ static bool hasUseInsideRegion(Value val, Region *region) {
   return false;
 }
 
-static bool allUsesInsideRegion(Value val, Region *region) {
-  for (OpOperand &use : val.getUses()) {
-    if (!region->isAncestor(use.getOwner()->getParentRegion()))
-      return false;
+static bool operandSafe(Value operand, Region *loopRegion,
+                        const llvm::DenseSet<Operation *> &sinkSet) {
+  if (!isVGPRType(operand.getType()))
+    return true;
+  if (hasUseInsideRegion(operand, loopRegion))
+    return true;
+  if (auto *defOp = operand.getDefiningOp()) {
+    if (sinkSet.contains(defOp))
+      return true;
   }
-  return true;
-}
-
-static Operation *findFirstUseInBody(Value val, Block &body) {
-  for (Operation &op : body) {
-    for (Value operand : op.getOperands())
-      if (operand == val)
-        return &op;
-    for (Region &region : op.getRegions())
-      if (hasUseInsideRegion(val, &region))
-        return &op;
-  }
-  return nullptr;
-}
-
-static void replaceUsesInsideRegion(Value oldVal, Value newVal,
-                                    Region *region) {
-  SmallVector<OpOperand *> usesToReplace;
-  for (OpOperand &use : oldVal.getUses()) {
-    if (region->isAncestor(use.getOwner()->getParentRegion()))
-      usesToReplace.push_back(&use);
-  }
-  for (OpOperand *use : usesToReplace)
-    use->set(newVal);
-}
-
-// Recursively collect the transitive closure of cheap VALU operands
-// defined outside the loop region.  The collected set includes all ops
-// that would need to be cloned to avoid introducing new in-loop uses
-// of original values (which would extend those values' live ranges).
-static void collectTransitiveDeps(Operation *op, Region *loopRegion,
-                                  llvm::DenseSet<Operation *> &deps) {
-  for (Value operand : op->getOperands()) {
-    Operation *defOp = operand.getDefiningOp();
-    if (!defOp)
-      continue;
-    if (loopRegion->isAncestor(defOp->getParentRegion()))
-      continue;
-    if (!isCheapVALUOp(defOp))
-      continue;
-    if (deps.insert(defOp).second)
-      collectTransitiveDeps(defOp, loopRegion, deps);
-  }
+  return false;
 }
 
 static unsigned sinkIntoLoop(LoopOp loopOp) {
@@ -115,9 +80,9 @@ static unsigned sinkIntoLoop(LoopOp loopOp) {
   Region *loopRegion = &loopOp.getBodyRegion();
   unsigned numSunk = 0;
 
-  // Phase 1: find all cheap VALU ops defined outside the loop whose
-  // results are used inside it.
-  llvm::DenseSet<Operation *> directCandidates;
+  // Phase 1: collect sinkable ops defined outside the loop whose results
+  // are used inside it.
+  llvm::DenseSet<Operation *> candidates;
   body.walk([&](Operation *op) {
     for (Value operand : op->getOperands()) {
       Operation *defOp = operand.getDefiningOp();
@@ -125,22 +90,61 @@ static unsigned sinkIntoLoop(LoopOp loopOp) {
         continue;
       if (loopRegion->isAncestor(defOp->getParentRegion()))
         continue;
-      if (!isCheapVALUOp(defOp))
+      if (!isSinkableOp(defOp))
         continue;
-      directCandidates.insert(defOp);
+      candidates.insert(defOp);
     }
   });
 
-  if (directCandidates.empty())
+  if (candidates.empty())
     return 0;
 
-  // Only sink direct candidates; skip transitive closure expansion.
-  // Expanding to transitive deps creates too many sunk ops, increasing
-  // register pressure and live ranges inside the loop body without
-  // proportional benefit.
-  llvm::DenseSet<Operation *> &allCandidates = directCandidates;
+  // Phase 2: expand to include transitive dependencies so that entire
+  // computation chains (e.g. v_add -> v_lshrrev) can be sunk together.
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (Operation *op : llvm::SmallVector<Operation *>(candidates.begin(),
+                                                        candidates.end())) {
+      for (Value operand : op->getOperands()) {
+        auto *defOp = operand.getDefiningOp();
+        if (!defOp)
+          continue;
+        if (loopRegion->isAncestor(defOp->getParentRegion()))
+          continue;
+        if (!isSinkableOp(defOp))
+          continue;
+        if (candidates.insert(defOp).second)
+          changed = true;
+      }
+    }
+  }
 
-  // Collect in topological (program) order.
+  // Phase 3: iteratively remove candidates whose VGPR operands are
+  // neither already live inside the loop nor defined by another candidate.
+  changed = true;
+  while (changed) {
+    changed = false;
+    SmallVector<Operation *> toRemove;
+    for (Operation *op : candidates) {
+      for (Value operand : op->getOperands()) {
+        if (!operandSafe(operand, loopRegion, candidates)) {
+          toRemove.push_back(op);
+          break;
+        }
+      }
+    }
+    for (Operation *op : toRemove) {
+      if (candidates.erase(op))
+        changed = true;
+    }
+  }
+
+  if (candidates.empty())
+    return 0;
+
+  // Phase 4: collect in topological (program) order by walking ancestor
+  // blocks from outermost to innermost.
   SmallVector<Block *> ancestorBlocks;
   {
     Operation *cur = loopOp.getOperation();
@@ -155,41 +159,41 @@ static unsigned sinkIntoLoop(LoopOp loopOp) {
   SmallVector<Operation *> toSink;
   for (Block *block : ancestorBlocks) {
     for (Operation &op : *block) {
-      if (allCandidates.count(&op))
+      if (candidates.count(&op))
         toSink.push_back(&op);
     }
   }
 
-  // Maps original values to their in-loop equivalents (whether moved
-  // or cloned) so that chains of sunk ops use the right operands.
-  llvm::DenseMap<Value, Value> inLoopValues;
-
-  // All sunk ops are placed at the beginning of the loop body in
-  // topological order.  A cursor tracks the insertion point so each
-  // successive op is placed after all previously sunk ops, preserving
-  // def-use ordering among sunk ops and ensuring all sunk definitions
-  // precede the original loop body ops that consume them.
-  Operation *insertCursor = &body.front();
+  // Phase 5: clone into loop body and rewire in-loop uses.
+  IRMapping mapping;
+  OpBuilder builder = OpBuilder::atBlockBegin(&body);
 
   for (Operation *op : toSink) {
     Value origResult = op->getResult(0);
 
-    if (!hasUseInsideRegion(origResult, loopRegion))
-      continue;
+    Operation *clone = builder.clone(*op, mapping);
+    Value clonedResult = clone->getResult(0);
 
-    if (!allUsesInsideRegion(origResult, loopRegion))
-      continue;
-
-    op->moveBefore(insertCursor);
-    for (unsigned i = 0; i < op->getNumOperands(); ++i) {
-      auto it = inLoopValues.find(op->getOperand(i));
-      if (it != inLoopValues.end())
-        op->setOperand(i, it->second);
+    SmallVector<OpOperand *> usesToReplace;
+    for (OpOperand &use : origResult.getUses()) {
+      if (loopRegion->isAncestor(use.getOwner()->getParentRegion()))
+        usesToReplace.push_back(&use);
     }
-    inLoopValues[origResult] = origResult;
+    for (OpOperand *use : usesToReplace)
+      use->set(clonedResult);
+
+    mapping.map(origResult, clonedResult);
     ++numSunk;
   }
 
+  // Phase 6: erase dead originals.
+  for (auto it = toSink.rbegin(); it != toSink.rend(); ++it) {
+    Operation *op = *it;
+    if (op->getResult(0).use_empty())
+      op->erase();
+  }
+
+  LLVM_DEBUG(llvm::dbgs() << "[SINK] cloned " << numSunk << " ops into loop\n");
   return numSunk;
 }
 
