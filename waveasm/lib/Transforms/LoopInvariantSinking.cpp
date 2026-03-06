@@ -28,6 +28,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "waveasm-loop-sinking"
 
@@ -133,12 +134,11 @@ static unsigned sinkIntoLoop(LoopOp loopOp) {
   if (directCandidates.empty())
     return 0;
 
-  // Phase 2: expand to transitive closure of cheap VALU dependencies.
-  // This ensures cloned ops can reference other clones rather than
-  // pulling original outside-the-loop values into the loop.
-  llvm::DenseSet<Operation *> allCandidates = directCandidates;
-  for (Operation *op : directCandidates)
-    collectTransitiveDeps(op, loopRegion, allCandidates);
+  // Only sink direct candidates; skip transitive closure expansion.
+  // Expanding to transitive deps creates too many sunk ops, increasing
+  // register pressure and live ranges inside the loop body without
+  // proportional benefit.
+  llvm::DenseSet<Operation *> &allCandidates = directCandidates;
 
   // Collect in topological (program) order.
   SmallVector<Block *> ancestorBlocks;
@@ -164,52 +164,29 @@ static unsigned sinkIntoLoop(LoopOp loopOp) {
   // or cloned) so that chains of sunk ops use the right operands.
   llvm::DenseMap<Value, Value> inLoopValues;
 
+  // All sunk ops are placed at the beginning of the loop body in
+  // topological order.  A cursor tracks the insertion point so each
+  // successive op is placed after all previously sunk ops, preserving
+  // def-use ordering among sunk ops and ensuring all sunk definitions
+  // precede the original loop body ops that consume them.
+  Operation *insertCursor = &body.front();
+
   for (Operation *op : toSink) {
     Value origResult = op->getResult(0);
 
-    bool usedInLoop = hasUseInsideRegion(origResult, loopRegion);
-    bool neededByClone = false;
-    for (OpOperand &use : origResult.getUses()) {
-      Operation *user = use.getOwner();
-      if (allCandidates.count(user) && !loopRegion->isAncestor(user->getParentRegion()))
-        neededByClone = true;
-    }
-    if (!usedInLoop && !neededByClone)
+    if (!hasUseInsideRegion(origResult, loopRegion))
       continue;
 
-    // Find insertion point: just before the first use in the body,
-    // or at the beginning of the body if only used by other clones.
-    Operation *insertBefore = nullptr;
-    if (usedInLoop)
-      insertBefore = findFirstUseInBody(origResult, body);
-    if (!insertBefore)
-      insertBefore = &body.front();
+    if (!allUsesInsideRegion(origResult, loopRegion))
+      continue;
 
-    if (allUsesInsideRegion(origResult, loopRegion)) {
-      op->moveBefore(insertBefore);
-      for (unsigned i = 0; i < op->getNumOperands(); ++i) {
-        auto it = inLoopValues.find(op->getOperand(i));
-        if (it != inLoopValues.end())
-          op->setOperand(i, it->second);
-      }
-      inLoopValues[origResult] = origResult;
-    } else {
-      // Clone the op into the loop body.  In-loop uses are rewired to
-      // the clone so the original no longer needs to survive across
-      // the loop body, reducing its live range.  Because we clone the
-      // full transitive dependency chain, the clone's operands
-      // reference other clones, not the originals.
-      OpBuilder builder(insertBefore);
-      Operation *clone = builder.clone(*op);
-      Value cloneResult = clone->getResult(0);
-      for (unsigned i = 0; i < clone->getNumOperands(); ++i) {
-        auto it = inLoopValues.find(clone->getOperand(i));
-        if (it != inLoopValues.end())
-          clone->setOperand(i, it->second);
-      }
-      replaceUsesInsideRegion(origResult, cloneResult, loopRegion);
-      inLoopValues[origResult] = cloneResult;
+    op->moveBefore(insertCursor);
+    for (unsigned i = 0; i < op->getNumOperands(); ++i) {
+      auto it = inLoopValues.find(op->getOperand(i));
+      if (it != inLoopValues.end())
+        op->setOperand(i, it->second);
     }
+    inLoopValues[origResult] = origResult;
     ++numSunk;
   }
 
