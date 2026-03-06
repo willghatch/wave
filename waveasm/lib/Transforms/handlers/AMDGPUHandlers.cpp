@@ -1113,16 +1113,9 @@ LogicalResult handleMemRefAtomicRMW(Operation *op, TranslationContext &ctx) {
 }
 
 LogicalResult handleROCDLSchedBarrier(Operation *op, TranslationContext &ctx) {
-  auto &builder = ctx.getBuilder();
-  auto loc = op->getLoc();
-
-  int32_t mask = 0;
-  if (auto maskAttr = op->getAttrOfType<IntegerAttr>("mask")) {
-    mask = maskAttr.getInt();
-  }
-
-  RawOp::create(builder, loc,
-                "s_sched_barrier 0x" + llvm::utohexstr(mask));
+  // s_sched_barrier is an LLVM pseudo-instruction (scheduling hint), not a
+  // real hardware instruction.  The waveasm backend emits assembly directly
+  // and has no software scheduler, so we simply drop it.
   return success();
 }
 

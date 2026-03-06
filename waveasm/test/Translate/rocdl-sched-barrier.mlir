@@ -1,17 +1,12 @@
 // RUN: waveasm-translate %s 2>&1 | FileCheck %s
 //
-// Test: rocdl.sched.barrier handler emits waveasm.raw "s_sched_barrier".
+// Test: rocdl.sched.barrier is silently dropped (it is an LLVM scheduling
+// pseudo-instruction, not a real hardware instruction on AMDGCN).
 
 // CHECK-LABEL: waveasm.program @sched_barrier_test
 
-// rocdl.sched.barrier 0 -> s_sched_barrier 0x0
-// CHECK: waveasm.raw "s_sched_barrier 0x0"
-
-// rocdl.sched.barrier 1 -> s_sched_barrier 0x1
-// CHECK: waveasm.raw "s_sched_barrier 0x1"
-
-// rocdl.sched.barrier 255 -> s_sched_barrier 0xFF
-// CHECK: waveasm.raw "s_sched_barrier 0xFF"
+// The sched.barrier ops should be silently dropped - no raw ops emitted.
+// CHECK-NOT: s_sched_barrier
 
 // CHECK: waveasm.s_endpgm
 
