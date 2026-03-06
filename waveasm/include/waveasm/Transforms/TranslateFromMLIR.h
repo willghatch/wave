@@ -395,8 +395,30 @@ public:
   /// Update buffer size for a pending SRD (called when we see reinterpret_cast)
   void updateSRDBufferSize(mlir::Value memref, int64_t bufferSize);
 
-  /// Get the number of kernel arguments (based on pending SRD count)
-  size_t getNumKernelArgs() const { return pendingSRDs.size(); }
+  //===--------------------------------------------------------------------===//
+  // Pending Scalar Arg Setup (for dynamic dims passed as kernel arguments)
+  //===--------------------------------------------------------------------===//
+
+  struct PendingScalarArg {
+    mlir::Value funcArg;  // The function argument value to map
+    int64_t argIndex;     // Kernel argument index (position in kernarg segment)
+  };
+
+  /// Queue a scalar kernel argument for loading from kernarg memory.
+  /// Called for non-memref function arguments (e.g., dynamic M, N, K dims).
+  void queueScalarArgSetup(mlir::Value funcArg, int64_t argIndex) {
+    pendingScalarArgs.push_back({funcArg, argIndex});
+  }
+
+  /// Get the number of kernel arguments (SRD-backed + scalar)
+  size_t getNumKernelArgs() const {
+    size_t maxArgIdx = 0;
+    for (const auto &p : pendingSRDs)
+      maxArgIdx = std::max(maxArgIdx, (size_t)(p.argIndex + 1));
+    for (const auto &p : pendingScalarArgs)
+      maxArgIdx = std::max(maxArgIdx, (size_t)(p.argIndex + 1));
+    return maxArgIdx;
+  }
 
   //===--------------------------------------------------------------------===//
   // Split Vector Result Tracking
@@ -674,6 +696,7 @@ private:
 
   llvm::DenseMap<mlir::Value, PendingSRDBaseAdjust> pendingSRDBaseAdjustMap;
   llvm::SmallVector<PendingSRD, 4> pendingSRDs;
+  llvm::SmallVector<PendingScalarArg, 4> pendingScalarArgs;
   llvm::StringMap<mlir::Value> exprCache;
   int64_t nextSRDIndex =
       -1; // Will be computed lazily, starts after user+system SGPRs

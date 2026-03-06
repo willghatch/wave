@@ -139,7 +139,8 @@ void TranslationContext::queueSRDSetup(Value memref, int64_t argIndex,
 }
 
 void TranslationContext::emitSRDPrologue() {
-  if (srdPrologueEmitted || pendingSRDs.empty())
+  if (srdPrologueEmitted ||
+      (pendingSRDs.empty() && pendingScalarArgs.empty()))
     return;
 
   srdPrologueEmitted = true;
@@ -153,7 +154,7 @@ void TranslationContext::emitSRDPrologue() {
   // SRDs must start after: user SGPRs + system SGPRs (workgroup IDs)
   int64_t userSgprCount = 2; // kernarg ptr
   if (isGFX95) {
-    userSgprCount += pendingSRDs.size() * 2; // preloaded args
+    userSgprCount += getNumKernelArgs() * 2; // preloaded args (SRDs + scalars)
   }
   int64_t systemSgprCount = 3; // workgroup_id_x, y, z
   int64_t srdStartIndex =
@@ -195,6 +196,14 @@ void TranslationContext::emitSRDPrologue() {
                                  /*size=*/2);
       }
     }
+    for (const auto &pending : pendingScalarArgs) {
+      int64_t preloadBase = 2 + pending.argIndex * 2;
+      if (reservedPreloadBases.insert(preloadBase).second) {
+        auto preloadType = createSRegType(2, 2);
+        PrecoloredSRegOp::create(builder, loc, preloadType, preloadBase,
+                                 /*size=*/2);
+      }
+    }
   }
 
   if (isGFX95) {
@@ -208,6 +217,17 @@ void TranslationContext::emitSRDPrologue() {
         PrecoloredSRegOp::create(builder, loc, kernargSRegType, 0, 2);
 
     for (const auto &pending : pendingSRDs) {
+      int64_t loadBase = 2 + pending.argIndex * 2;
+      int64_t kernargOffset = pending.argIndex * 8;
+
+      auto loadDstType = createSRegType(2, loadBase);
+      auto offsetImm = builder.getType<ImmType>(kernargOffset);
+      auto offsetConst =
+          ConstantOp::create(builder, loc, offsetImm, kernargOffset);
+      S_LOAD_DWORDX2::create(builder, loc, TypeRange{loadDstType}, kernargBase,
+                             offsetConst);
+    }
+    for (const auto &pending : pendingScalarArgs) {
       int64_t loadBase = 2 + pending.argIndex * 2;
       int64_t kernargOffset = pending.argIndex * 8;
 
@@ -266,6 +286,20 @@ void TranslationContext::emitSRDPrologue() {
 
       mapper.mapValue(pending.memref, srdReg);
     }
+
+    // Step 4: Copy scalar args from preload SGPRs to VGPRs.
+    // Dynamic dims are passed as 2x uint32 (lo, hi).  We only need the lo
+    // part (s[preloadBase]) since dimensions fit in 32 bits.
+    for (const auto &pending : pendingScalarArgs) {
+      int64_t preloadBase = 2 + pending.argIndex * 2;
+      auto preloadSregType = createSRegType(1, 1);
+      auto preloadSreg = PrecoloredSRegOp::create(builder, loc,
+                                                   preloadSregType,
+                                                   preloadBase, 1);
+      auto vregType = createVRegType();
+      auto vreg = V_MOV_B32::create(builder, loc, vregType, preloadSreg);
+      mapper.mapValue(pending.funcArg, vreg);
+    }
   } else {
     // Non-GFX95* path (e.g., gfx942): Load directly into SRD positions
     // This eliminates the s_mov_b64 copies by loading args directly into the
@@ -319,6 +353,15 @@ void TranslationContext::emitSRDPrologue() {
       RawOp::create(builder, loc, movStrideStr);
 
       mapper.mapValue(pending.memref, srdReg);
+    }
+
+    // Non-GFX95 fallback: map scalar args to precolored VGPRs.
+    // True kernarg loading for dynamic dims is only implemented for gfx950+.
+    for (const auto &pending : pendingScalarArgs) {
+      auto vregType = createVRegType();
+      auto vreg = PrecoloredVRegOp::create(builder, loc, vregType,
+                                           pending.argIndex, 1);
+      mapper.mapValue(pending.funcArg, vreg);
     }
   }
 
@@ -1844,17 +1887,24 @@ LogicalResult translateModule(ModuleOp module, StringRef targetId) {
     // Map function arguments
     for (auto arg : funcOp.getBody().getArguments()) {
       int64_t argIdx = arg.getArgNumber();
-      // Check if argument is a memref type
       if (auto memrefType = dyn_cast<MemRefType>(arg.getType())) {
-        // Queue SRD setup for this binding
         int64_t bufferSize = computeBufferSizeFromMemRef(memrefType);
         ctx.queueSRDSetup(arg, argIdx, bufferSize);
-      } else {
-        // Non-memref args (i32, index, etc.) - map to VGPR
-        auto vregType = ctx.createVRegType();
-        auto vreg = PrecoloredVRegOp::create(builder, funcOp.getLoc(), vregType,
-                                             argIdx, 1);
-        ctx.getMapper().mapValue(arg, vreg);
+      } else if (isa<IndexType>(arg.getType())) {
+        // Dynamic dim args (M, N, K) -- queue for loading from kernarg
+        // memory in the SRD prologue.
+        ctx.queueScalarArgSetup(arg, argIdx);
+      } else if (!isa<MemRefType>(arg.getType())) {
+        // Non-binding, non-index args (i32, f32, etc.) -- map to VGPR.
+        // stream.binding args are intentionally skipped here; they are
+        // handled later by handleBindingSubspan.
+        auto type = arg.getType();
+        if (isa<IntegerType>(type) || isa<FloatType>(type)) {
+          auto vregType = ctx.createVRegType();
+          auto vreg = PrecoloredVRegOp::create(builder, funcOp.getLoc(),
+                                               vregType, argIdx, 1);
+          ctx.getMapper().mapValue(arg, vreg);
+        }
       }
     }
 
@@ -2033,12 +2083,18 @@ LogicalResult translateModule(ModuleOp module,
       if (auto memrefType = dyn_cast<MemRefType>(arg.getType())) {
         int64_t bufferSize = computeBufferSizeFromMemRef(memrefType);
         transCtx.queueSRDSetup(arg, argIdx, bufferSize);
-      } else {
+      } else if (isa<IndexType>(arg.getType())) {
+        // Dynamic dim args (M, N, K) -- queue for loading from kernarg
+        // memory in the SRD prologue.
+        transCtx.queueScalarArgSetup(arg, argIdx);
+      } else if (isa<IntegerType>(arg.getType()) ||
+                 isa<FloatType>(arg.getType())) {
         auto vregType = transCtx.createVRegType();
-        auto vreg = PrecoloredVRegOp::create(builder, funcOp.getLoc(), vregType,
-                                             argIdx, 1);
+        auto vreg = PrecoloredVRegOp::create(builder, funcOp.getLoc(),
+                                             vregType, argIdx, 1);
         transCtx.getMapper().mapValue(arg, vreg);
       }
+      // stream.binding args: handled later by handleBindingSubspan.
     }
 
     // First pass: handle binding.subspan operations
