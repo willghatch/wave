@@ -6,6 +6,7 @@
 
 #include "waveasm/Transforms/RegionBuilder.h"
 #include "mlir/Dialect/AMDGPU/IR/AMDGPUDialect.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "waveasm/Dialect/WaveASMOps.h"
@@ -291,16 +292,73 @@ IfOp RegionBuilder::buildIfFromSCFIf(scf::IfOp ifOp) {
   auto &builder = ctx.getBuilder();
   auto loc = ifOp.getLoc();
 
-  // Get mapped condition
+  // Get mapped condition.
+  // arith.cmpi maps its result to an ImmType(1) placeholder (it actually sets
+  // VCC via V_CMP_*, but IfOp branches on SCC via s_cbranch_scc0).  To bridge
+  // this, we re-emit the comparison as an S_CMP_* right before the branch so
+  // that SCC is set correctly.
   auto condition = ctx.getMapper().getMapped(ifOp.getCondition());
   if (!condition) {
     ifOp.emitError("condition not mapped");
     return nullptr;
   }
 
-  // Convert condition to sreg if it's an immediate
-  // (arith.cmpi maps result to immediate placeholder)
   Value conditionValue = *condition;
+
+  if (auto *condDefOp = ifOp.getCondition().getDefiningOp()) {
+    if (auto cmpOp = dyn_cast<arith::CmpIOp>(condDefOp)) {
+      auto lhsMapped = ctx.getMapper().getMapped(cmpOp.getLhs());
+      auto rhsMapped = ctx.getMapper().getMapped(cmpOp.getRhs());
+      if (lhsMapped && rhsMapped) {
+        auto sregType = ctx.createSRegType();
+        Value lhsS = *lhsMapped;
+        Value rhsS = *rhsMapped;
+        if (isVGPRType(lhsS.getType())) {
+          lhsS = V_READFIRSTLANE_B32::create(builder, loc, sregType, lhsS);
+        } else if (isa<ImmType>(lhsS.getType())) {
+          lhsS = S_MOV_B32::create(builder, loc, sregType, lhsS);
+        }
+        if (isVGPRType(rhsS.getType())) {
+          rhsS = V_READFIRSTLANE_B32::create(builder, loc, sregType, rhsS);
+        }
+
+        switch (cmpOp.getPredicate()) {
+        case arith::CmpIPredicate::eq:
+          conditionValue = S_CMP_EQ_U32::create(builder, loc, sregType, lhsS, rhsS);
+          break;
+        case arith::CmpIPredicate::ne:
+          conditionValue = S_CMP_NE_U32::create(builder, loc, sregType, lhsS, rhsS);
+          break;
+        case arith::CmpIPredicate::slt:
+          conditionValue = S_CMP_LT_I32::create(builder, loc, sregType, lhsS, rhsS);
+          break;
+        case arith::CmpIPredicate::sle:
+          conditionValue = S_CMP_LE_I32::create(builder, loc, sregType, lhsS, rhsS);
+          break;
+        case arith::CmpIPredicate::sgt:
+          conditionValue = S_CMP_GT_I32::create(builder, loc, sregType, lhsS, rhsS);
+          break;
+        case arith::CmpIPredicate::sge:
+          conditionValue = S_CMP_GE_I32::create(builder, loc, sregType, lhsS, rhsS);
+          break;
+        case arith::CmpIPredicate::ult:
+          conditionValue = S_CMP_LT_U32::create(builder, loc, sregType, lhsS, rhsS);
+          break;
+        case arith::CmpIPredicate::ule:
+          conditionValue = S_CMP_LE_U32::create(builder, loc, sregType, lhsS, rhsS);
+          break;
+        case arith::CmpIPredicate::ugt:
+          conditionValue = S_CMP_GT_U32::create(builder, loc, sregType, lhsS, rhsS);
+          break;
+        case arith::CmpIPredicate::uge:
+          conditionValue = S_CMP_GE_U32::create(builder, loc, sregType, lhsS, rhsS);
+          break;
+        }
+      }
+    }
+  }
+
+  // Fallback: if condition is still an immediate placeholder, materialize it
   if (isa<ImmType>(conditionValue.getType())) {
     auto sregType = ctx.createSRegType();
     conditionValue = S_MOV_B32::create(builder, loc, sregType, conditionValue);

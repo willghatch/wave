@@ -107,6 +107,49 @@ KernelGenerator::materializeLiteralOperand(Value operand, int scratchIdx) {
   return {resolveValue(operand), ""};
 }
 
+KernelGenerator::ResolvedOperands
+KernelGenerator::resolveVALUSourceOperands(ArrayRef<Value> operands) {
+  ResolvedOperands result;
+  int scratchIdx = kScratchVGPR;
+
+  bool hasLiteral = false;
+  bool hasSGPR = false;
+
+  for (int i = 0; i < static_cast<int>(operands.size()); ++i) {
+    Value op = operands[i];
+    auto [isLit, val] = getLiteralValue(op);
+    bool isNonInlineLit = isLit && !isInlineConstant(val);
+    bool isSGPR = isSGPRType(op.getType());
+
+    if (isNonInlineLit) {
+      if (hasLiteral || hasSGPR) {
+        std::string scratch = formatVGPRRange(scratchIdx, 1);
+        result.prefix +=
+            "  v_mov_b32 " + scratch + ", " + std::to_string(val) + "\n";
+        peakVGPRs = std::max(peakVGPRs, static_cast<int64_t>(scratchIdx + 1));
+        result.operandStrs.push_back(scratch);
+        scratchIdx++;
+        continue;
+      }
+      hasLiteral = true;
+    } else if (isSGPR) {
+      if (hasSGPR || hasLiteral) {
+        std::string sgprStr = resolveValue(op);
+        std::string scratch = formatVGPRRange(scratchIdx, 1);
+        result.prefix +=
+            "  v_mov_b32 " + scratch + ", " + sgprStr + "\n";
+        peakVGPRs = std::max(peakVGPRs, static_cast<int64_t>(scratchIdx + 1));
+        result.operandStrs.push_back(scratch);
+        scratchIdx++;
+        continue;
+      }
+      hasSGPR = true;
+    }
+    result.operandStrs.push_back(resolveValue(op));
+  }
+  return result;
+}
+
 //===----------------------------------------------------------------------===//
 // TypeSwitch-based Operation Code Generation
 //===----------------------------------------------------------------------===//
@@ -281,9 +324,21 @@ std::string KernelGenerator::emitDefaultFormat(Operation *op,
     }
   }
 
+  bool isVALU = mnemonic.starts_with("v_");
+
   for (Value result : op->getResults()) {
     operands.push_back(resolveValue(result));
   }
+
+  if (isVALU) {
+    llvm::SmallVector<Value> srcVals(op->getOperands().begin(),
+                                     op->getOperands().end());
+    auto resolved = resolveVALUSourceOperands(srcVals);
+    for (auto &s : resolved.operandStrs)
+      operands.push_back(s);
+    return resolved.prefix + formatter.format(mnemonic, operands);
+  }
+
   for (Value operand : op->getOperands()) {
     if (isScalarOp) {
       operands.push_back(resolveScalarValue(operand));
@@ -779,15 +834,14 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
             llvm::StringRef mnemonic = opName;
             if (opName.starts_with("waveasm."))
               mnemonic = opName.drop_front(8);
-            std::string prefix;
+            llvm::SmallVector<Value> srcVals(cmpOp->getOperands().begin(),
+                                             cmpOp->getOperands().end());
+            auto resolved = resolveVALUSourceOperands(srcVals);
             llvm::SmallVector<std::string> operands;
             operands.push_back("vcc");
-            for (Value operand : cmpOp->getOperands()) {
-              auto mat = materializeLiteralOperand(operand, kScratchVGPR);
-              prefix += mat.prefix;
-              operands.push_back(mat.operandStr);
-            }
-            return prefix + formatter.format(mnemonic, operands);
+            for (auto &s : resolved.operandStrs)
+              operands.push_back(s);
+            return resolved.prefix + formatter.format(mnemonic, operands);
           })
 
       // V_ADD_U32: VOP2 commutative — literal must be in src0.
@@ -814,6 +868,8 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
       })
 
       // V_CNDMASK_B32: VOP2 form uses implicit VCC — drop the 3rd source.
+      // VOP2 encoding requires src1 to be a VGPR; if it resolves to an
+      // SGPR or inline constant, materialize it into a scratch VGPR.
       .Case<V_CNDMASK_B32>(
           [&](V_CNDMASK_B32 cndOp) -> std::optional<std::string> {
             std::string dst = resolveValue(cndOp.getDst());
@@ -821,10 +877,21 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
                 materializeLiteralOperand(cndOp.getSrc0(), kScratchVGPR);
             int nextScratch =
                 mat0.prefix.empty() ? kScratchVGPR : kScratchVGPR + 1;
-            auto mat1 = materializeLiteralOperand(cndOp.getSrc1(), nextScratch);
-            std::string prefix = mat0.prefix + mat1.prefix;
+
+            std::string src1Str = resolveValue(cndOp.getSrc1());
+            std::string prefix = mat0.prefix;
+            // src1 must be VGPR. If it's not (starts with 's' for SGPR,
+            // or is a number for inline constant), materialize to VGPR.
+            bool src1IsVGPR = src1Str.size() > 0 && src1Str[0] == 'v';
+            if (!src1IsVGPR) {
+              std::string scratch = formatVGPRRange(nextScratch, 1);
+              prefix += "  v_mov_b32 " + scratch + ", " + src1Str + "\n";
+              peakVGPRs =
+                  std::max(peakVGPRs, static_cast<int64_t>(nextScratch + 1));
+              src1Str = scratch;
+            }
             llvm::SmallVector<std::string> operands = {dst, mat0.operandStr,
-                                                       mat1.operandStr};
+                                                       src1Str};
             return prefix + formatter.format("v_cndmask_b32", operands);
           })
 
@@ -847,12 +914,14 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
 
         if (mnemonic.starts_with("v_cmp_")) {
           std::string mnem64 = (mnemonic + "_e64").str();
+          llvm::SmallVector<Value> srcVals(defaultOp->getOperands().begin(),
+                                           defaultOp->getOperands().end());
+          auto resolved = resolveVALUSourceOperands(srcVals);
           llvm::SmallVector<std::string> operands;
           operands.push_back("vcc");
-          for (Value operand : defaultOp->getOperands()) {
-            operands.push_back(resolveValue(operand));
-          }
-          return formatter.format(mnem64, operands);
+          for (auto &s : resolved.operandStrs)
+            operands.push_back(s);
+          return resolved.prefix + formatter.format(mnem64, operands);
         }
 
         return emitDefaultFormat(defaultOp, mnemonic);

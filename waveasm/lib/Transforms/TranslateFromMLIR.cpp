@@ -299,6 +299,7 @@ void TranslationContext::emitSRDPrologue() {
       auto vregType = createVRegType();
       auto vreg = V_MOV_B32::create(builder, loc, vregType, preloadSreg);
       mapper.mapValue(pending.funcArg, vreg);
+      scalarArgMap[vreg] = preloadSreg;
     }
   } else {
     // Non-GFX95* path (e.g., gfx942): Load directly into SRD positions

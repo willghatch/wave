@@ -671,6 +671,23 @@ public:
 
   const TranslationOptions &getOptions() const { return options; }
 
+  //===--------------------------------------------------------------------===//
+  // Scalar Argument Mapping (VGPR -> SGPR for affine SALU optimization)
+  //===--------------------------------------------------------------------===//
+
+  /// Register that a VGPR value has a corresponding scalar SGPR version
+  void mapScalarArg(mlir::Value vreg, mlir::Value sreg) {
+    scalarArgMap[vreg] = sreg;
+  }
+
+  /// Get the scalar (SGPR) version of a value, if one exists
+  std::optional<mlir::Value> getScalarVersion(mlir::Value v) const {
+    auto it = scalarArgMap.find(v);
+    if (it != scalarArgMap.end())
+      return it->second;
+    return std::nullopt;
+  }
+
 private:
   mlir::OpBuilder &builder;
   OpHandlerRegistry registry;
@@ -694,6 +711,17 @@ private:
   llvm::DenseMap<mlir::Value, mlir::Value>
       ldsBaseOffsetMap; // memref -> LDS byte offset from memref.view
 
+  llvm::DenseMap<mlir::Value, mlir::Value>
+      scalarArgMap; // VGPR -> SGPR for kernel args
+
+public:
+  struct CachedSubExpr {
+    void *valuePtr;
+    int64_t rangeLow;
+    int64_t rangeHigh;
+  };
+  llvm::StringMap<CachedSubExpr> affineSubExprCache;
+private:
   llvm::DenseMap<mlir::Value, PendingSRDBaseAdjust> pendingSRDBaseAdjustMap;
   llvm::SmallVector<PendingSRD, 4> pendingSRDs;
   llvm::SmallVector<PendingScalarArg, 4> pendingScalarArgs;

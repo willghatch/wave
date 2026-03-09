@@ -182,6 +182,16 @@ private:
   /// Emit default instruction format (results then operands)
   std::string emitDefaultFormat(mlir::Operation *op, llvm::StringRef mnemonic);
 
+  struct ResolvedOperands {
+    std::string prefix;
+    llvm::SmallVector<std::string> operandStrs;
+  };
+
+  /// Resolve VALU source operands, materializing SGPRs/literals into
+  /// scratch VGPRs as needed to satisfy constant bus restrictions.
+  ResolvedOperands resolveVALUSourceOperands(
+      llvm::ArrayRef<mlir::Value> operands);
+
   /// Emit scaled MFMA instruction with cbsz/blgp format modifiers
   std::optional<std::string> emitScaledMFMA(mlir::Operation *op,
                                             llvm::StringRef mnemonic);

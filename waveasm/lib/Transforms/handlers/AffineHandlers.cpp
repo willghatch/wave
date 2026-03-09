@@ -33,6 +33,259 @@ using namespace mlir;
 
 namespace waveasm {
 
+static bool isScalarValue(Value v) {
+  Type ty = v.getType();
+  return isa<SRegType>(ty) || isa<PSRegType>(ty) || isa<ImmType>(ty);
+}
+
+// Return the scalar (SGPR) version of a value if one exists.
+// Only considers SGPR/PSReg types and scalarArgMap (VGPR->SGPR bindings).
+// Does NOT convert ImmType to SGPR -- that would cause unwanted SALU paths
+// for compile-time constants in the static case.
+static std::optional<Value> tryGetScalar(Value v, TranslationContext &ctx) {
+  if (isa<SRegType>(v.getType()) || isa<PSRegType>(v.getType()))
+    return v;
+  if (auto s = ctx.getScalarVersion(v))
+    return *s;
+  return std::nullopt;
+}
+
+// SALU Granlund-Montgomery unsigned division by constant.
+static Value emitScalarConstantUnsignedDiv(OpBuilder &builder, Location loc,
+                                           TranslationContext &ctx,
+                                           Value numerator, int64_t divisor) {
+  assert(divisor > 0 && "divisor must be positive");
+  if (divisor == 1)
+    return numerator;
+
+  auto sregType = ctx.createSRegType();
+  int S = 0;
+  while ((1ULL << S) < static_cast<uint64_t>(divisor))
+    S++;
+  uint64_t M = (static_cast<__uint128_t>(1) << (32 + S)) / divisor + 1;
+
+  if (M <= 0xFFFFFFFFULL) {
+    auto mImm = ctx.createImmType(static_cast<int64_t>(M));
+    Value mConst = ConstantOp::create(builder, loc, mImm, static_cast<int64_t>(M));
+    Value mS = S_MOV_B32::create(builder, loc, sregType, mConst);
+    Value hi = S_MUL_HI_U32::create(builder, loc, sregType, numerator, mS);
+    auto sImm = ctx.createImmType(S);
+    Value sConst = ConstantOp::create(builder, loc, sImm, S);
+    return S_LSHR_B32::create(builder, loc, sregType, hi, sConst);
+  }
+
+  uint64_t Mlow = M - (1ULL << 32);
+  auto mlowImm = ctx.createImmType(static_cast<int64_t>(Mlow));
+  Value mlowConst = ConstantOp::create(builder, loc, mlowImm, static_cast<int64_t>(Mlow));
+  Value mlowS = S_MOV_B32::create(builder, loc, sregType, mlowConst);
+  Value t = S_MUL_HI_U32::create(builder, loc, sregType, numerator, mlowS);
+  Value diff = S_SUB_U32::create(builder, loc, sregType, sregType, numerator, t).getDst();
+  auto oneImm = ctx.createImmType(1);
+  Value oneConst = ConstantOp::create(builder, loc, oneImm, 1);
+  Value halfDiff = S_LSHR_B32::create(builder, loc, sregType, diff, oneConst);
+  Value sum = S_ADD_U32::create(builder, loc, sregType, sregType, t, halfDiff).getDst();
+  int64_t finalShift = S - 1;
+  auto fsImm = ctx.createImmType(finalShift);
+  Value fsConst = ConstantOp::create(builder, loc, fsImm, finalShift);
+  return S_LSHR_B32::create(builder, loc, sregType, sum, fsConst);
+}
+
+static Value emitScalarConstantUnsignedMod(OpBuilder &builder, Location loc,
+                                           TranslationContext &ctx,
+                                           Value numerator, int64_t divisor) {
+  auto sregType = ctx.createSRegType();
+  Value quotient = emitScalarConstantUnsignedDiv(builder, loc, ctx, numerator, divisor);
+  auto dImm = ctx.createImmType(divisor);
+  Value dConst = ConstantOp::create(builder, loc, dImm, divisor);
+  Value dS = S_MOV_B32::create(builder, loc, sregType, dConst);
+  Value product = S_MUL_I32::create(builder, loc, sregType, quotient, dS);
+  return S_SUB_U32::create(builder, loc, sregType, sregType, numerator, product).getDst();
+}
+
+static Value emitScalarConstantCeilDiv(OpBuilder &builder, Location loc,
+                                       TranslationContext &ctx,
+                                       Value numerator, int64_t divisor) {
+  auto sregType = ctx.createSRegType();
+  int64_t bias = divisor - 1;
+  auto biasImm = ctx.createImmType(bias);
+  Value biasConst = ConstantOp::create(builder, loc, biasImm, bias);
+  Value biased = S_ADD_U32::create(builder, loc, sregType, sregType, biasConst, numerator).getDst();
+  return emitScalarConstantUnsignedDiv(builder, loc, ctx, biased, divisor);
+}
+
+// Granlund-Montgomery unsigned division by constant (VALU).
+static Value emitConstantUnsignedDiv(OpBuilder &builder, Location loc,
+                                     Type vregType, TranslationContext &ctx,
+                                     Value numerator, int64_t divisor) {
+  assert(divisor > 0 && "divisor must be positive");
+  if (divisor == 1)
+    return numerator;
+
+  int S = 0;
+  while ((1ULL << S) < static_cast<uint64_t>(divisor))
+    S++;
+  uint64_t M = (static_cast<__uint128_t>(1) << (32 + S)) / divisor + 1;
+
+  if (M <= 0xFFFFFFFFULL) {
+    auto mImm = ctx.createImmType(static_cast<int64_t>(M));
+    Value mConst = ConstantOp::create(builder, loc, mImm, static_cast<int64_t>(M));
+    Value hi = V_MUL_HI_U32::create(builder, loc, vregType, numerator, mConst);
+    auto sImm = ctx.createImmType(S);
+    Value sConst = ConstantOp::create(builder, loc, sImm, S);
+    return V_LSHRREV_B32::create(builder, loc, vregType, sConst, hi);
+  }
+
+  uint64_t Mlow = M - (1ULL << 32);
+  auto mlowImm = ctx.createImmType(static_cast<int64_t>(Mlow));
+  Value mlowConst = ConstantOp::create(builder, loc, mlowImm, static_cast<int64_t>(Mlow));
+  Value t = V_MUL_HI_U32::create(builder, loc, vregType, numerator, mlowConst);
+  Value diff = V_SUB_U32::create(builder, loc, vregType, numerator, t);
+  auto oneImm = ctx.createImmType(1);
+  Value oneConst = ConstantOp::create(builder, loc, oneImm, 1);
+  Value halfDiff = V_LSHRREV_B32::create(builder, loc, vregType, oneConst, diff);
+  Value sum = V_ADD_U32::create(builder, loc, vregType, t, halfDiff);
+  int64_t finalShift = S - 1;
+  auto fsImm = ctx.createImmType(finalShift);
+  Value fsConst = ConstantOp::create(builder, loc, fsImm, finalShift);
+  return V_LSHRREV_B32::create(builder, loc, vregType, fsConst, sum);
+}
+
+static Value emitConstantUnsignedMod(OpBuilder &builder, Location loc,
+                                     Type vregType, TranslationContext &ctx,
+                                     Value numerator, int64_t divisor) {
+  Value quotient = emitConstantUnsignedDiv(builder, loc, vregType, ctx, numerator, divisor);
+  auto dImm = ctx.createImmType(divisor);
+  Value dConst = ConstantOp::create(builder, loc, dImm, divisor);
+  Value product = V_MUL_LO_U32::create(builder, loc, vregType, quotient, dConst);
+  return V_SUB_U32::create(builder, loc, vregType, numerator, product);
+}
+
+static Value emitConstantCeilDiv(OpBuilder &builder, Location loc,
+                                 Type vregType, TranslationContext &ctx,
+                                 Value numerator, int64_t divisor) {
+  int64_t bias = divisor - 1;
+  auto biasImm = ctx.createImmType(bias);
+  Value biasConst = ConstantOp::create(builder, loc, biasImm, bias);
+  Value biased = V_ADD_U32::create(builder, loc, vregType, biasConst, numerator);
+  return emitConstantUnsignedDiv(builder, loc, vregType, ctx, biased, divisor);
+}
+
+// Runtime unsigned division via float reciprocal with two-step fixup (VALU).
+static Value emitRuntimeUnsignedDiv(OpBuilder &builder, Location loc,
+                                    Type vregType, TranslationContext &ctx,
+                                    Value numerator, Value divisor) {
+  Value fNum = V_CVT_F32_U32::create(builder, loc, vregType, numerator);
+  Value fDiv = V_CVT_F32_U32::create(builder, loc, vregType, divisor);
+  Value rcp = V_RCP_F32::create(builder, loc, vregType, fDiv);
+  Value fQuot = V_MUL_F32::create(builder, loc, vregType, fNum, rcp);
+  Value quot = V_CVT_U32_F32::create(builder, loc, vregType, fQuot);
+
+  auto sregType2 = ctx.createSRegType(2, 2);
+  auto oneImm = ctx.createImmType(1);
+  Value oneConst = ConstantOp::create(builder, loc, oneImm, 1);
+  auto zeroImm = ctx.createImmType(0);
+  Value zeroConst = ConstantOp::create(builder, loc, zeroImm, 0);
+
+  Value prod = V_MUL_LO_U32::create(builder, loc, vregType, quot, divisor);
+  V_CMP_GT_U32::create(builder, loc, prod, numerator);
+  Value vcc1 = PrecoloredSRegOp::create(builder, loc, sregType2, 106, 2);
+  Value correction = V_CNDMASK_B32::create(builder, loc, vregType, zeroConst, oneConst, vcc1);
+  Value fixedQuot = V_SUB_U32::create(builder, loc, vregType, quot, correction);
+
+  Value prod2 = V_MUL_LO_U32::create(builder, loc, vregType, fixedQuot, divisor);
+  Value rem = V_SUB_U32::create(builder, loc, vregType, numerator, prod2);
+  V_CMP_GE_U32::create(builder, loc, rem, divisor);
+  Value vcc2 = PrecoloredSRegOp::create(builder, loc, sregType2, 106, 2);
+  Value correction2 = V_CNDMASK_B32::create(builder, loc, vregType, zeroConst, oneConst, vcc2);
+  return V_ADD_U32::create(builder, loc, vregType, fixedQuot, correction2);
+}
+
+static Value emitRuntimeUnsignedMod(OpBuilder &builder, Location loc,
+                                    Type vregType, TranslationContext &ctx,
+                                    Value numerator, Value divisor) {
+  Value quotient = emitRuntimeUnsignedDiv(builder, loc, vregType, ctx, numerator, divisor);
+  Value product = V_MUL_LO_U32::create(builder, loc, vregType, quotient, divisor);
+  return V_SUB_U32::create(builder, loc, vregType, numerator, product);
+}
+
+// Check if all leaf operands (dims/symbols) of an affine expression are scalar.
+// If true, the entire expression can be computed on SALU.
+static bool isExprFullyScalar(AffineExpr e, affine::AffineApplyOp applyOp,
+                              AffineMap map, TranslationContext &ctx) {
+  if (isa<AffineConstantExpr>(e))
+    return true;
+  if (auto dimExpr = dyn_cast<AffineDimExpr>(e)) {
+    if (dimExpr.getPosition() < applyOp.getOperands().size()) {
+      Value operand = applyOp.getOperands()[dimExpr.getPosition()];
+      if (auto mapped = ctx.getMapper().getMapped(operand)) {
+        if (tryGetScalar(*mapped, ctx))
+          return true;
+      }
+    }
+    return false;
+  }
+  if (auto symExpr = dyn_cast<AffineSymbolExpr>(e)) {
+    int64_t symIdx = map.getNumDims() + symExpr.getPosition();
+    if (symIdx < static_cast<int64_t>(applyOp.getOperands().size())) {
+      Value operand = applyOp.getOperands()[symIdx];
+      if (auto mapped = ctx.getMapper().getMapped(operand)) {
+        if (tryGetScalar(*mapped, ctx))
+          return true;
+      }
+    }
+    return false;
+  }
+  if (auto binExpr = dyn_cast<AffineBinaryOpExpr>(e)) {
+    // FloorDiv, CeilDiv, Mod with non-constant RHS require runtime division.
+    // We have no SALU runtime division, so reject these.
+    if (binExpr.getKind() == AffineExprKind::FloorDiv ||
+        binExpr.getKind() == AffineExprKind::CeilDiv ||
+        binExpr.getKind() == AffineExprKind::Mod) {
+      if (!isa<AffineConstantExpr>(binExpr.getRHS()))
+        return false;
+    }
+    return isExprFullyScalar(binExpr.getLHS(), applyOp, map, ctx) &&
+           isExprFullyScalar(binExpr.getRHS(), applyOp, map, ctx);
+  }
+  return false;
+}
+
+// Check if all leaf operands are scalar (uniform across lanes).
+// Unlike isExprFullyScalar, this does NOT reject runtime divisors.
+// Used to decide whether the result of a VALU computation can be converted
+// back to SGPR via V_READFIRSTLANE_B32.
+static bool isExprUniform(AffineExpr e, affine::AffineApplyOp applyOp,
+                          AffineMap map, TranslationContext &ctx) {
+  if (isa<AffineConstantExpr>(e))
+    return true;
+  if (auto dimExpr = dyn_cast<AffineDimExpr>(e)) {
+    if (dimExpr.getPosition() < applyOp.getOperands().size()) {
+      Value operand = applyOp.getOperands()[dimExpr.getPosition()];
+      if (auto mapped = ctx.getMapper().getMapped(operand)) {
+        if (tryGetScalar(*mapped, ctx))
+          return true;
+      }
+    }
+    return false;
+  }
+  if (auto symExpr = dyn_cast<AffineSymbolExpr>(e)) {
+    int64_t symIdx = map.getNumDims() + symExpr.getPosition();
+    if (symIdx < static_cast<int64_t>(applyOp.getOperands().size())) {
+      Value operand = applyOp.getOperands()[symIdx];
+      if (auto mapped = ctx.getMapper().getMapped(operand)) {
+        if (tryGetScalar(*mapped, ctx))
+          return true;
+      }
+    }
+    return false;
+  }
+  if (auto binExpr = dyn_cast<AffineBinaryOpExpr>(e)) {
+    return isExprUniform(binExpr.getLHS(), applyOp, map, ctx) &&
+           isExprUniform(binExpr.getRHS(), applyOp, map, ctx);
+  }
+  return false;
+}
+
 /// Handle affine.apply - compile affine expression to arithmetic instructions
 LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
   auto applyOp = cast<affine::AffineApplyOp>(op);
@@ -126,10 +379,114 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
   int64_t constAddend = 0;
   AffineExpr exprToCompile = expr;
 
-  // Simple pattern matching for common affine expressions
-  // Pattern: d0 mod N -> v_and_b32 (when N is power of 2)
-  // Pattern: d0 floordiv N -> v_lshrrev_b32 (when N is power of 2)
-  // Pattern: d0 * N -> v_lshlrev_b32 (when N is power of 2)
+  // If the entire expression is scalar (all operands are SGPR/precolored),
+  // compile it entirely on SALU to avoid VGPR pressure.
+  if (isExprFullyScalar(exprToCompile, applyOp, map, ctx)) {
+    std::function<Value(AffineExpr)> compileScalar =
+        [&](AffineExpr e) -> Value {
+      auto sregType = ctx.createSRegType();
+
+      if (auto dimExpr = dyn_cast<AffineDimExpr>(e)) {
+        Value operand = applyOp.getOperands()[dimExpr.getPosition()];
+        auto mapped = ctx.getMapper().getMapped(operand);
+        return *tryGetScalar(*mapped, ctx);
+      }
+      if (auto symExpr = dyn_cast<AffineSymbolExpr>(e)) {
+        int64_t symIdx = map.getNumDims() + symExpr.getPosition();
+        Value operand = applyOp.getOperands()[symIdx];
+        auto mapped = ctx.getMapper().getMapped(operand);
+        return *tryGetScalar(*mapped, ctx);
+      }
+      if (auto constExpr = dyn_cast<AffineConstantExpr>(e)) {
+        int64_t val = constExpr.getValue();
+        auto immType = ctx.createImmType(val);
+        Value c = ConstantOp::create(builder, loc, immType, val);
+        return static_cast<Value>(S_MOV_B32::create(builder, loc, sregType, c));
+      }
+      if (auto binExpr = dyn_cast<AffineBinaryOpExpr>(e)) {
+        Value lhs = compileScalar(binExpr.getLHS());
+        Value rhs = compileScalar(binExpr.getRHS());
+
+        switch (binExpr.getKind()) {
+        case AffineExprKind::Add:
+          return S_ADD_U32::create(builder, loc, sregType, sregType, lhs, rhs).getDst();
+        case AffineExprKind::Mul: {
+          if (auto c = dyn_cast<AffineConstantExpr>(binExpr.getRHS())) {
+            int64_t val = c.getValue();
+            if (val > 0 && isPowerOf2(val)) {
+              auto imm = ctx.createImmType(log2(val));
+              Value shift = ConstantOp::create(builder, loc, imm, log2(val));
+              return S_LSHL_B32::create(builder, loc, sregType, lhs, shift);
+            }
+          }
+          if (auto c = dyn_cast<AffineConstantExpr>(binExpr.getLHS())) {
+            int64_t val = c.getValue();
+            if (val > 0 && isPowerOf2(val)) {
+              auto imm = ctx.createImmType(log2(val));
+              Value shift = ConstantOp::create(builder, loc, imm, log2(val));
+              return S_LSHL_B32::create(builder, loc, sregType, rhs, shift);
+            }
+          }
+          return S_MUL_I32::create(builder, loc, sregType, lhs, rhs);
+        }
+        case AffineExprKind::FloorDiv: {
+          if (auto c = dyn_cast<AffineConstantExpr>(binExpr.getRHS())) {
+            int64_t d = c.getValue();
+            if (d > 0 && isPowerOf2(d)) {
+              auto imm = ctx.createImmType(log2(d));
+              Value shift = ConstantOp::create(builder, loc, imm, log2(d));
+              return S_LSHR_B32::create(builder, loc, sregType, lhs, shift);
+            }
+            return emitScalarConstantUnsignedDiv(builder, loc, ctx, lhs, d);
+          }
+          // Runtime divisor: fall through to VALU below
+          break;
+        }
+        case AffineExprKind::CeilDiv: {
+          if (auto c = dyn_cast<AffineConstantExpr>(binExpr.getRHS())) {
+            int64_t d = c.getValue();
+            if (d > 0 && isPowerOf2(d)) {
+              int64_t bias = d - 1;
+              auto biasImm = ctx.createImmType(bias);
+              Value biasC = ConstantOp::create(builder, loc, biasImm, bias);
+              Value biased = S_ADD_U32::create(builder, loc, sregType, sregType, biasC, lhs).getDst();
+              auto imm = ctx.createImmType(log2(d));
+              Value shift = ConstantOp::create(builder, loc, imm, log2(d));
+              return S_LSHR_B32::create(builder, loc, sregType, biased, shift);
+            }
+            return emitScalarConstantCeilDiv(builder, loc, ctx, lhs, d);
+          }
+          break;
+        }
+        case AffineExprKind::Mod: {
+          if (auto c = dyn_cast<AffineConstantExpr>(binExpr.getRHS())) {
+            int64_t d = c.getValue();
+            if (d > 0 && isPowerOf2(d)) {
+              auto maskImm = ctx.createImmType(d - 1);
+              Value mask = ConstantOp::create(builder, loc, maskImm, d - 1);
+              return S_AND_B32::create(builder, loc, sregType, lhs, mask);
+            }
+            return emitScalarConstantUnsignedMod(builder, loc, ctx, lhs, d);
+          }
+          break;
+        }
+        default:
+          break;
+        }
+      }
+      // Should not reach here for a fully-scalar expression with constant RHS.
+      // Fallthrough: will fall to VALU path.
+      return Value();
+    };
+
+    Value result = compileScalar(exprToCompile);
+    if (result) {
+      ctx.getMapper().mapValue(applyOp.getResult(), result);
+      return success();
+    }
+    // Fall through to VALU if scalar compilation failed
+    // (e.g., runtime divisor in a fully-scalar expression)
+  }
 
   // Result type that includes bit range tracking for OR optimization
   struct ExprResult {
@@ -138,8 +495,98 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
     ExprResult(Value v, BitRange r) : value(v), range(r) {}
   };
 
-  // Helper to emit the compiled expression with bit range tracking
+  // Build a string cache key for a sub-expression, incorporating
+  // the resolved leaf operand Values so that identical AffineExpr objects
+  // with different operand mappings produce different keys.
+  std::function<void(AffineExpr, llvm::raw_string_ostream &)> buildCacheKey =
+      [&](AffineExpr e, llvm::raw_string_ostream &os) {
+    if (auto dimExpr = dyn_cast<AffineDimExpr>(e)) {
+      Value operand = applyOp.getOperands()[dimExpr.getPosition()];
+      if (auto mapped = ctx.getMapper().getMapped(operand))
+        os << "d" << mapped->getAsOpaquePointer();
+      else
+        os << "d?";
+      return;
+    }
+    if (auto symExpr = dyn_cast<AffineSymbolExpr>(e)) {
+      int64_t symIdx = map.getNumDims() + symExpr.getPosition();
+      Value operand = applyOp.getOperands()[symIdx];
+      if (auto mapped = ctx.getMapper().getMapped(operand))
+        os << "s" << mapped->getAsOpaquePointer();
+      else
+        os << "s?";
+      return;
+    }
+    if (auto constExpr = dyn_cast<AffineConstantExpr>(e)) {
+      os << "c" << constExpr.getValue();
+      return;
+    }
+    if (auto binExpr = dyn_cast<AffineBinaryOpExpr>(e)) {
+      os << "(";
+      buildCacheKey(binExpr.getLHS(), os);
+      os << static_cast<int>(binExpr.getKind());
+      buildCacheKey(binExpr.getRHS(), os);
+      os << ")";
+      return;
+    }
+  };
+
+  auto &subExprCache = ctx.affineSubExprCache;
+
+  // Inner compilation function (does the real work)
+  std::function<ExprResult(AffineExpr)> compileExprInner;
+
+  // Check if an expression contains a runtime (non-constant) divisor.
+  // Only these expensive sub-trees benefit from caching.
+  std::function<bool(AffineExpr)> hasRuntimeDiv =
+      [&](AffineExpr e) -> bool {
+    if (auto binExpr = dyn_cast<AffineBinaryOpExpr>(e)) {
+      if (binExpr.getKind() == AffineExprKind::FloorDiv ||
+          binExpr.getKind() == AffineExprKind::CeilDiv ||
+          binExpr.getKind() == AffineExprKind::Mod) {
+        if (!isa<AffineConstantExpr>(binExpr.getRHS()))
+          return true;
+      }
+      return hasRuntimeDiv(binExpr.getLHS()) || hasRuntimeDiv(binExpr.getRHS());
+    }
+    return false;
+  };
+
+  // Memoizing wrapper: check cache, compile if needed, store result
   std::function<ExprResult(AffineExpr)> compileExpr =
+      [&](AffineExpr e) -> ExprResult {
+    // Only cache binary sub-expressions that contain runtime division.
+    // Cheap expressions (shifts, masks, adds) are cheaper to recompute
+    // than to keep their results alive across long ranges.
+    if (!isa<AffineBinaryOpExpr>(e) || !hasRuntimeDiv(e))
+      return compileExprInner(e);
+
+    std::string cacheKey;
+    llvm::raw_string_ostream keyOs(cacheKey);
+    buildCacheKey(e, keyOs);
+
+    auto cacheIt = subExprCache.find(cacheKey);
+    if (cacheIt != subExprCache.end()) {
+      auto &entry = cacheIt->second;
+      Value cached = Value::getFromOpaquePointer(entry.valuePtr);
+      if (cached && cached.getDefiningOp()) {
+        return ExprResult(cached, BitRange(entry.rangeLow, entry.rangeHigh));
+      }
+      subExprCache.erase(cacheIt);
+    }
+
+    ExprResult result = compileExprInner(e);
+    if (result.value) {
+      TranslationContext::CachedSubExpr entry;
+      entry.valuePtr = result.value.getAsOpaquePointer();
+      entry.rangeLow = result.range.lowBit;
+      entry.rangeHigh = result.range.highBit;
+      subExprCache[cacheKey] = entry;
+    }
+    return result;
+  };
+
+  compileExprInner =
       [&](AffineExpr e) -> ExprResult {
     // Dimension reference
     if (auto dimExpr = dyn_cast<AffineDimExpr>(e)) {
@@ -184,30 +631,116 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
       BitRange lhsRange = lhsResult.range;
       BitRange rhsRange = rhsResult.range;
 
+      // --- Partial SALU evaluation ---
+      // When both operands resolve to scalar types (SGPR/Imm), use SALU
+      // instructions to keep the result as SGPR, avoiding VGPR consumption.
+      bool lhsIsScalar = isSGPRType(lhs.getType()) ||
+                         isa<ImmType>(lhs.getType());
+      bool rhsIsScalar = isSGPRType(rhs.getType()) ||
+                         isa<ImmType>(rhs.getType());
+
+      if (lhsIsScalar && rhsIsScalar) {
+        auto sregType = ctx.createSRegType();
+        auto resolveScalar = [&](Value v) -> Value {
+          if (isSGPRType(v.getType()))
+            return v;
+          if (isa<ImmType>(v.getType()))
+            return S_MOV_B32::create(builder, loc, sregType, v);
+          return v;
+        };
+
+        switch (binExpr.getKind()) {
+        case AffineExprKind::Add: {
+          Value sL = resolveScalar(lhs);
+          Value sR = resolveScalar(rhs);
+          Value res = S_ADD_U32::create(builder, loc, sregType, sregType,
+                                        sL, sR).getDst();
+          return ExprResult(res, lhsRange.extendForAdd(rhsRange));
+        }
+        case AffineExprKind::FloorDiv: {
+          if (auto c = dyn_cast<AffineConstantExpr>(binExpr.getRHS())) {
+            int64_t d = c.getValue();
+            if (d > 0 && isPowerOf2(d)) {
+              Value sL = resolveScalar(lhs);
+              auto imm = ctx.createImmType(log2(d));
+              Value shift = ConstantOp::create(builder, loc, imm, log2(d));
+              Value res = S_LSHR_B32::create(builder, loc, sregType,
+                                             sL, shift);
+              BitRange rr = lhsRange.shiftRight(log2(d));
+              ctx.setBitRange(res, rr);
+              return ExprResult(res, rr);
+            }
+            Value sL = resolveScalar(lhs);
+            return ExprResult(
+                emitScalarConstantUnsignedDiv(builder, loc, ctx, sL, d),
+                BitRange());
+          }
+          break;
+        }
+        case AffineExprKind::CeilDiv: {
+          if (auto c = dyn_cast<AffineConstantExpr>(binExpr.getRHS())) {
+            int64_t d = c.getValue();
+            if (d > 0 && isPowerOf2(d)) {
+              Value sL = resolveScalar(lhs);
+              int64_t bias = d - 1;
+              auto biasImm = ctx.createImmType(bias);
+              Value biasC = ConstantOp::create(builder, loc, biasImm, bias);
+              Value biased = S_ADD_U32::create(builder, loc, sregType,
+                                               sregType, sL, biasC).getDst();
+              auto imm = ctx.createImmType(log2(d));
+              Value shift = ConstantOp::create(builder, loc, imm, log2(d));
+              return ExprResult(
+                  S_LSHR_B32::create(builder, loc, sregType, biased, shift),
+                  BitRange());
+            }
+            Value sL = resolveScalar(lhs);
+            return ExprResult(
+                emitScalarConstantCeilDiv(builder, loc, ctx, sL, d),
+                BitRange());
+          }
+          break;
+        }
+        case AffineExprKind::Mod: {
+          if (auto c = dyn_cast<AffineConstantExpr>(binExpr.getRHS())) {
+            int64_t d = c.getValue();
+            if (d > 0 && isPowerOf2(d)) {
+              Value sL = resolveScalar(lhs);
+              auto maskImm = ctx.createImmType(d - 1);
+              Value mask = ConstantOp::create(builder, loc, maskImm, d - 1);
+              Value res = S_AND_B32::create(builder, loc, sregType, sL, mask);
+              BitRange rr = BitRange(0, log2(d) - 1);
+              ctx.setBitRange(res, rr);
+              return ExprResult(res, rr);
+            }
+            Value sL = resolveScalar(lhs);
+            return ExprResult(
+                emitScalarConstantUnsignedMod(builder, loc, ctx, sL, d),
+                BitRange());
+          }
+          break;
+        }
+        default:
+          break;
+        }
+      }
+
       switch (binExpr.getKind()) {
       case AffineExprKind::Add: {
         if (!lhsRange.overlaps(rhsRange)) {
-          // Check if either operand is a shift (Mul by power of 2)
-          // If so, emit v_lshl_or_b32 directly instead of lshlrev + or
           auto tryFuseShiftOr =
               [&](AffineExpr shiftExpr, Value orend,
                   BitRange orendRange) -> std::optional<ExprResult> {
             if (auto mulExpr = dyn_cast<AffineBinaryOpExpr>(shiftExpr)) {
               if (mulExpr.getKind() == AffineExprKind::Mul) {
-                // Check for power of 2 multiplier
                 if (auto constRhs =
                         dyn_cast<AffineConstantExpr>(mulExpr.getRHS())) {
                   int64_t val = constRhs.getValue();
                   if (val > 0 && (val & (val - 1)) == 0) {
-                    // It's a shift! Emit v_lshl_or_b32 directly
                     int64_t shiftAmount = log2(val);
-                    // Get the base value being shifted (compile without the
-                    // multiply)
                     ExprResult baseResult = compileExpr(mulExpr.getLHS());
                     auto shiftImm = ctx.createImmType(shiftAmount);
                     auto shiftConst =
                         ConstantOp::create(builder, loc, shiftImm, shiftAmount);
-                    // v_lshl_or_b32: dst = (src << shift) | orend
                     Value fusedResult = V_LSHL_OR_B32::create(
                         builder, loc, vregType, baseResult.value, shiftConst,
                         orend);
@@ -218,7 +751,6 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
                     return ExprResult(fusedResult, resultRange);
                   }
                 }
-                // Also check LHS for constant
                 if (auto constLhs =
                         dyn_cast<AffineConstantExpr>(mulExpr.getLHS())) {
                   int64_t val = constLhs.getValue();
@@ -243,16 +775,13 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
             return std::nullopt;
           };
 
-          // Try to fuse: check if LHS is a shift
           if (auto result = tryFuseShiftOr(binExpr.getLHS(), rhs, rhsRange)) {
             return *result;
           }
-          // Try to fuse: check if RHS is a shift
           if (auto result = tryFuseShiftOr(binExpr.getRHS(), lhs, lhsRange)) {
             return *result;
           }
 
-          // No fusion possible, emit regular v_or_b32
           Value orResult = V_OR_B32::create(builder, loc, vregType, lhs, rhs);
           BitRange resultRange = lhsRange.merge(rhsRange);
           ctx.setBitRange(orResult, resultRange);
@@ -319,7 +848,6 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
             return ExprResult(ConstantOp::create(builder, loc, immZero, 0),
                               BitRange(0, 0));
           }
-          // Check if RHS is constant power of 2 -> use shift
           int64_t val = constRhs.getValue();
           if (isPowerOf2(val)) {
             int64_t shiftAmount = log2(val);
@@ -328,13 +856,11 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
                 ConstantOp::create(builder, loc, shiftAmt, shiftAmount);
             Value shiftResult =
                 V_LSHLREV_B32::create(builder, loc, vregType, shiftConst, lhs);
-            // Shift the bit range left by shiftAmount
             BitRange resultRange = lhsRange.shiftLeft(shiftAmount);
             ctx.setBitRange(shiftResult, resultRange);
             return ExprResult(shiftResult, resultRange);
           }
         }
-        // Also check LHS for power of 2 multiply
         if (auto constLhs = dyn_cast<AffineConstantExpr>(binExpr.getLHS())) {
           int64_t val = constLhs.getValue();
           if (isPowerOf2(val)) {
@@ -351,7 +877,7 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
         }
         Value mulResult =
             V_MUL_LO_U32::create(builder, loc, vregType, lhs, rhs);
-        return ExprResult(mulResult, BitRange()); // Conservative: full range
+        return ExprResult(mulResult, BitRange());
       }
 
       case AffineExprKind::FloorDiv: {
@@ -379,14 +905,26 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
                 ConstantOp::create(builder, loc, shiftAmt, shiftAmount);
             Value shiftResult =
                 V_LSHRREV_B32::create(builder, loc, vregType, shiftConst, lhs);
-            // Shift the bit range right by shiftAmount
             BitRange resultRange = lhsRange.shiftRight(shiftAmount);
             ctx.setBitRange(shiftResult, resultRange);
             return ExprResult(shiftResult, resultRange);
           }
+
+          // Non-power-of-2 constant: Granlund-Montgomery
+          if (auto sLhs = tryGetScalar(lhs, ctx)) {
+            Value divResult = emitScalarConstantUnsignedDiv(builder, loc, ctx,
+                                                            *sLhs, divisor);
+            return ExprResult(divResult, BitRange());
+          }
+          Value divResult = emitConstantUnsignedDiv(builder, loc, vregType,
+                                                    ctx, lhs, divisor);
+          return ExprResult(divResult, BitRange());
         }
-        // General floordiv - needs more complex handling
-        return ExprResult(lhs, BitRange()); // Conservative
+
+        // Runtime divisor: float reciprocal approximation
+        Value divResult = emitRuntimeUnsignedDiv(builder, loc, vregType,
+                                                 ctx, lhs, rhs);
+        return ExprResult(divResult, BitRange());
       }
 
       case AffineExprKind::CeilDiv: {
@@ -417,8 +955,27 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
             ctx.setBitRange(shiftResult, resultRange);
             return ExprResult(shiftResult, resultRange);
           }
+
+          if (auto sLhs = tryGetScalar(lhs, ctx)) {
+            Value ceilResult = emitScalarConstantCeilDiv(builder, loc, ctx,
+                                                         *sLhs, divisor);
+            return ExprResult(ceilResult, BitRange());
+          }
+          Value ceilResult = emitConstantCeilDiv(builder, loc, vregType,
+                                                 ctx, lhs, divisor);
+          return ExprResult(ceilResult, BitRange());
         }
-        return ExprResult(lhs, BitRange());
+
+        // Runtime ceildiv: (lhs + rhs - 1) / rhs
+        {
+          auto oneImm = ctx.createImmType(1);
+          Value oneConst = ConstantOp::create(builder, loc, oneImm, 1);
+          Value rhsM1 = V_SUB_U32::create(builder, loc, vregType, rhs, oneConst);
+          Value biased = V_ADD_U32::create(builder, loc, vregType, lhs, rhsM1);
+          Value ceilResult = emitRuntimeUnsignedDiv(builder, loc, vregType,
+                                                    ctx, biased, rhs);
+          return ExprResult(ceilResult, BitRange());
+        }
       }
 
       case AffineExprKind::Mod: {
@@ -435,9 +992,21 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
             ctx.setBitRange(andResult, resultRange);
             return ExprResult(andResult, resultRange);
           }
+
+          if (auto sLhs = tryGetScalar(lhs, ctx)) {
+            Value modResult = emitScalarConstantUnsignedMod(builder, loc, ctx,
+                                                            *sLhs, val);
+            return ExprResult(modResult, BitRange());
+          }
+          Value modResult = emitConstantUnsignedMod(builder, loc, vregType,
+                                                    ctx, lhs, val);
+          return ExprResult(modResult, BitRange());
         }
-        // General mod - needs more complex handling
-        return ExprResult(lhs, BitRange()); // Conservative
+
+        // Runtime mod
+        Value modResult = emitRuntimeUnsignedMod(builder, loc, vregType,
+                                                 ctx, lhs, rhs);
+        return ExprResult(modResult, BitRange());
       }
 
       default:
@@ -450,8 +1019,15 @@ LogicalResult handleAffineApply(Operation *op, TranslationContext &ctx) {
   };
 
   ExprResult result = compileExpr(exprToCompile);
-  ctx.getMapper().mapValue(applyOp.getResult(), result.value);
-  ctx.setBitRange(result.value, result.range);
+  Value resultValue = result.value;
+
+  // NOTE: Converting uniform VGPR results to SGPR via V_READFIRSTLANE_B32
+  // would reduce VGPR pressure, but the resulting SGPR values may violate
+  // AMDGCN encoding constraints when used as VALU operands (constant bus
+  // restrictions, src1 must be VGPR for VOP2).  Disabled for now.
+
+  ctx.getMapper().mapValue(applyOp.getResult(), resultValue);
+  ctx.setBitRange(resultValue, result.range);
 
   // Track the constant addend for buffer store offset:N optimization
   if (constAddend != 0) {
