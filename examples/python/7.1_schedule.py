@@ -406,11 +406,11 @@ def test_dbuf_4wave_mxfp_preshuffle_b_gemm_cpp(
 ):
     """Preshuffle-B MXFP4 GEMM using C++ WaveASM backend."""
     if splitk:
-        raise NotImplementedError(
-            "split-K with WaveASM backend hits register alignment errors in "
-            "the assembler; use test_dbuf_4wave_mxfp_preshuffle_b_gemm instead"
+        gemm, options = get_tagged_splitk_mxfp4_gemm_preshuffle_b(
+            shape, num_splits=splitk, block_shape=block, wave_shape=(1, 4)
         )
-    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(shape, block, wave_shape=(1, 4))
+    else:
+        gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(shape, block, wave_shape=(1, 4))
     options.backend = "asm"
     options.use_buffer_ops = False
     options.wave_runtime = True
@@ -422,7 +422,8 @@ def test_dbuf_4wave_mxfp_preshuffle_b_gemm_cpp(
     gemm = wave_compile(options, gemm, schedule)
 
     _run_mxfp_gemm_preshuffle(gemm, shape, all=True)
-    print("MXFP GEMM preshuffle-B 4-wave (WaveASM backend) test passed!")
+    sk = f" split-K({splitk})" if splitk else ""
+    print(f"MXFP GEMM preshuffle-B 4-wave{sk} (WaveASM backend) test passed!")
 
 
 def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm(
