@@ -293,6 +293,22 @@ public:
     return std::nullopt;
   }
 
+  /// Record that a source memref already has a cache-swizzle SRD at the
+  /// given SGPR base index.  Used by fat_raw_buffer_cast inside loops to
+  /// copy from the prologue SRD instead of the (potentially clobbered)
+  /// initial kernel-arg SRD.
+  void setSwizzleSRDForSource(mlir::Value source, int64_t srdBase) {
+    sourceSwizzleSRDMap[source] = srdBase;
+  }
+
+  /// Look up an existing cache-swizzle SRD base for a source memref.
+  std::optional<int64_t> getSwizzleSRDForSource(mlir::Value source) const {
+    auto it = sourceSwizzleSRDMap.find(source);
+    if (it != sourceSwizzleSRDMap.end())
+      return it->second;
+    return std::nullopt;
+  }
+
   //===--------------------------------------------------------------------===//
   // SRD Management
   //===--------------------------------------------------------------------===//
@@ -709,6 +725,7 @@ private:
   ValueMapper mapper;
   llvm::DenseMap<mlir::Value, int64_t> bindingMap;
   llvm::DenseMap<mlir::Value, int64_t> cacheSwizzleMap;
+  llvm::DenseMap<mlir::Value, int64_t> sourceSwizzleSRDMap;
   llvm::DenseMap<mlir::Value, SRDInfo> srdMap;
   llvm::DenseMap<mlir::Value, int64_t>
       srdIndexMap; // memref -> SRD SGPR base index

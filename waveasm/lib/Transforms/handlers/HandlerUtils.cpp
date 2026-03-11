@@ -62,14 +62,32 @@ int64_t getElementBytes(Type type) {
 //===----------------------------------------------------------------------===//
 
 int64_t computeBufferSizeFromMemRef(MemRefType memrefType) {
-  // Use (1 << 31) - 2 = 0x7FFFFFFE as num_records. The Wave Python frontend
-  // emits OOB sentinel index values at (valid_bytes + elem_bytes) / elem_bytes
-  // which lands at byte offset 0x7FFFFFFF. With num_records = 0x7FFFFFFE the
-  // sentinel is one byte past the SRD range, so hardware returns 0 for OOB
-  // lanes. Using 0xFFFFFFFF would make the sentinel "in bounds" and cause a
-  // real access to unmapped memory, triggering HSA page faults.
-  (void)memrefType;
-  return 0x7FFFFFFE;
+  static constexpr int64_t kOOBSentinel = 0x7FFFFFFE;
+
+  // For ranked memrefs with fully static shapes, compute the real buffer size
+  // in bytes.  This enables hardware bounds checking for out-of-bounds loads
+  // (e.g. during drain iterations of pipelined loops with
+  // eliminate_epilogue=True).  Reads past NUM_RECORDS return zero on GFX9+.
+  if (memrefType.hasStaticShape() && memrefType.getRank() > 0) {
+    int64_t numElements = 1;
+    for (auto dim : memrefType.getShape()) {
+      if (dim <= 0)
+        return kOOBSentinel;
+      if (dim > kOOBSentinel / std::max(numElements, int64_t(1)))
+        return kOOBSentinel;
+      numElements *= dim;
+    }
+    int64_t elementBits = memrefType.getElementTypeBitWidth();
+    int64_t totalBytes = (numElements * elementBits + 7) / 8;
+    if (totalBytes <= 0 || totalBytes > kOOBSentinel)
+      return kOOBSentinel;
+    return totalBytes;
+  }
+
+  // Rank-0 or dynamic shapes: fall back to the OOB sentinel so that the
+  // Python frontend's OOB-index scheme still works (sentinel index at
+  // 0x7FFFFFFF is one byte past the SRD range).
+  return kOOBSentinel;
 }
 
 //===----------------------------------------------------------------------===//

@@ -621,6 +621,14 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
 
         os << labelName << ":\n";
         for (Operation &bodyOp : body) {
+          if (auto rawOp = dyn_cast<RawOp>(&bodyOp)) {
+            os << generateRaw(rawOp) << "\n";
+            continue;
+          }
+          if (auto commentOp = dyn_cast<CommentOp>(&bodyOp)) {
+            os << generateComment(commentOp) << "\n";
+            continue;
+          }
           if (auto condOp = dyn_cast<ConditionOp>(&bodyOp)) {
             {
               unsigned numArgs = body.getNumArguments();

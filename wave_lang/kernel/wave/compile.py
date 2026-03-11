@@ -1286,6 +1286,11 @@ def _generate_asm_code(mb, options):
         mlir_file.write(kernel_mlir)
         mlir_path = mlir_file.name
 
+    if options.dump_intermediates:
+        import shutil
+        mlir_save = os.path.join(options.dump_intermediates, f"{kernel_name}.waveasm.mlir")
+        shutil.copy2(mlir_path, mlir_save)
+
     try:
         cmd = [
             waveasm_translate,

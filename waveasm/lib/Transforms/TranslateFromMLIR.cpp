@@ -482,11 +482,13 @@ int64_t TranslationContext::getNextSRDIndex() {
 }
 
 void TranslationContext::updateSRDBufferSize(Value memref, int64_t bufferSize) {
-  // Find the pending SRD for this memref and update its buffer size
+  // Find the pending SRD for this memref and update its buffer size.
+  // Prefer the *smaller* (more restrictive) value so that the hardware's
+  // bounds check returns zero for true OOB accesses (e.g. drain iterations
+  // when eliminate_epilogue is enabled).
   for (auto &pending : pendingSRDs) {
     if (pending.memref == memref) {
-      // Only update if the new size is larger (more specific)
-      if (bufferSize > pending.bufferSize) {
+      if (bufferSize > 0 && bufferSize < pending.bufferSize) {
         pending.bufferSize = bufferSize;
       }
       return;
