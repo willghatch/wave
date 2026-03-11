@@ -1296,6 +1296,8 @@ def _generate_asm_code_waveasm(mlir_asm, options):
         mlir_file.write(kernel_mlir)
         mlir_path = mlir_file.name
 
+    needs_workgroup_id_z = "gpu.block_id  z" in kernel_mlir_pretty
+
     try:
         cmd = [
             waveasm_translate,
@@ -1326,6 +1328,15 @@ def _generate_asm_code_waveasm(mlir_asm, options):
         asm_text = result.stdout
     finally:
         os.unlink(mlir_path)
+
+    # Workaround: waveasm-translate does not enable workgroup_id_z in the
+    # kernel descriptor even when the kernel uses gpu.block_id z.  Patch
+    # the assembly metadata so the hardware actually provides the SGPR.
+    if needs_workgroup_id_z:
+        asm_text = asm_text.replace(
+            ".amdhsa_system_sgpr_workgroup_id_z 0",
+            ".amdhsa_system_sgpr_workgroup_id_z 1",
+        )
 
     if options.dump_intermediates:
         asm_path = os.path.join(options.dump_intermediates, f"{kernel_name}.rocmasm")

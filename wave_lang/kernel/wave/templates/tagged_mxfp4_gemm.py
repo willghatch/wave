@@ -741,7 +741,11 @@ def _get_tagged_splitk_mxfp4_gemm_impl(
         K: k,
         S: num_splits,
         K_SPLIT_OFF: WORKGROUP_2 * k_per_split,
-        K_SPLIT_LEN: sympy.Min(K, (WORKGROUP_2 + 1) * k_per_split) - K_SPLIT_OFF,
+        K_SPLIT_LEN: (
+            k_per_split
+            if k % k_per_split == 0
+            else sympy.Min(K, (WORKGROUP_2 + 1) * k_per_split) - K_SPLIT_OFF
+        ),
     }
     for key, value in hyperparams.items():
         if isinstance(value, sympy.Expr):
