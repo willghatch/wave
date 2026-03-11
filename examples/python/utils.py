@@ -36,6 +36,12 @@ def parse_args():
         default=None,
         help="Enable epilogue elimination (true/false)",
     )
+    parser.add_argument(
+        "--wave_shape",
+        type=str,
+        default=None,
+        help="Wave shape, e.g. 2,2",
+    )
 
     args = parser.parse_args()
 
@@ -44,6 +50,8 @@ def parse_args():
         args.shape = tuple(map(int, args.shape.split(",")))
     if isinstance(args.block, str):
         args.block = tuple(map(int, args.block.split(",")))
+    if isinstance(args.wave_shape, str):
+        args.wave_shape = tuple(map(int, args.wave_shape.split(",")))
 
     return args
 
@@ -64,6 +72,7 @@ def run_test(
     shape=None,
     block=None,
     eliminate_epilogue=None,
+    wave_shape=None,
 ):
     """Run a test function multiple times."""
     if test_name not in module_globals:
@@ -78,6 +87,8 @@ def run_test(
         kwargs["block"] = block
     if eliminate_epilogue is not None:
         kwargs["eliminate_epilogue"] = eliminate_epilogue
+    if wave_shape is not None:
+        kwargs["wave_shape"] = wave_shape
 
     for i in range(repeat):
         try:

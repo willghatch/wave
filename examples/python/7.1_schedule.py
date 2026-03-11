@@ -444,5 +444,6 @@ if __name__ == "__main__":
         args.shape,
         args.block,
         args.eliminate_epilogue,
+        getattr(args, "wave_shape", None),
     )
     exit(0 if success else 1)

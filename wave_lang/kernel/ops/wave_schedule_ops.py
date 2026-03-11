@@ -764,12 +764,22 @@ class PartitionByDim(CustomScheduleOp):
         nodes_list = list(nodes)
         assert len(nodes_list) > 0, "Nodes must have at least one element"
 
+        # Filter to only nodes that have expanded_dims with the target dim.
+        # Pre-expansion nodes (without expanded_dims) are excluded.
+        nodes_list = [
+            node
+            for node in nodes_list
+            if get_custom(node).expanded_dims and dim in get_custom(node).expanded_dims
+        ]
+        assert len(nodes_list) > 0, (
+            f"No nodes have expanded_dims with dimension {dim}"
+        )
+
         # Get all unique dimension IDs for the specified dimension
         dim_ids = set()
         for node in nodes_list:
             custom = get_custom(node)
-            if custom.expanded_dims and dim in custom.expanded_dims:
-                dim_ids.add(custom.expanded_dims[dim])
+            dim_ids.add(custom.expanded_dims[dim])
 
         # Validate that the dimension can be partitioned by the num_partitions
         dim_expand_size = len(dim_ids)
