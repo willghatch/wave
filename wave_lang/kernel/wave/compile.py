@@ -1318,8 +1318,8 @@ def _generate_asm_code(mb, options):
         os.unlink(mlir_path)
 
     if options.dump_intermediates:
-        asm_path = os.path.join(options.dump_intermediates, f"{kernel_name}.rocmasm")
         os.makedirs(options.dump_intermediates, exist_ok=True)
+        asm_path = os.path.join(options.dump_intermediates, f"{kernel_name}.rocmasm")
         with open(asm_path, "w") as f:
             f.write(asm_text)
 

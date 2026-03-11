@@ -68,14 +68,16 @@ bool isVALUOp(Operation *op) {
     return false;
 
   // Exclude v_readfirstlane (it's the consumer in the hazard, not the producer)
-  if (isa<V_READFIRSTLANE_B32>(op))
+  if (isa<V_READFIRSTLANE_B32, V_READFIRSTLANE_B32_EFFECT>(op))
     return false;
 
   return true;
 }
 
 /// Check if an operation is v_readfirstlane
-bool isReadfirstlaneOp(Operation *op) { return isa<V_READFIRSTLANE_B32>(op); }
+bool isReadfirstlaneOp(Operation *op) {
+  return isa<V_READFIRSTLANE_B32, V_READFIRSTLANE_B32_EFFECT>(op);
+}
 
 /// Check if an operation is a transcendental instruction (uses the Trans
 /// pipeline which has different latency characteristics from the main VALU).

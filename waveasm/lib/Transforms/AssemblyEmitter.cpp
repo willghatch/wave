@@ -917,6 +917,11 @@ std::optional<std::string> KernelGenerator::generateOp(Operation *op) {
             return formatter.format("v_cvt_pk_bf16_f32", operands);
           })
 
+      .Case<V_READFIRSTLANE_B32_EFFECT>(
+          [&](auto rflOp) -> std::optional<std::string> {
+            return emitDefaultFormat(rflOp, "v_readfirstlane_b32");
+          })
+
       .Default([&](Operation *defaultOp) -> std::optional<std::string> {
         llvm::StringRef opName = defaultOp->getName().getStringRef();
         llvm::StringRef mnemonic = opName;

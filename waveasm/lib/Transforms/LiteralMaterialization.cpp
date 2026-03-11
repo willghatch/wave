@@ -53,6 +53,9 @@ static bool needsLiteralMaterialization(llvm::StringRef mnemonic) {
   // the condition operand and materializes non-inline literals as needed.
   if (mnemonic == "v_cndmask_b32")
     return false;
+  // The _effect variant has a dedicated handler mapping to v_readfirstlane_b32.
+  if (mnemonic == "v_readfirstlane_b32_effect")
+    return false;
   if (getVOP2Instructions().count(mnemonic))
     return false;
   return true;

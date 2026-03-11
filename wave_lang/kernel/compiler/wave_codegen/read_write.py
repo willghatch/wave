@@ -436,12 +436,10 @@ def _compute_branchless_valid_bytes(
     SRD's NUM_RECORDS=0 so gather_to_lds DMA is a hardware no-op.
     """
     uint64 = IntegerType.get_signless(64)
+    i32 = IntegerType.get_signless(32)
     total_bytes = _compute_total_valid_bytes(
         elem_type, symbolic_shape, use_real_bounds=True
     )
-
-    real_valid = arith_d.constant(uint64, get_constant_attr(total_bytes, uint64))
-    zero_valid = arith_d.constant(uint64, get_constant_attr(0, uint64))
 
     cond_val = gen_sympy_index(add_emitter_subs(emitter), guard_condition)
     i1 = IntegerType.get_signless(1)
@@ -449,7 +447,10 @@ def _compute_branchless_valid_bytes(
         zero_idx = arith_d.constant(cond_val.type, 0)
         cond_val = arith_d.cmpi(arith_d.CmpIPredicate.ne, cond_val, zero_idx)
 
-    return arith_d.select(cond_val, real_valid, zero_valid)
+    real_valid_32 = arith_d.constant(i32, get_constant_attr(total_bytes, i32))
+    zero_valid_32 = arith_d.constant(i32, get_constant_attr(0, i32))
+    selected_32 = arith_d.select(cond_val, real_valid_32, zero_valid_32)
+    return arith_d.extui(uint64, selected_32)
 
 
 def _compute_valid_bytes(

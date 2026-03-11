@@ -472,6 +472,16 @@ def WaveASM_V_READFIRSTLANE_B32 : WAVEASMOp<"v_readfirstlane_b32", []> {
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($dst)";
 }
 
+// Non-Pure variant for SRD field writes where the result has no SSA consumer.
+// Without this, canonicalize would DCE the readfirstlane since the physical
+// register write is invisible to the SSA graph.
+def WaveASM_V_READFIRSTLANE_B32_EFFECT : WAVEASMOp<"v_readfirstlane_b32_effect", []> {
+  let summary = "Read first lane of VGPR to SGPR (side-effecting)";
+  let arguments = (ins WaveASM_AnyVGPR:$src);
+  let results = (outs WaveASM_AnySGPR:$dst);
+  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($dst)";
+}
+
 // Bit operations
 def WaveASM_V_NOT_B32 : VALUUnaryOp<"v_not_b32">;
 def WaveASM_V_NOT_B64 : VALUUnaryOp<"v_not_b64">;
