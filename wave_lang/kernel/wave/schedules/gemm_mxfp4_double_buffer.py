@@ -2156,32 +2156,25 @@ def get_mxfp4_asymmetric_nounroll_schedule(
         interleaved_mma_0 = tkw.interleave_operations(
             base_ops=loop_scaled_mma_0,
             interleaved_ops=[
-                loop_g2v_b,
                 loop_shared_load_a_1,
                 loop_shared_load_a_scale_1,
-                loop_g2v_b_scale,
             ],
-            intervals=[4, 4, 2, 4],
-            start_offsets=[0, 3, 2, 0],
-            start_after_groups=[[], [], [1], [0]],
+            intervals=[4, 2],
+            start_offsets=[3, 2],
+            start_after_groups=[[], [0]],
         )
 
         interleaved_mma_1 = tkw.interleave_operations(
             base_ops=loop_scaled_mma_1,
             interleaved_ops=[
-                loop_g2s_a,
                 loop_shared_load_a_0,
                 loop_shared_load_a_scale_0,
-                loop_g2s_a_scale,
             ],
-            intervals=[4, 4, 2, 4],
-            start_offsets=[0, 3, 2, 0],
-            start_after_groups=[[], [], [1], [0]],
+            intervals=[4, 2],
+            start_offsets=[3, 2],
+            start_after_groups=[[], [0]],
         )
 
-        loop_B_g2v_bs = len(loop_g2v_b) + (
-            len(loop_g2v_b_scale) // b_scale_shuffling_factor
-        )
         loop_A_s2v_bs = len(loop_g2s_a) + len(loop_g2s_a_scale)
         kernel_clusters = [
             tkw.cluster(
@@ -2193,8 +2186,6 @@ def get_mxfp4_asymmetric_nounroll_schedule(
                     tkw.SchedulingBarrier([]),
                     interleaved_mma_0,
                     tkw.SchedulingBarrier([]),
-                    tkw.MemoryCounterWaitBarrier(load=loop_B_g2v_bs, ds=0),
-                    tkw.SchedulingBarrier([]),
                 ],
             ),
             tkw.cluster(
@@ -2204,9 +2195,18 @@ def get_mxfp4_asymmetric_nounroll_schedule(
                     tkw.SchedulingBarrier([]),
                     interleaved_mma_1,
                     tkw.SchedulingBarrier([]),
+                ],
+            ),
+            tkw.cluster(
+                [
+                    loop_g2v_b,
+                    loop_g2v_b_scale,
+                    loop_g2s_a,
+                    loop_g2s_a_scale,
+                    tkw.SchedulingBarrier([]),
                     tkw.MemoryCounterWaitBarrier(load=loop_A_s2v_bs, ds=0),
                     tkw.SchedulingBarrier([]),
-                ]
+                ],
             ),
         ]
 
