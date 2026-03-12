@@ -1287,6 +1287,7 @@ def _generate_asm_code(mb, options):
         mlir_path = mlir_file.name
 
     if options.dump_intermediates:
+        os.makedirs(options.dump_intermediates, exist_ok=True)
         import shutil
         mlir_save = os.path.join(options.dump_intermediates, f"{kernel_name}.waveasm.mlir")
         shutil.copy2(mlir_path, mlir_save)

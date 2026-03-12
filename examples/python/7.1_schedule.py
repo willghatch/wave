@@ -384,9 +384,15 @@ def test_dbuf_4wave_mxfp_preshuffle_b_gemm_cpp(
     options.use_wave_asm_backend = True
     options.dump_intermediates = "build/intermediates"
     options.eliminate_epilogue = eliminate_epilogue
-    schedule = get_mxfp4_asymmetric_schedule(
-        eliminate_epilogue=eliminate_epilogue, is_bscale_shuffled=True
-    )
+    use_nounroll = wave_shape != (1, 4)
+    if use_nounroll:
+        schedule = get_mxfp4_asymmetric_nounroll_schedule(
+            eliminate_epilogue=eliminate_epilogue, is_bscale_shuffled=True
+        )
+    else:
+        schedule = get_mxfp4_asymmetric_schedule(
+            eliminate_epilogue=eliminate_epilogue, is_bscale_shuffled=True
+        )
     options.print_ir_after = "all" if is_debug else []
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm, schedule)
