@@ -595,8 +595,8 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
   // Subsequent fat_raw_buffer_cast ops with the same source will
   // copy from this SRD (whose registers remain live) rather than
   // the original kernel-arg SRD (which may be repurposed).
-  if (!ctx.getSwizzleSRDForSource(sourceMemref)) {
-    ctx.setSwizzleSRDForSource(sourceMemref, newSrdBase);
+  if (!ctx.getSwizzleSRDForSource(op->getOperand(0))) {
+    ctx.setSwizzleSRDForSource(op->getOperand(0), newSrdBase);
   }
 
   return success();
