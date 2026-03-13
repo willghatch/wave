@@ -213,6 +213,19 @@ MemOpKind classifyMemOp(const Operation *op) {
   return MemOpKind::None;
 }
 
+/// True for gather-to-LDS loads (buffer_load with LDS destination).
+/// These use the vmcnt counter but write to LDS with no VGPR/SSA result.
+bool isBufferLoadLds(const Operation *op) {
+  return isa<BUFFER_LOAD_DWORD_LDS, BUFFER_LOAD_DWORDX4_LDS>(op);
+}
+
+/// True for LDS read operations (ds_read_*).
+bool isDsRead(const Operation *op) {
+  return isa<DS_READ_B32, DS_READ_B64, DS_READ_B128, DS_READ2_B32,
+             DS_READ2_B64, DS_READ_U8, DS_READ_I8, DS_READ_U16,
+             DS_READ_I16>(op);
+}
+
 //===----------------------------------------------------------------------===//
 // InsertWaitcnt Pass
 //===----------------------------------------------------------------------===//
@@ -225,6 +238,17 @@ struct WaitcntState {
   int64_t opIndex = 0;
   int64_t maxLgkmcnt = 15;
   int64_t maxVmcnt = 63;
+
+  /// Vmem ticket of the most recent buffer_load_*_lds operation.
+  /// Used for cross-counter dependency: buffer_load_lds (vmcnt) -> ds_read
+  /// (lgkmcnt).  These ops write to LDS via the texture path with no SSA
+  /// result, so the normal ticket tracking cannot see the dependency.
+  int64_t lastBufferLoadLdsVmemTicket = -1;
+
+  /// True when the current loop body contains buffer_load_*_lds operations.
+  /// Needed to handle the back-edge case: buffer_load_lds at the end of the
+  /// loop body must complete before ds_read at the start of the next iteration.
+  bool loopContainsBufferLoadLds = false;
 
   int64_t capLgkmcnt(int64_t v) const {
     return v > maxLgkmcnt ? int64_t(0) : v;
@@ -335,6 +359,10 @@ private:
       numVmemOps++;
     }
 
+    // Track buffer_load_*_lds for cross-counter dependency handling.
+    if (isBufferLoadLds(op))
+      st.lastBufferLoadLdsVmemTicket = ticket;
+
     for (Value result : op->getResults()) {
       st.valueTickets[result] = {kind, ticket};
       if (kind == MemOpKind::VmemLoad || kind == MemOpKind::LgkmLoad)
@@ -424,6 +452,43 @@ private:
   }
 
   //===--------------------------------------------------------------------===//
+  // Handler: cross-counter buffer_load_lds -> ds_read dependency
+  //===--------------------------------------------------------------------===//
+
+  /// buffer_load_*_lds writes to LDS via the VMEM (texture) path.
+  /// ds_read reads from LDS via the LGKM path.  These use different HW
+  /// counters with no SSA link, so normal ticket tracking misses the
+  /// dependency.  We must ensure vmcnt drains all outstanding
+  /// buffer_load_lds before any ds_read that may consume their data.
+  ///
+  /// Two cases:
+  ///   1. Linear flow: buffer_load_lds issued earlier in the same walk.
+  ///   2. Loop back-edge: buffer_load_lds at the end of the loop body
+  ///      must complete before ds_read at the start of the next iteration.
+  void handleCrossCounterLdsDependency(Operation *op, WaitcntState &st) {
+    if (!isDsRead(op))
+      return;
+
+    // Case 1: buffer_load_lds seen earlier in the linear walk.
+    if (st.lastBufferLoadLdsVmemTicket >= 0) {
+      auto wait =
+          st.ticketing.computeVmemWait(st.lastBufferLoadLdsVmemTicket);
+      if (wait.has_value()) {
+        emitWaitcnt(op, wait, std::nullopt, st);
+        return;
+      }
+    }
+
+    // Case 2: loop back-edge.  On the first iteration, the barrier at the
+    // loop top has already drained vmcnt (handled by handleBarrier).  For
+    // robustness, if we are inside a loop that contains buffer_load_lds AND
+    // there are still outstanding vmem ops, insert vmcnt(0).
+    if (st.loopContainsBufferLoadLds && st.ticketing.hasOutstandingVmem()) {
+      emitWaitcnt(op, std::optional<int64_t>(0), std::nullopt, st);
+    }
+  }
+
+  //===--------------------------------------------------------------------===//
   // Handler: loop boundary reset
   //===--------------------------------------------------------------------===//
 
@@ -433,6 +498,14 @@ private:
     // because waits from the end of one iteration ARE valid at the start
     // of the next -- the hardware state is continuous.
     if (isa<LoopOp>(op) || op->getName().getStringRef().contains("branch")) {
+      // Pre-scan loop body for buffer_load_lds to handle back-edge deps.
+      if (auto loop = dyn_cast<LoopOp>(op)) {
+        st.loopContainsBufferLoadLds = false;
+        loop->walk([&](Operation *inner) {
+          if (isBufferLoadLds(inner))
+            st.loopContainsBufferLoadLds = true;
+        });
+      }
       st.ticketing.resetWaits();
     }
   }
@@ -494,6 +567,9 @@ private:
 
         MemOpKind kind = classifyMemOp(op);
         if (kind != MemOpKind::None) {
+          // Cross-counter: ensure buffer_load_lds has completed before ds_read.
+          if (kind == MemOpKind::LgkmLoad)
+            handleCrossCounterLdsDependency(op, st);
           handleMemoryOp(op, kind, st);
           continue;
         }

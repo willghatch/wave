@@ -278,24 +278,11 @@ MetadataEmitter::emitKernelDescriptor(int64_t peakVGPRs, int64_t peakSGPRs,
   lines.push_back("  .amdhsa_system_sgpr_workgroup_id_z " +
                   std::to_string(usesWorkgroupIdZ ? 1 : 0));
 
-  int64_t systemVgprWorkitemId = 0;
-  auto workgroupSize = program.getWorkgroupSize();
-  if (workgroupSize.has_value() && workgroupSize->size() >= 2) {
-    int64_t wgY = 1, wgZ = 1;
-    if (auto intAttr = dyn_cast<IntegerAttr>((*workgroupSize)[1])) {
-      wgY = intAttr.getInt();
-    }
-    if (workgroupSize->size() >= 3) {
-      if (auto intAttr = dyn_cast<IntegerAttr>((*workgroupSize)[2])) {
-        wgZ = intAttr.getInt();
-      }
-    }
-    if (wgY > 1 || wgZ > 1) {
-      systemVgprWorkitemId = 1;
-    }
-  }
-  lines.push_back("  .amdhsa_system_vgpr_workitem_id " +
-                  std::to_string(systemVgprWorkitemId));
+  // Always use system_vgpr_workitem_id = 0 (only v0 initialized).
+  // Multi-wave kernels are launched with a flat 1D block and derive
+  // tid_y / tid_z from v0 arithmetically, avoiding reliance on v1/v2
+  // which are unreliable with hipModuleLaunchKernel on some hardware.
+  lines.push_back("  .amdhsa_system_vgpr_workitem_id 0");
 
   lines.push_back("  .amdhsa_float_denorm_mode_32 3");
   lines.push_back("  .amdhsa_float_denorm_mode_16_64 3");

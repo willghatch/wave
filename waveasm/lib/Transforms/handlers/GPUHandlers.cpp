@@ -42,39 +42,43 @@ LogicalResult handleGPUThreadId(Operation *op, TranslationContext &ctx) {
   gpu::Dimension dim = threadIdOp.getDimension();
 
   // Check if this is a multi-wave kernel
-  // For multi-wave, the hardware provides flat_workitem_id in v0
-  // For single-wave, we compute lane_id using v_mbcnt
+  // For multi-wave, the kernel is launched with a 1D block (total_threads, 1, 1)
+  // and v0 = flat workitem ID.  We derive tid_x and tid_y from v0.
+  // (v1/v2 are unreliable with hipModuleLaunchKernel on some hardware.)
   if (ctx.isMultiWaveKernel()) {
-    // Multi-wave: the kernel is launched with a multi-dimensional workgroup
-    // (e.g. (64, 4, 1)). The hardware provides separate workitem IDs in
-    // v0 = workitem_id_x, v1 = workitem_id_y, v2 = workitem_id_z.
+    auto flatWorkitemId =
+        PrecoloredVRegOp::create(builder, loc, vregType, 0, 1);
 
-    ctx.setUsesWorkitemId(true);
+    auto [wgX, wgY, wgZ] = ctx.getWorkgroupSize();
 
     switch (dim) {
     case gpu::Dimension::x: {
-      // workitem_id_x from hardware v0
-      auto flatWorkitemId =
-          PrecoloredVRegOp::create(builder, loc, vregType, 0, 1);
+      // tid_x = flat_id % wgX.  wgX is always a power of two (waves * 64),
+      // so this is a bit-field extract of the low log2(wgX) bits.
+      int64_t bitsX = llvm::Log2_64_Ceil(wgX);
       auto immZero = ctx.createImmType(0);
       auto zeroConst = ConstantOp::create(builder, loc, immZero, 0);
-      auto immBits = ctx.createImmType(10);
-      auto bitsConst = ConstantOp::create(builder, loc, immBits, 10);
+      auto immBits = ctx.createImmType(bitsX);
+      auto bitsConst = ConstantOp::create(builder, loc, immBits, bitsX);
       result = V_BFE_U32::create(builder, loc, vregType, flatWorkitemId,
                                  zeroConst, bitsConst);
       break;
     }
     case gpu::Dimension::y: {
-      // workitem_id_y from hardware v1
-      auto tidY =
-          PrecoloredVRegOp::create(builder, loc, vregType, 1, 1);
+      // tid_y = (flat_id / wgX) % wgY
+      // flat_id / wgX == flat_id >> log2(wgX)  (wgX is power of two)
+      int64_t shiftX = llvm::Log2_64_Ceil(wgX);
+      auto immShift = ctx.createImmType(shiftX);
+      auto shiftConst = ConstantOp::create(builder, loc, immShift, shiftX);
+      auto shifted = V_LSHRREV_B32::create(builder, loc, vregType,
+                                            shiftConst, flatWorkitemId);
+      // Extract log2(wgY) bits to get tid_y % wgY
+      int64_t bitsY = llvm::Log2_64_Ceil(wgY);
       auto immZero = ctx.createImmType(0);
       auto zeroConst = ConstantOp::create(builder, loc, immZero, 0);
-      auto [wgX, wgY, wgZ] = ctx.getWorkgroupSize();
-      int64_t bitsY = llvm::Log2_64_Ceil(wgY);
       auto immBits = ctx.createImmType(bitsY);
       auto bitsConst = ConstantOp::create(builder, loc, immBits, bitsY);
-      result = V_BFE_U32::create(builder, loc, vregType, tidY,
+      result = V_BFE_U32::create(builder, loc, vregType, shifted,
                                  zeroConst, bitsConst);
       break;
     }

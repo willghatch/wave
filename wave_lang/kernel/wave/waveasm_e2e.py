@@ -617,6 +617,11 @@ def run_with_wave_runtime(
     # Load GPU function from binary.
     gpu_binary, gpu_func = wave_runtime.load_binary(str(binary_path), func_name)
 
+    # WaveASM kernels derive tid_y/tid_z from the flat thread ID (v0),
+    # so always flatten the block to 1D to avoid relying on v1/v2
+    # hardware initialization which is unreliable with hipModuleLaunchKernel.
+    flat_block = (block[0] * block[1] * block[2], 1, 1)
+
     # Create launch info (using positional args - the API expects 12 int args).
     stream = torch.cuda.current_stream().cuda_stream
     kernel_launch_info = wave_runtime.KernelLaunchInfo(
@@ -626,9 +631,9 @@ def run_with_wave_runtime(
         grid[0],  # arg3: grid_dim_x.
         grid[1],  # arg4: grid_dim_y.
         grid[2],  # arg5: grid_dim_z.
-        block[0],  # arg6: block_dim_x.
-        block[1],  # arg7: block_dim_y.
-        block[2],  # arg8: block_dim_z.
+        flat_block[0],  # arg6: block_dim_x.
+        flat_block[1],  # arg7: block_dim_y.
+        flat_block[2],  # arg8: block_dim_z.
         1,  # arg9: cluster_dim_x.
         1,  # arg10: cluster_dim_y.
         1,  # arg11: cluster_dim_z.

@@ -318,10 +318,10 @@ KernelGenerator::emitScaledMFMA(Operation *scaledOp, llvm::StringRef mnemonic) {
     line += " op_sel:[" + std::to_string(selLo0) + "," +
             std::to_string(selLo1) + ",0]";
   }
-  if (selHi0 || selHi1) {
-    line += " op_sel_hi:[" + std::to_string(selHi0) + "," +
-            std::to_string(selHi1) + ",0]";
-  }
+  // Always emit op_sel_hi: the assembler default for VOP3P is [1,1,1],
+  // so omitting [0,0,0] would silently select the wrong scale bytes.
+  line += " op_sel_hi:[" + std::to_string(selHi0) + "," +
+          std::to_string(selHi1) + ",0]";
 
   int32_t cbsz = 4;
   int32_t blgp = 4;
