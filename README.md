@@ -64,8 +64,16 @@ Before installing Wave, ensure you have the following prerequisites:
 
    Before installing Wave, ensure you have the appropriate ROCm-enabled PyTorch dependencies:
 
+
    ```bash
    pip install -r pytorch-rocm-requirements.txt
+   ```
+
+   or, to auto-detect the installed ROCm version:
+
+   ```sh
+   ./gen-pytorch-rocm-requirements.py > requirements-pytorch-rocm-generated.txt
+   pip install -r requirements-pytorch-rocm-generated.txt
    ```
 
 2. **Install Wave**
