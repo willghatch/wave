@@ -16,8 +16,10 @@ Usage:
 """
 
 import argparse
+import glob
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -34,12 +36,12 @@ import sys
 # Edit this table to add special handling for new macro tiles.
 # ============================================================
 MACRO_TILE_OVERRIDES = {
-    "128x256x256": {"extra_args": ["--wave_shape", "1,4"]},
-    "128x32x256": {"extra_args": ["--wave_shape", "2,2"]},
-    "224x160x256": {"extra_args": ["--wave_shape", "2,2"]},
-    "256x192x256": {"extra_args": ["--wave_shape", "1,4"]},
-    "256x160x256": {"extra_args": ["--wave_shape", "2,2"]},
-    "256x224x256": {"extra_args": ["--no-unroll", "--wave_shape", "2,2"]},
+    #"128x256x256": {"extra_args": ["--wave_shape", "1,4"]},
+    #"128x32x256": {"extra_args": ["--wave_shape", "2,2"]},
+    #"224x160x256": {"extra_args": ["--wave_shape", "2,2"]},
+    "256x192x256": {"extra_args": []},
+    #"256x160x256": {"extra_args": ["--no-unroll", "--wave_shape", "2,2"]},
+    #"256x224x256": {"extra_args": ["--no-unroll", "--wave_shape", "2,2"]},
 }
 
 # ============================================================
@@ -64,6 +66,7 @@ TEST_MAP = {
     (4, "llvm", "static"): "test_dbuf_4wave_mxfp_preshuffle_b_gemm",
     (4, "llvm", "dynamic"): "test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm",
     (4, "waveasm", "static"): "test_dbuf_4wave_mxfp_preshuffle_b_gemm_cpp",
+    (4, "waveasm", "dynamic"): "test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm_asm",
     (8, "llvm", "static"): "test_dbuf_8wave_pingpong_mxfp_gemm",
     (8, "llvm", "dynamic"): "test_dbuf_8wave_pingpong_mxfp_gemm",
 }
@@ -191,6 +194,12 @@ def main() -> None:
         action="store_true",
         help="Show abbreviated output (first/last 5 lines) for failures",
     )
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=2,
+        help="GPU ID for HIP_VISIBLE_DEVICES (default 2)",
+    )
     args = parser.parse_args()
 
     errors = []
@@ -214,6 +223,13 @@ def main() -> None:
         for shape_comma, shape_display in shapes:
             cmd = _build_cmd(test_name, mt_comma, mt_display, shape_comma, shape_display)
 
+            print(
+                f"Running: mt={mt_display}, shape={shape_display} ... ",
+                end="",
+                flush=True,
+            )
+
+            env = {**os.environ, "HIP_VISIBLE_DEVICES": str(args.gpu)}
             output = ""
             try:
                 result = subprocess.run(
@@ -221,6 +237,7 @@ def main() -> None:
                     capture_output=True,
                     text=True,
                     timeout=args.timeout,
+                    env=env,
                 )
                 status = "PASS" if result.returncode == 0 else "FAIL"
                 output = (result.stdout + result.stderr).strip()
@@ -232,10 +249,20 @@ def main() -> None:
             if status != "PASS":
                 any_fail = True
 
-            print(
-                f"dyn={args.dyn}, n-wave={args.n_wave}, backend={args.backend}, "
-                f"macro-tile={mt_display}, shape={shape_display}, result={status}"
-            )
+            print(status)
+            if status != "PASS":
+                for ext in ("*.s", "*.rocmasm"):
+                    asm_files = sorted(
+                        glob.glob(f"build/intermediates/{ext}"),
+                        key=os.path.getmtime,
+                        reverse=True,
+                    )
+                    if asm_files:
+                        suffix = os.path.splitext(asm_files[0])[1]
+                        dest = f"failing_{mt_display}_{shape_display}{suffix}"
+                        shutil.copy2(asm_files[0], dest)
+                        print(f"  -> saved {dest}")
+
             if args.verbose and status != "PASS" and output:
                 for line in _abbreviated(output).splitlines():
                     print(f"  | {line}")
