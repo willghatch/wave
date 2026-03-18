@@ -61,13 +61,8 @@ from ...ops.wave_ops import (
     MemoryAccessFlags,
 )
 from ...wave.utils.general_utils import get_fastest_index, infer_dim, linearize_index
-from ...wave.utils.mapping_utils import (
-    linearize_dims,
-    mem_simplify,
-    transform_index_on_mapping,
-)
-from ...wave.assumptions import get_divisibility_subs
-from ...wave.utils.symbol_utils import safe_subs, simplify, extract_iv
+from ...wave.utils.mapping_utils import transform_index_on_mapping
+from ...wave.utils.symbol_utils import safe_subs, simplify
 from .emitter import (
     WaveEmitter,
     add_emitter_subs,
@@ -776,19 +771,6 @@ def _create_vec_read_write(
             return
 
 
-def _cancel_floordiv_mod_linearize(
-    dim_exprs: list[sympy.Expr],
-    strides: list[sympy.Expr],
-) -> sympy.Expr:
-    """Compute ``sum(e_i * s_i)`` while cancelling floor/Mod pairs.
-
-    Delegates to :func:`linearize_dims` which expands ``Mod(x, d)``
-    into ``x - d*floor(x/d)`` so that the matching ``floor`` terms
-    cancel algebraically under ``expand()``.
-    """
-    return linearize_dims(dim_exprs, strides)
-
-
 def _emit_cycle_offset(
     cycle: list[IndexExpr],
     iv_mlir: Value,
@@ -842,7 +824,6 @@ def _try_iv_split_offset(
     dynamic_vals: dict[IndexExpr, Any],
     use_subs_idxc: bool = True,
     precomputed_iv_stride: dict[sympy.Symbol, IndexExpr | list[IndexExpr]] | None = None,
-    **kwargs,
 ) -> Optional[Value]:
     """Compute a hoisted IV-split linearized offset for a loop-carried read.
 
@@ -853,8 +834,6 @@ def _try_iv_split_offset(
     When *precomputed_iv_stride* is supplied (from
     ``compute_iv_stride_through_mapping``), the IV stride is known from the
     pre-mapping index and the extraction phase is skipped entirely.
-
-    Otherwise falls back to the original Phase 1 / Phase 1b extraction.
     """
     ip = InsertionPoint.current
     owner = ip.block.owner
@@ -863,7 +842,6 @@ def _try_iv_split_offset(
     if owner.name != "scf.for":
         return None
 
-    # Find the IV symbol for this scf.for directly from its block argument.
     current_iv = owner.induction_variable
 
     dim = next((d for d, v in emitter.induction_vars.items() if v == current_iv), None)
@@ -890,12 +868,13 @@ def _try_iv_split_offset(
 
     sym_strides = [sympy.sympify(s) for s in strides]
 
-    # ------------------------------------------------------------------
-    # Fast path: pre-computed IV stride from mapping analysis.
-    # ------------------------------------------------------------------
     has_iv = any(iv_sym in sympy.sympify(e).free_symbols for e in start_exprs)
     if not has_iv:
         return None
+
+    # ------------------------------------------------------------------
+    # Fast path: pre-computed IV stride from mapping analysis.
+    # ------------------------------------------------------------------
     if precomputed_iv_stride and iv_sym in precomputed_iv_stride:
         k_stride_per_iv = precomputed_iv_stride[iv_sym]
 
@@ -937,97 +916,49 @@ def _try_iv_split_offset(
         return total
 
     # ------------------------------------------------------------------
-    # Original extraction path (Phase 1 / Phase 1b).
+    # Symbolic linearity proof w.r.t. the current loop's IV.
     # ------------------------------------------------------------------
-    div_fwd, div_bwd = get_divisibility_subs(emitter.constraints)
-
     _j = sympy.Symbol("_j", integer=True, nonnegative=True)
     iv_as_j = step_int * _j
-
-    dims = list(index.keys())
-
-    dim_exprs = []
-    for i, (expr, stride) in enumerate(zip(start_exprs, sym_strides)):
+    lin_sym = sympy.Integer(0)
+    for expr, stride in zip(start_exprs, sym_strides):
         e = safe_subs(expr, {iv_sym: iv_as_j})
         if use_subs_idxc:
             e = subs_idxc(e)
-        if div_fwd:
-            e = safe_subs(e, div_fwd)
-        e = mem_simplify(e)
-        dim_exprs.append(e)
+        e = simplify(e)
+        lin_sym += e * stride
+    lin_sym = simplify(lin_sym)
 
-    # Phase 1: per-dimension extract.
-    iv_stride_sym = sympy.Integer(0)
-    base_exprs = []
-    split_first_ok = True
-
-    for i, (e, stride) in enumerate(zip(dim_exprs, sym_strides)):
-        result = extract_iv(e, _j)
-        if result is None:
-            split_first_ok = False
-            break
-        j_coeff, remainder = result
-
-        if div_bwd:
-            j_coeff = safe_subs(j_coeff, div_bwd)
-            remainder = safe_subs(remainder, div_bwd)
-
-        iv_stride_sym += simplify(mem_simplify(j_coeff * stride))
-        base_exprs.append(remainder)
-
-    # Phase 1b: linearize-first fallback.
-    if not split_first_ok:
-        fwd_strides = []
-        for s in sym_strides:
-            fs = safe_subs(s, div_fwd) if div_fwd else s
-            fwd_strides.append(fs)
-
-        lin_sym = _cancel_floordiv_mod_linearize(dim_exprs, fwd_strides)
-        lin_sym = mem_simplify(lin_sym)
-
-        result = extract_iv(lin_sym, _j)
-        if result is None:
-            return None
-        j_coeff_lin, base_lin = result
-
-        if div_bwd:
-            j_coeff_lin = safe_subs(j_coeff_lin, div_bwd)
-            base_lin = safe_subs(base_lin, div_bwd)
-
-        iv_stride_sym = simplify(mem_simplify(j_coeff_lin))
-        base_exprs = None
-        base_lin_expr = base_lin
-
-    if iv_stride_sym == 0:
+    coeff = lin_sym.coeff(_j)
+    remainder = simplify(lin_sym - coeff * _j)
+    if coeff == 0 or _j in remainder.free_symbols:
         return None
 
-    if iv_stride_sym.is_Integer:
-        k_stride_per_iv_int, rem = divmod(int(iv_stride_sym), step_int)
+    if coeff.is_Integer:
+        k_stride_per_iv_int, rem = divmod(int(coeff), step_int)
         if rem != 0:
             return None
         k_stride_per_iv = sympy.Integer(k_stride_per_iv_int)
     else:
-        k_stride_per_iv = simplify(mem_simplify(iv_stride_sym / step_int))
+        k_stride_per_iv = simplify(coeff / step_int)
 
-    # Emit MLIR.
+    base_start_exprs = [safe_subs(e, {iv_sym: 0}) for e in start_exprs]
+
     hoist_ip = InsertionPoint(owner)
     subs_map = add_emitter_subs(emitter, dynamic_vals)
     overflow_flags = arith_d.IntegerOverflowFlags.nsw
 
     with hoist_ip:
-        if base_exprs is not None:
-            lin_offset = None
-            for base_expr, stride in zip(base_exprs, sym_strides):
-                val = gen_sympy_index(subs_map, base_expr)
-                stride_val = gen_sympy_index(subs_map, stride)
-                term = arith_d.muli(val, stride_val, overflow_flags=overflow_flags)
-                lin_offset = (
-                    term
-                    if lin_offset is None
-                    else arith_d.addi(lin_offset, term, overflow_flags=overflow_flags)
-                )
-        else:
-            lin_offset = gen_sympy_index(subs_map, base_lin_expr)
+        lin_offset = None
+        for base_expr, stride in zip(base_start_exprs, sym_strides):
+            val = gen_sympy_index(subs_map, base_expr)
+            stride_val = gen_sympy_index(subs_map, stride)
+            term = arith_d.muli(val, stride_val, overflow_flags=overflow_flags)
+            lin_offset = (
+                term
+                if lin_offset is None
+                else arith_d.addi(lin_offset, term, overflow_flags=overflow_flags)
+            )
         k_stride_val = gen_sympy_index(subs_map, k_stride_per_iv)
 
     iv_mlir = subs_map.get(iv_sym)
