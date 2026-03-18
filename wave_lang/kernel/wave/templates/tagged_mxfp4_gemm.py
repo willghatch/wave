@@ -494,22 +494,39 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
     else:
         a_scale_mapping = None
 
-    # --- B scale preshuffle mapping (e8m0_shuffle) ---
-    # Maps logical (N, K/32) scale coordinates to the shuffled physical layout.
-    # The e8m0_shuffle does:
-    #   view(N//32, 2, 16, Ks//8, 2, 4).permute(0,3,5,2,4,1)
-    # where Ks = K_SCALE_SHUFFLED = ceil(K/32, 8).
+    # --- B scale preshuffle mapping ---
     k_s = tkw.IndexMapping.iterator(0)
     n_s = tkw.IndexMapping.iterator(1)
 
-    b_scale_flat = (
-        (n_s // 32) * ((K_SCALE_SHUFFLED // 8) * 256)
-        + (k_s // 8) * 256
-        + ((k_s % 8) % 4) * 64
-        + ((n_s % 32) % 16) * 4
-        + (((k_s % 8) // 4) * 2)
-        + ((n_s % 32) // 16)
-    )
+    n_per_wave_val = block_shape[1] // wave_shape[1]
+    use_quartile_b_scale = n_per_wave_val % 32 != 0 and n_per_wave_val % 4 == 0
+
+    if use_quartile_b_scale:
+        # 4-quarter layout: tiles along N in blocks of n_per_wave, each block
+        # split into 4 quarters.  Each aligned DWORD holds one byte from each
+        # quarter at the same K position.  Works for any N_PER_WAVE divisible
+        # by 4 (not just multiples of 32).
+        n_quarter_val = n_per_wave_val // 4
+        tile_bytes_val = n_per_wave_val * 8
+
+        b_scale_flat = (
+            (n_s // n_per_wave_val) * ((K_SCALE_SHUFFLED // 8) * tile_bytes_val)
+            + (k_s // 8) * tile_bytes_val
+            + (k_s % 8) * n_per_wave_val
+            + ((n_s % n_per_wave_val) % n_quarter_val) * 4
+            + ((n_s % n_per_wave_val) // n_quarter_val)
+        )
+    else:
+        # Original 32-wide layout (e8m0_shuffle):
+        #   view(N//32, 2, 16, Ks//8, 2, 4).permute(0,3,5,2,4,1)
+        b_scale_flat = (
+            (n_s // 32) * ((K_SCALE_SHUFFLED // 8) * 256)
+            + (k_s // 8) * 256
+            + ((k_s % 8) % 4) * 64
+            + ((n_s % 32) % 16) * 4
+            + (((k_s % 8) // 4) * 2)
+            + ((n_s % 32) // 16)
+        )
 
     b_scale_mapping = tkw.IndexMapping(
         num_iterators=2,

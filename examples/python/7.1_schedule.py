@@ -36,6 +36,7 @@ from wave_lang.kernel.wave.utils.mxfp_utils import (
     torchScaledGemmMXFP4,
     b_preshuffle,
     e8m0_shuffle,
+    e8m0_shuffle_quartile,
 )
 from wave_lang.kernel.lang.global_symbols import (
     GLOBAL_ADDRESS_SPACE,
@@ -60,7 +61,8 @@ def _run_mxfp_gemm(gemm, shape):
 
 
 def _run_mxfp_gemm_preshuffle(
-    gemm, shape, all=False, only_scale=False, only_b=False, output_dtype=torch.float32
+    gemm, shape, all=False, only_scale=False, only_b=False, output_dtype=torch.float32,
+    b_scale_n_per_wave=None,
 ):
     """Run compiled GEMM kernel with preshuffled B and B_scale, verify against reference.
 
@@ -68,6 +70,9 @@ def _run_mxfp_gemm_preshuffle(
       all        - shuffle a_scale (x_scales), b_scale (w_scales), and b (w_t)
       only_scale - shuffle a_scale (x_scales) and b_scale (w_scales) only
       only_b     - shuffle b_scale (w_scales) only
+
+    When b_scale_n_per_wave is set, the 4-quarter layout
+    (e8m0_shuffle_quartile) is used for b_scale instead of e8m0_shuffle.
     """
     x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(shape)
     torch_out = torchScaledGemmMXFP4(x, w, x_scales, w_scales)
@@ -81,7 +86,13 @@ def _run_mxfp_gemm_preshuffle(
     x_scales_ps = e8m0_shuffle(x_scales) if (all or only_scale) else x_scales
 
     # Apply b_scale shuffle when all=True, only_scale=True, or only_b=True
-    w_scales_ps = e8m0_shuffle(w_scales) if (all or only_scale or only_b) else w_scales
+    if all or only_scale or only_b:
+        if b_scale_n_per_wave is not None:
+            w_scales_ps = e8m0_shuffle_quartile(w_scales, b_scale_n_per_wave)
+        else:
+            w_scales_ps = e8m0_shuffle(w_scales)
+    else:
+        w_scales_ps = w_scales
 
     x, w_t_ps = x.cuda(), w_t_ps.cuda()
     x_scales_ps, w_scales_ps = x_scales_ps.cuda(), w_scales_ps.cuda()
@@ -430,7 +441,13 @@ def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm_asm(
     eliminate_epilogue=True,
 ):
     """Preshuffle-B MXFP4 GEMM with dynamic M, N, K."""
-    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(shape, block, wave_shape=(2, 2), reorder_workgroups=True)
+    wave_shape = (2, 2)
+    n_per_wave = block[1] // wave_shape[1]
+    use_quartile = n_per_wave % 32 != 0 and n_per_wave % 4 == 0
+
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
+        shape, block, wave_shape=wave_shape, reorder_workgroups=True,
+    )
     # Make M, N, K dynamic so the compiler does not specialize on problem size.
     dynamic_symbols = [tkl.sym.M, tkl.sym.N, tkl.sym.K]
     for sym in dynamic_symbols:
@@ -451,7 +468,10 @@ def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm_asm(
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm, schedule)
 
-    _run_mxfp_gemm_preshuffle(gemm, shape, all=True)
+    _run_mxfp_gemm_preshuffle(
+        gemm, shape, all=True,
+        b_scale_n_per_wave=n_per_wave if use_quartile else None,
+    )
     print("MXFP GEMM preshuffle-B 4-wave dynamic M, N, K (WaveASM backend) test passed!")
 
 

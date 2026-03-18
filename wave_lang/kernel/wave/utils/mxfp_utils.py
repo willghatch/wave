@@ -128,6 +128,47 @@ def e8m0_shuffle(scale: Tensor) -> Tensor:
     return padded.view(sm, sn)[:m, :n].contiguous()
 
 
+def e8m0_shuffle_quartile(scale: Tensor, n_per_wave: int) -> Tensor:
+    """Shuffle e8m0 scale tensor using 4-quarter layout.
+
+    Tiles along the first dimension (N) in blocks of n_per_wave, splitting
+    each block into 4 quarters.  Each aligned DWORD in the output contains
+    one byte from each quarter at the same K-scale position, enabling the
+    compiler to merge 4 scalar byte loads into a single dword load.
+
+    Use this instead of e8m0_shuffle when N_PER_WAVE (= BLOCK_N / waves_N)
+    is not divisible by 32 but is divisible by 4.
+
+    The returned tensor may be larger than the input along N (padded to a
+    multiple of n_per_wave).  This is necessary because the quartile layout
+    scatters elements across the tile's full row range; slicing back would
+    discard valid data when N is not a multiple of n_per_wave.
+
+    Args:
+        scale: [N, K_scale] uint8 scale tensor (K_scale = K // 32).
+        n_per_wave: Number of N-elements per wave (must be divisible by 4).
+
+    Returns:
+        Shuffled tensor of shape [sn, sk] where sn >= N, sk >= K_scale.
+    """
+    assert n_per_wave % 4 == 0, f"n_per_wave={n_per_wave} must be divisible by 4"
+    n_quarter = n_per_wave // 4
+    N, K_scale = scale.shape
+
+    sn = ((N + n_per_wave - 1) // n_per_wave) * n_per_wave
+    sk = ((K_scale + 7) // 8) * 8
+
+    padded = torch.zeros(sn, sk, dtype=scale.dtype, device=scale.device)
+    padded[:N, :K_scale] = scale
+
+    # [n_tile, n_quarter_idx, n_pos, k_tile, k_in_tile]
+    padded = padded.view(sn // n_per_wave, 4, n_quarter, sk // 8, 8)
+    # -> [n_tile, k_tile, k_in_tile, n_pos, n_quarter_idx]
+    padded = padded.permute(0, 3, 4, 2, 1).contiguous()
+
+    return padded.view(sn, sk)
+
+
 def torchScaledGemmMXFP4(
     x: Tensor, w: Tensor, x_scales: Tensor, w_scales: Tensor
 ) -> Tensor:
