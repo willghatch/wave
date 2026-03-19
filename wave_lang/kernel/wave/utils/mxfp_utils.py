@@ -128,45 +128,56 @@ def e8m0_shuffle(scale: Tensor) -> Tensor:
     return padded.view(sm, sn)[:m, :n].contiguous()
 
 
-def e8m0_shuffle_quartile(scale: Tensor, n_per_wave: int) -> Tensor:
-    """Shuffle e8m0 scale tensor using 4-quarter layout.
+def e8m0_shuffle_tiled(scale: Tensor, n_per_wave: int) -> Tensor:
+    """Shuffle e8m0 scale tensor with wave-aligned 32-wide layout.
 
-    Tiles along the first dimension (N) in blocks of n_per_wave, splitting
-    each block into 4 quarters.  Each aligned DWORD in the output contains
-    one byte from each quarter at the same K-scale position, enabling the
-    compiler to merge 4 scalar byte loads into a single dword load.
+    Tiles along the first dimension (N) in blocks of n_per_wave, pads
+    each tile to the next multiple of 32, then applies the standard
+    32-wide e8m0_shuffle within each padded tile.  This ensures every
+    wave's scale reads are within its own tile, so the merge pass can
+    form DWORDs regardless of N_PER_WAVE alignment.
 
-    Use this instead of e8m0_shuffle when N_PER_WAVE (= BLOCK_N / waves_N)
-    is not divisible by 32 but is divisible by 4.
-
-    The returned tensor may be larger than the input along N (padded to a
-    multiple of n_per_wave).  This is necessary because the quartile layout
-    scatters elements across the tile's full row range; slicing back would
-    discard valid data when N is not a multiple of n_per_wave.
+    Use this instead of e8m0_shuffle when N_PER_WAVE is not a multiple
+    of 32.  When N_PER_WAVE is already a multiple of 32 the result is
+    identical to e8m0_shuffle (the padding is a no-op).
 
     Args:
         scale: [N, K_scale] uint8 scale tensor (K_scale = K // 32).
-        n_per_wave: Number of N-elements per wave (must be divisible by 4).
+        n_per_wave: Number of N-elements per wave (must be > 0).
 
     Returns:
-        Shuffled tensor of shape [sn, sk] where sn >= N, sk >= K_scale.
+        Shuffled tensor of shape [B_SCALE_N, sk] where
+        B_SCALE_N = ceil(N/n_per_wave) * ceil32(n_per_wave),
+        sk = ceil8(K_scale).
     """
-    assert n_per_wave % 4 == 0, f"n_per_wave={n_per_wave} must be divisible by 4"
-    n_quarter = n_per_wave // 4
+    assert n_per_wave > 0
     N, K_scale = scale.shape
-
-    sn = ((N + n_per_wave - 1) // n_per_wave) * n_per_wave
+    npw_padded = ((n_per_wave + 31) // 32) * 32
     sk = ((K_scale + 7) // 8) * 8
+    n_tiles = (N + n_per_wave - 1) // n_per_wave
+    sn = n_tiles * n_per_wave
 
     padded = torch.zeros(sn, sk, dtype=scale.dtype, device=scale.device)
     padded[:N, :K_scale] = scale
 
-    # [n_tile, n_quarter_idx, n_pos, k_tile, k_in_tile]
-    padded = padded.view(sn // n_per_wave, 4, n_quarter, sk // 8, 8)
-    # -> [n_tile, k_tile, k_in_tile, n_pos, n_quarter_idx]
-    padded = padded.permute(0, 3, 4, 2, 1).contiguous()
+    tiles = padded.view(n_tiles, n_per_wave, sk)
 
-    return padded.view(sn, sk)
+    if npw_padded > n_per_wave:
+        pad = torch.zeros(
+            n_tiles, npw_padded - n_per_wave, sk,
+            dtype=scale.dtype, device=scale.device,
+        )
+        tiles = torch.cat([tiles, pad], dim=1)
+
+    # Apply standard 32-wide shuffle within each padded tile:
+    #   view(n_sub32, 2, 16, sk//8, 2, 4).permute(0, 3, 5, 2, 4, 1)
+    # with an extra leading n_tiles dimension.
+    tiles = tiles.view(
+        n_tiles, npw_padded // 32, 2, 16, sk // 8, 2, 4
+    )
+    tiles = tiles.permute(0, 1, 4, 6, 3, 5, 2).contiguous()
+
+    return tiles.view(n_tiles * npw_padded, sk)
 
 
 def torchScaledGemmMXFP4(

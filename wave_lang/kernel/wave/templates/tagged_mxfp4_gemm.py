@@ -499,22 +499,29 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
     n_s = tkw.IndexMapping.iterator(1)
 
     n_per_wave_val = block_shape[1] // wave_shape[1]
-    use_quartile_b_scale = n_per_wave_val % 32 != 0 and n_per_wave_val % 4 == 0
+    use_tiled_b_scale = n_per_wave_val % 32 != 0
 
-    if use_quartile_b_scale:
-        # 4-quarter layout: tiles along N in blocks of n_per_wave, each block
-        # split into 4 quarters.  Each aligned DWORD holds one byte from each
-        # quarter at the same K position.  Works for any N_PER_WAVE divisible
-        # by 4 (not just multiples of 32).
-        n_quarter_val = n_per_wave_val // 4
-        tile_bytes_val = n_per_wave_val * 8
+    B_SCALE_N = tkl.sym.B_SCALE_N
+
+    if use_tiled_b_scale:
+        # Wave-aligned 32-wide layout: tile by n_per_wave, pad each tile to
+        # the next multiple of 32, then apply the standard 32-wide shuffle
+        # within each padded tile.  This ensures every wave's reads land in
+        # its own tile so the merge pass can form DWORDs.
+        npw_padded_val = ((n_per_wave_val + 31) // 32) * 32
+        n_sub32_val = npw_padded_val // 32
+
+        n_tile = n_s // n_per_wave_val
+        n_local = n_s % n_per_wave_val
 
         b_scale_flat = (
-            (n_s // n_per_wave_val) * ((K_SCALE_SHUFFLED // 8) * tile_bytes_val)
-            + (k_s // 8) * tile_bytes_val
-            + (k_s % 8) * n_per_wave_val
-            + ((n_s % n_per_wave_val) % n_quarter_val) * 4
-            + ((n_s % n_per_wave_val) // n_quarter_val)
+            (n_tile * n_sub32_val + n_local // 32)
+            * ((K_SCALE_SHUFFLED // 8) * 256)
+            + (k_s // 8) * 256
+            + ((k_s % 8) % 4) * 64
+            + (n_local % 16) * 4
+            + (((k_s % 8) // 4) * 2)
+            + ((n_local // 16) % 2)
         )
     else:
         # Original 32-wide layout (e8m0_shuffle):
@@ -531,7 +538,7 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
     b_scale_mapping = tkw.IndexMapping(
         num_iterators=2,
         inputs={
-            N: b_scale_flat // K_SCALE_SHUFFLED,
+            B_SCALE_N: b_scale_flat // K_SCALE_SHUFFLED,
             K: b_scale_flat % K_SCALE_SHUFFLED,
         },
         outputs={K: k_s, N: n_s},
@@ -542,7 +549,7 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
         a: tkl.Memory[M, K / 2, A_ADDRESS_SPACE, tkl.i8],
         a_scale: tkl.Memory[M, K / 32, A_ADDRESS_SPACE, tkl.i8],
         b: tkl.Memory[N, K / 2, GLOBAL_ADDRESS_SPACE, tkl.i8],
-        b_scale: tkl.Memory[N, K / 32, GLOBAL_ADDRESS_SPACE, tkl.i8],
+        b_scale: tkl.Memory[B_SCALE_N, K / 32, GLOBAL_ADDRESS_SPACE, tkl.i8],
         c: tkl.Memory[M, N, C_ADDRESS_SPACE, output_dtype],
     ):
         c_reg = tkl.Register[M, N, tkl.f32](0.0)
@@ -568,6 +575,13 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
             repeat = tkw.cast(repeat, tkl.bf16)
         tkw.write(repeat, c)
 
+    if use_tiled_b_scale:
+        npw_padded = ((n_per_wave_val + 31) // 32) * 32
+        n_tiles = (shape[1] + n_per_wave_val - 1) // n_per_wave_val
+        b_scale_n_val = n_tiles * npw_padded
+    else:
+        b_scale_n_val = shape[1]
+
     hyperparams = {
         A_ADDRESS_SPACE: a_address_space,
         C_ADDRESS_SPACE: GLOBAL_ADDRESS_SPACE,
@@ -580,6 +594,7 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
         K: shape[2],
         K_PACKED: K // 2,
         K_SCALE_SHUFFLED: (((K // 32) + 7) // 8) * 8,
+        B_SCALE_N: b_scale_n_val,
     }
     hyperparams.update(get_default_scheduling_params())
 

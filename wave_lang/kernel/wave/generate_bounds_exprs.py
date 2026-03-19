@@ -13,6 +13,7 @@ from .constraints import Constraint, DistributionConstraint, ReorderingConstrain
 from .utils.general_utils import (
     find_index_bounds,
     get_hardware_constraint,
+    infer_dim,
     is_shared_mem_access,
     remove_global_indexing,
 )
@@ -119,6 +120,23 @@ def generate_bounds_exprs(
                 for k, v in bounds.items()
                 if subs_idxc(v % (vector_shapes[k] or 1)) != 0
             }
+
+        # For mapped reads whose physical memory doesn't include a bound
+        # dimension, that bound is unreachable: the mapping routes all
+        # logical indices to physical coordinates within the (potentially
+        # padded) buffer.  Keeping such bounds would block the merge pass
+        # from forming wider loads, because the mask verifier can't find
+        # the bound dimension in the transformed physical index.
+        if (
+            bounds
+            and isinstance(node, Read)
+            and node.mapping is not None
+            and not node.has_identity_mapping()
+            and not is_shared_mem
+        ):
+            mem_dims = {infer_dim(d) for d in node.memory_type.symbolic_shape}
+            bounds = {k: v for k, v in bounds.items() if k in mem_dims}
+            bounds = bounds or None
 
         if not bounds:
             continue
