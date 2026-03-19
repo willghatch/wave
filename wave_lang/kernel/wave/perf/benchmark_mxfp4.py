@@ -53,7 +53,10 @@ from wave_lang.kernel.wave.perf.utils import (
     parse_rocprof_kernel_stats,
 )
 
-PRESHUFFLE_B_WAVE_SHAPE = (2, 2)
+PRESHUFFLE_B_WAVE_SHAPES = {
+    "asm": (2, 2),
+    "llvm": (1, 4),
+}
 
 # ---------------------------------------------------------------------------
 # Wave kernel template and compile options
@@ -64,9 +67,10 @@ def get_mxfp4_gemm_wave(
     shape: tuple[int, int, int],
     macrotiles: tuple[int, int, int],
     preshuffle_b: bool = False,
+    backend: str = "asm",
 ):
     if preshuffle_b:
-        wave_shape = PRESHUFFLE_B_WAVE_SHAPE
+        wave_shape = PRESHUFFLE_B_WAVE_SHAPES[backend]
         n_per_wave = macrotiles[1] // wave_shape[1]
         use_tiled = n_per_wave % 32 != 0
 
@@ -82,8 +86,9 @@ def get_mxfp4_gemm_wave(
             del options.subs[sym]
         options.dynamic_symbols = dynamic_symbols
         options.use_buffer_ops = True
-        options.backend = "asm"
-        options.use_wave_asm_backend = True
+        options.backend = backend
+        if backend == "asm":
+            options.use_wave_asm_backend = True
         options.wave_runtime = True
         options.eliminate_epilogue = True
         schedule = get_mxfp4_asymmetric_schedule(
@@ -102,6 +107,7 @@ def _prepare_inputs(
     shape: tuple[int, int, int],
     macrotiles: tuple[int, int, int],
     preshuffle_b: bool = False,
+    backend: str = "asm",
 ):
     """Generate MXFP4 inputs and apply preshuffling when needed.
 
@@ -131,7 +137,8 @@ def _prepare_inputs(
 
     x_scale_ps = e8m0_shuffle(x_scale)
 
-    n_per_wave = block_n // PRESHUFFLE_B_WAVE_SHAPE[1]
+    wave_shape = PRESHUFFLE_B_WAVE_SHAPES[backend]
+    n_per_wave = block_n // wave_shape[1]
     if n_per_wave % 32 != 0:
         effective_n = ((n + block_n - 1) // block_n) * block_n
         w_scale_ps = e8m0_shuffle_tiled(w_scale, n_per_wave, effective_n)
@@ -228,10 +235,11 @@ def run_worker(
     warmup_iters: int = 0,
     benchmark_iters: int = 1,
     preshuffle_b: bool = False,
+    backend: str = "asm",
 ) -> None:
     """Worker entry: compile GEMM with wave_runtime, run torch benchmark, print MEAN_US to stdout."""
-    gemm_rt = get_mxfp4_gemm_wave(shape, macrotiles, preshuffle_b=preshuffle_b)
-    inputs, _ = _prepare_inputs(shape, macrotiles, preshuffle_b=preshuffle_b)
+    gemm_rt = get_mxfp4_gemm_wave(shape, macrotiles, preshuffle_b=preshuffle_b, backend=backend)
+    inputs, _ = _prepare_inputs(shape, macrotiles, preshuffle_b=preshuffle_b, backend=backend)
 
     mean_us = _run_torch_benchmark(
         gemm_rt, inputs, warmup_iters=warmup_iters, benchmark_iters=benchmark_iters
@@ -244,6 +252,7 @@ def validate_mxfp4_gemm(
     compiled_gemm,
     macrotiles: tuple[int, int, int] = None,
     preshuffle_b: bool = False,
+    backend: str = "asm",
 ) -> bool:
     """Run compiled Wave GEMM (with wave_runtime=True) and compare to torch reference."""
     m, n, k = shape
@@ -257,7 +266,7 @@ def validate_mxfp4_gemm(
 
         # Prepare (possibly preshuffled) inputs for the Wave kernel.
         inputs, n_actual = _prepare_inputs(
-            shape, macrotiles or (256, 256, 256), preshuffle_b=preshuffle_b
+            shape, macrotiles or (256, 256, 256), preshuffle_b=preshuffle_b, backend=backend
         )
         compiled_gemm(*inputs)
         wave_out = inputs[-1]
@@ -280,6 +289,7 @@ def benchmark_mxfp4_gemm_rocprof(
     warmup_iters: int = 0,
     benchmark_iters: int = 1,
     preshuffle_b: bool = False,
+    backend: str = "asm",
 ) -> float:
     """Run self as worker under rocprofv3 (torch benchmark); return mean runtime in microseconds.
 
@@ -311,6 +321,7 @@ def benchmark_mxfp4_gemm_rocprof(
     ]
     if preshuffle_b:
         worker_cmd.append("--_preshuffle_b")
+    worker_cmd.extend(["--backend", backend])
     full_cmd = profile_prefix + worker_cmd
     try:
         proc = subprocess.run(
@@ -359,6 +370,7 @@ def run_validate_and_benchmark(
     warmup_iters: int = 0,
     benchmark_iters: int = 1,
     preshuffle_b: bool = False,
+    backend: str = "asm",
 ) -> tuple[Optional[float], Optional[float], str]:
     """
     Compile with wave_runtime and validate; then benchmark via torch worker under rocprofv3.
@@ -371,7 +383,7 @@ def run_validate_and_benchmark(
 
     # Compile for validation (wave_runtime=True)
     try:
-        gemm_rt = get_mxfp4_gemm_wave(shape, macrotiles, preshuffle_b=preshuffle_b)
+        gemm_rt = get_mxfp4_gemm_wave(shape, macrotiles, preshuffle_b=preshuffle_b, backend=backend)
     except Exception as e:
         raise BenchmarkError(
             f"Compilation failed for shape {shape}: {e}", stage="compile_failed"
@@ -386,7 +398,7 @@ def run_validate_and_benchmark(
     # Validate numerics
     try:
         validate_mxfp4_gemm(
-            shape, gemm_rt, macrotiles=macrotiles, preshuffle_b=preshuffle_b
+            shape, gemm_rt, macrotiles=macrotiles, preshuffle_b=preshuffle_b, backend=backend
         )
     except Exception as e:
         raise BenchmarkError(
@@ -405,6 +417,7 @@ def run_validate_and_benchmark(
             warmup_iters=warmup_iters,
             benchmark_iters=benchmark_iters,
             preshuffle_b=preshuffle_b,
+            backend=backend,
         )
     except RuntimeError as e:
         raise BenchmarkError(str(e), stage="benchmark_failed") from e
@@ -492,6 +505,13 @@ def parse_args():
         help="Use preshuffle-B kernel variant with asymmetric schedule "
         "(for block sizes where N_PER_WAVE is not a multiple of 32)",
     )
+    p.add_argument(
+        "--backend",
+        type=str,
+        choices=["asm", "llvm"],
+        default="asm",
+        help="Compiler backend: 'asm' (waveasm) or 'llvm' (default: asm)",
+    )
     return p.parse_args()
 
 
@@ -575,6 +595,7 @@ def main():
             warmup_iters=args.warmup_iters,
             benchmark_iters=args.benchmark_iters,
             preshuffle_b=preshuffle_b,
+            backend=args.backend,
         )
         return
 
@@ -583,6 +604,7 @@ def main():
         sys.exit(1)
 
     preshuffle_b = args.preshuffle_b
+    backend = args.backend
     dump_dir = Path(args.dump_dir)
     dump_dir.mkdir(parents=True, exist_ok=True)
     run_id = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
@@ -590,7 +612,8 @@ def main():
     run_dump_dir.mkdir(parents=True, exist_ok=True)
     print(f"Dump directory for this run: {run_dump_dir}")
     if preshuffle_b:
-        print(f"Using preshuffle-B variant (wave_shape={PRESHUFFLE_B_WAVE_SHAPE})")
+        ws = PRESHUFFLE_B_WAVE_SHAPES[backend]
+        print(f"Using preshuffle-B variant (backend={backend}, wave_shape={ws})")
     kernel_regex = args.kernel_regex
     warmup_iters = args.warmup_iters
     benchmark_iters = args.benchmark_iters
@@ -629,6 +652,7 @@ def main():
                 warmup_iters=warmup_iters,
                 benchmark_iters=benchmark_iters,
                 preshuffle_b=preshuffle_b,
+                backend=backend,
             )
         except BenchmarkError as e:
             print(f"  {e}", file=sys.stderr)
