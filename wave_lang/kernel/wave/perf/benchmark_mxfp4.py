@@ -59,14 +59,32 @@ PRESHUFFLE_B_WAVE_SHAPE = (2, 2)
 # ---------------------------------------------------------------------------
 
 
+def _pad_shape_for_preshuffle(
+    shape: tuple[int, int, int],
+    macrotiles: tuple[int, int, int],
+) -> tuple[int, int, int]:
+    """Round N up to the next multiple of block_n for preshuffle-B static compilation.
+
+    When N is not a multiple of block_n the B tensor must be padded so
+    partial-workgroup waves read valid memory.  The kernel must be
+    compiled with the padded N so buffer assertions pass.
+    """
+    m, n, k = shape
+    mt_n = macrotiles[1]
+    if n % mt_n != 0:
+        n = ((n + mt_n - 1) // mt_n) * mt_n
+    return (m, n, k)
+
+
 def get_mxfp4_gemm_wave(
     shape: tuple[int, int, int],
     macrotiles: tuple[int, int, int],
     preshuffle_b: bool = False,
 ):
     if preshuffle_b:
+        compile_shape = _pad_shape_for_preshuffle(shape, macrotiles)
         gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
-            shape, macrotiles,
+            compile_shape, macrotiles,
             wave_shape=PRESHUFFLE_B_WAVE_SHAPE,
             reorder_workgroups=True,
         )
