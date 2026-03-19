@@ -439,12 +439,17 @@ LogicalResult handleFatRawBufferCast(Operation *op, TranslationContext &ctx) {
       adj = ctx.getPendingSRDBaseAdjust(castOp2.getSource());
   }
 
-  // When adj exists AND the cast doesn't need non-max validBytes, emit
-  // the SRD adjustment eagerly.  The fat_raw_buffer_cast is typically
-  // outside any scf.for loop while the loads are inside; deferring to
-  // load-time would place the SRD init RawOps inside the loop body.
-  if (adj && !hasNonMaxValidBytes) {
-    Value srd = emitSRDBaseAdjustment(*adj, op->getResult(0), ctx, loc);
+  // When adj exists, emit the SRD adjustment eagerly.  When the MLIR
+  // specifies a tight validBytes (e.g. for output OOB store protection),
+  // propagate it as numRecordsOverride so emitSRDBaseAdjustment sets
+  // a tight NUM_RECORDS in the new SRD.
+  if (adj) {
+    auto adjCopy = *adj;
+    if (hasNonMaxValidBytes && validBytesVal) {
+      if (auto mapped = ctx.getMapper().getMapped(validBytesVal))
+        adjCopy.numRecordsOverride = *mapped;
+    }
+    Value srd = emitSRDBaseAdjustment(adjCopy, op->getResult(0), ctx, loc);
     ctx.getMapper().mapValue(op->getResult(0), srd);
     return success();
   }

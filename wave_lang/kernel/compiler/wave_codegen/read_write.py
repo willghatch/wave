@@ -495,25 +495,20 @@ def _compute_valid_bytes(
     hw_max = _valid_bytes_buffer(elem_type)
 
     if use_real_bounds:
+        index_type = IndexType.get()
         if total_bytes == hw_max and symbolic_shape is not None:
             elem_bytes = _elem_bytes(elem_type)
             total_bytes_expr = sympy.prod(s for s in symbolic_shape) * elem_bytes
             subs_map = add_emitter_subs(emitter)
-            total_val = arith_d.index_cast(
-                uint64, gen_sympy_index(subs_map, total_bytes_expr)
-            )
+            total_val_idx = gen_sympy_index(subs_map, total_bytes_expr)
         else:
-            total_val = arith_d.constant(
-                uint64, get_constant_attr(total_bytes, uint64)
-            )
+            total_val_idx = arith_d.constant(index_type, total_bytes)
         metadata = memref_d.extract_strided_metadata(ptr)
         offset_elements = metadata[1]
-        offset_bytes = arith_d.index_cast(uint64, offset_elements)
-        elem_bytes_val = arith_d.constant(
-            uint64, get_constant_attr(_elem_bytes(elem_type), uint64)
-        )
-        offset_bytes = arith_d.muli(offset_bytes, elem_bytes_val)
-        return arith_d.subi(total_val, offset_bytes)
+        elem_bytes_idx = arith_d.constant(index_type, _elem_bytes(elem_type))
+        offset_bytes_idx = arith_d.muli(offset_elements, elem_bytes_idx)
+        result_idx = arith_d.subi(total_val_idx, offset_bytes_idx)
+        return arith_d.index_cast(uint64, result_idx)
 
     return arith_d.constant(uint64, get_constant_attr(total_bytes, uint64))
 
@@ -671,7 +666,7 @@ def _create_vec_read_write(
                 _compute_valid_bytes(
                     mem,
                     element_type,
-                    symbolic_shape if is_read else None,
+                    symbolic_shape,
                     emitter,
                 ),
             )
@@ -726,7 +721,7 @@ def _create_vec_read_write(
             _compute_valid_bytes(
                 mem,
                 element_type,
-                symbolic_shape if is_read else None,
+                symbolic_shape,
                 emitter,
             ),
         )

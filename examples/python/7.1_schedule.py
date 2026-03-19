@@ -112,12 +112,18 @@ def _run_mxfp_gemm_preshuffle(
 
     x, w_t_ps = x.cuda(), w_t_ps.cuda()
     x_scales_ps, w_scales_ps = x_scales_ps.cuda(), w_scales_ps.cuda()
-    out = torch.zeros(x.shape[0], shape[1], dtype=output_dtype).cuda()
+
+    # Pad output columns to match padded B.  N is a dynamic symbol inferred
+    # from tensor shapes; B was padded to N_padded rows so the kernel sees
+    # N=N_padded.  The output must have the same N_padded columns or partial-
+    # workgroup stores will write past the allocation.
+    out_cols = w_t_ps.shape[0]
+    out = torch.zeros(x.shape[0], out_cols, dtype=output_dtype).cuda()
 
     gemm(x, x_scales_ps, w_t_ps, w_scales_ps, out)
 
     torch.testing.assert_close(
-        torch_out, out.cpu(), check_dtype=False, check_device=False
+        torch_out, out[:, :shape[1]].cpu(), check_dtype=False, check_device=False
     )
 
 
