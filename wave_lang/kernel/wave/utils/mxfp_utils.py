@@ -128,7 +128,7 @@ def e8m0_shuffle(scale: Tensor) -> Tensor:
     return padded.view(sm, sn)[:m, :n].contiguous()
 
 
-def e8m0_shuffle_tiled(scale: Tensor, n_per_wave: int) -> Tensor:
+def e8m0_shuffle_tiled(scale: Tensor, n_per_wave: int, effective_n: int = None) -> Tensor:
     """Shuffle e8m0 scale tensor with wave-aligned 32-wide layout.
 
     Tiles along the first dimension (N) in blocks of n_per_wave, pads
@@ -144,17 +144,23 @@ def e8m0_shuffle_tiled(scale: Tensor, n_per_wave: int) -> Tensor:
     Args:
         scale: [N, K_scale] uint8 scale tensor (K_scale = K // 32).
         n_per_wave: Number of N-elements per wave (must be > 0).
+        effective_n: Minimum N to cover when computing tile count.
+            Typically ceil(N / BLOCK_N) * BLOCK_N, to ensure all waves
+            in the (possibly partial) last workgroup have valid tiles.
+            Defaults to N (the tensor's first dimension).
 
     Returns:
         Shuffled tensor of shape [B_SCALE_N, sk] where
-        B_SCALE_N = ceil(N/n_per_wave) * ceil32(n_per_wave),
+        B_SCALE_N = ceil(effective_n/n_per_wave) * ceil32(n_per_wave),
         sk = ceil8(K_scale).
     """
     assert n_per_wave > 0
     N, K_scale = scale.shape
+    if effective_n is None:
+        effective_n = N
     npw_padded = ((n_per_wave + 31) // 32) * 32
     sk = ((K_scale + 7) // 8) * 8
-    n_tiles = (N + n_per_wave - 1) // n_per_wave
+    n_tiles = (effective_n + n_per_wave - 1) // n_per_wave
     sn = n_tiles * n_per_wave
 
     padded = torch.zeros(sn, sk, dtype=scale.dtype, device=scale.device)

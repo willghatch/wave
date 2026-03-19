@@ -8,11 +8,12 @@ module {
 
     // The scalarization pass rewrites extract[2](addi(broadcast(base),
     // dense<[10,11,12,13]>)) into scalar arith.addi(base, 12).
-    // The translator emits a single v_add_u32 with the constant 12.
+    // The translator emits a single s_add_u32 with the constant 12 (kernel
+    // args live in SGPRs after SRD setup).
     //
     // CHECK-LABEL: waveasm.program @scalarized_kernel
     // CHECK: waveasm.constant 12
-    // CHECK: waveasm.v_add_u32
+    // CHECK: waveasm.s_add_u32
     // CHECK: waveasm.s_endpgm
     gpu.func @scalarized_kernel(%base: i32) kernel {
       %bcast = vector.broadcast %base : i32 to vector<4xi32>

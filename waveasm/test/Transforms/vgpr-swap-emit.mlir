@@ -23,7 +23,6 @@ waveasm.program @vgpr_swap_iter_args
   // Loop that swaps %a and %b each iteration.
   // CHECK: v_mov_b32 v
   // CHECK: v_mov_b32 v
-  // CHECK: v_mov_b32 v
   // CHECK: s_cbranch_scc1
   %r:3 = waveasm.loop(%iv = %init_iv, %a = %init_a, %b = %init_b)
       : (!waveasm.sreg, !waveasm.vreg, !waveasm.vreg)

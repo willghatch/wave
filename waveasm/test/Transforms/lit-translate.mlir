@@ -4,13 +4,13 @@
 
 // CHECK-LABEL: waveasm.program @translate_arith
 func.func @translate_arith(%arg0: i32, %arg1: i32) -> i32 {
-  // CHECK: waveasm.v_add_u32
+  // CHECK: waveasm.s_add_u32
   %add = arith.addi %arg0, %arg1 : i32
 
-  // CHECK: waveasm.v_sub_u32
+  // CHECK: waveasm.s_sub_u32
   %sub = arith.subi %add, %arg1 : i32
 
-  // CHECK: waveasm.v_mul_lo_u32
+  // CHECK: waveasm.s_mul_i32
   %mul = arith.muli %sub, %arg0 : i32
 
   return %mul : i32
@@ -18,7 +18,7 @@ func.func @translate_arith(%arg0: i32, %arg1: i32) -> i32 {
 
 // CHECK-LABEL: waveasm.program @translate_bitwise
 func.func @translate_bitwise(%arg0: i32, %arg1: i32) -> i32 {
-  // CHECK: waveasm.v_and_b32
+  // CHECK: waveasm.s_and_b32
   %and = arith.andi %arg0, %arg1 : i32
 
   // CHECK: waveasm.v_or_b32
@@ -32,10 +32,10 @@ func.func @translate_bitwise(%arg0: i32, %arg1: i32) -> i32 {
 
 // CHECK-LABEL: waveasm.program @translate_shifts
 func.func @translate_shifts(%arg0: i32, %arg1: i32) -> i32 {
-  // CHECK: waveasm.v_lshlrev_b32
+  // CHECK: waveasm.s_lshl_b32
   %shl = arith.shli %arg0, %arg1 : i32
 
-  // CHECK: waveasm.v_lshrrev_b32
+  // CHECK: waveasm.s_lshr_b32
   %shr = arith.shrui %shl, %arg1 : i32
 
   // CHECK: waveasm.v_ashrrev_i32

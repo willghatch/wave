@@ -20,12 +20,12 @@ func.func @div_power_of_2(%arg0: i32) -> i32 {
 func.func @div_by_7(%arg0: i32) -> i32 {
   // div by 7: magic = 0x24924925, shift = 2, needsAdd = true
   // Expect: mul_hi -> sub -> lshrrev(1) -> add -> lshrrev(shift)
-  // CHECK: waveasm.v_mul_hi_u32
-  // CHECK: waveasm.v_sub_u32
-  // CHECK: waveasm.v_lshrrev_b32
-  // CHECK: waveasm.v_add_u32
+  // CHECK: waveasm.s_mul_hi_u32
+  // CHECK: waveasm.s_sub_u32
+  // CHECK: waveasm.s_lshr_b32
+  // CHECK: waveasm.s_add_u32
   // CHECK: [[SHIFT:%[^ ]+]] = waveasm.constant 2
-  // CHECK: waveasm.v_lshrrev_b32 [[SHIFT]],
+  // CHECK: waveasm.s_lshr_b32 %{{.*}}, [[SHIFT]]
   %c7 = arith.constant 7 : i32
   %div = arith.divui %arg0, %c7 : i32
   return %div : i32
@@ -36,8 +36,8 @@ func.func @div_by_7(%arg0: i32) -> i32 {
 func.func @div_by_3(%arg0: i32) -> i32 {
   // div by 3: magic = 0xAAAAAAAB, shift = 1, needsAdd = false
   // Expect: mul_hi -> lshrrev(1)
-  // CHECK: waveasm.v_mul_hi_u32
-  // CHECK: waveasm.v_lshrrev_b32
+  // CHECK: waveasm.s_mul_hi_u32
+  // CHECK: waveasm.s_lshr_b32
   %c3 = arith.constant 3 : i32
   %div = arith.divui %arg0, %c3 : i32
   return %div : i32
@@ -59,8 +59,8 @@ func.func @mod_power_of_2(%arg0: i32) -> i32 {
 func.func @mod_by_5(%arg0: i32) -> i32 {
   // rem by 5 = x - floordiv(x, 5) * 5
   // Expect: mul_hi (magic), lshrrev (shift), mul_lo (q*5), sub (x - q*5)
-  // CHECK: waveasm.v_mul_hi_u32
-  // CHECK: waveasm.v_lshrrev_b32
+  // CHECK: waveasm.s_mul_hi_u32
+  // CHECK: waveasm.s_lshr_b32
   // CHECK: waveasm.v_mul_lo_u32
   // CHECK: waveasm.v_sub_u32
   %c5 = arith.constant 5 : i32

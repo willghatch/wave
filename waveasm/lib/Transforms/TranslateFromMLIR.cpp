@@ -350,6 +350,12 @@ void TranslationContext::emitSRDPrologue() {
                                  ", 0x" + llvm::utohexstr(kSRDStrideSwizzle);
       RawOp::create(builder, loc, movStrideStr);
 
+      // Keep srdReg alive through canonicalize/DCE so its physical registers
+      // remain in the reserved set for the linear scan allocator.
+      // handleFatRawBufferCast reads these registers via RawOps that are
+      // invisible to SSA liveness analysis.
+      DCEProtectOp::create(builder, loc, srdReg);
+
       mapper.mapValue(pending.memref, srdReg);
     }
 
@@ -448,6 +454,8 @@ void TranslationContext::emitSRDPrologue() {
       std::string movStrideStr = "s_mov_b32 s" + std::to_string(srdBase + 3) +
                                  ", 0x" + llvm::utohexstr(kSRDStrideSwizzle);
       RawOp::create(builder, loc, movStrideStr);
+
+      DCEProtectOp::create(builder, loc, srdReg);
 
       mapper.mapValue(pending.memref, srdReg);
     }

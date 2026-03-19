@@ -25,6 +25,7 @@ module {
       // Else branch: yield a constant zero (-> immediate)
       // Backend must coerce the else-yield immediate to VGPR.
       //
+      // CHECK:      waveasm.v_readfirstlane_b32
       // CHECK:      waveasm.if
       // CHECK:        waveasm.v_add_u32
       // CHECK:        waveasm.yield {{.*}} : !waveasm.vreg

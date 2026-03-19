@@ -577,7 +577,11 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
 
     if use_tiled_b_scale:
         npw_padded = ((n_per_wave_val + 31) // 32) * 32
-        n_tiles = (shape[1] + n_per_wave_val - 1) // n_per_wave_val
+        # Round N up to full workgroups so the buffer covers all waves in
+        # the (possibly partial) last workgroup.  Without this, waves whose
+        # n_s exceeds N would compute tile indices beyond the allocation.
+        effective_n = ((shape[1] + block_shape[1] - 1) // block_shape[1]) * block_shape[1]
+        n_tiles = effective_n // n_per_wave_val
         b_scale_n_val = n_tiles * npw_padded
     else:
         b_scale_n_val = shape[1]

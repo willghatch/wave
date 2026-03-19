@@ -339,6 +339,11 @@ IfOp RegionBuilder::buildIfFromSCFIf(scf::IfOp ifOp) {
   if (isa<ImmType>(conditionValue.getType())) {
     auto sregType = ctx.createSRegType();
     conditionValue = S_MOV_B32::create(builder, loc, sregType, conditionValue);
+  } else if (isa<VRegType>(conditionValue.getType())) {
+    // waveasm.if requires an SGPR condition; VALU compares live in VGPRs.
+    auto sregType = ctx.createSRegType();
+    conditionValue =
+        V_READFIRSTLANE_B32::create(builder, loc, sregType, conditionValue);
   }
 
   // Infer result types by peeking at what the then region will yield

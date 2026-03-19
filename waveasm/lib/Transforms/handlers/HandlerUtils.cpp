@@ -62,14 +62,18 @@ int64_t getElementBytes(Type type) {
 //===----------------------------------------------------------------------===//
 
 int64_t computeBufferSizeFromMemRef(MemRefType memrefType) {
-  // Use (1 << 31) - 2 = 0x7FFFFFFE as num_records. The Wave Python frontend
-  // emits OOB sentinel index values at (valid_bytes + elem_bytes) / elem_bytes
-  // which lands at byte offset 0x7FFFFFFF. With num_records = 0x7FFFFFFE the
-  // sentinel is one byte past the SRD range, so hardware returns 0 for OOB
-  // lanes. Using 0xFFFFFFFF would make the sentinel "in bounds" and cause a
-  // real access to unmapped memory, triggering HSA page faults.
-  (void)memrefType;
-  return 0x7FFFFFFE;
+  // The Wave Python frontend computes an OOB sentinel element index as
+  //   (valid_bytes + elem_bytes) / elem_bytes
+  // where valid_bytes = (1 << 31) - 1 - elem_bytes.  The sentinel's byte
+  // offset is sentinel_idx * elem_bytes which simplifies to
+  //   ((valid_bytes + elem_bytes) / elem_bytes) * elem_bytes
+  // For f32 (elem_bytes=4) the sentinel byte offset = 0x7FFFFFFC.
+  // NUM_RECORDS must be <= sentinel_byte_offset so hardware treats the
+  // sentinel as OOB (returning 0 for loads, dropping stores).
+  // Using 0x7FFFFFFE for all types breaks f32: 0x7FFFFFFC < 0x7FFFFFFE
+  // so the sentinel is "in bounds" and the hardware executes the access.
+  int64_t elemBytes = getElementBytes(memrefType.getElementType());
+  return (1LL << 31) - 1 - elemBytes;
 }
 
 //===----------------------------------------------------------------------===//

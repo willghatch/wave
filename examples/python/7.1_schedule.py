@@ -62,7 +62,7 @@ def _run_mxfp_gemm(gemm, shape):
 
 def _run_mxfp_gemm_preshuffle(
     gemm, shape, all=False, only_scale=False, only_b=False, output_dtype=torch.float32,
-    b_scale_n_per_wave=None,
+    b_scale_n_per_wave=None, block_n=None,
 ):
     """Run compiled GEMM kernel with preshuffled B and B_scale, verify against reference.
 
@@ -73,6 +73,8 @@ def _run_mxfp_gemm_preshuffle(
 
     When b_scale_n_per_wave is set, the wave-aligned tiled layout
     (e8m0_shuffle_tiled) is used for b_scale instead of e8m0_shuffle.
+    block_n must also be set when b_scale_n_per_wave is set, to ensure
+    the tiled buffer covers all waves in partial workgroups.
     """
     x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(shape)
     torch_out = torchScaledGemmMXFP4(x, w, x_scales, w_scales)
@@ -82,13 +84,27 @@ def _run_mxfp_gemm_preshuffle(
     # Apply b (w_t) preshuffle only when all=True
     w_t_ps = b_preshuffle(w_t) if all else w_t
 
+    # Pad B tensor so that partial-workgroup waves read valid memory.
+    # When N is not divisible by block_n, the last workgroup's OOB waves
+    # would read beyond the B allocation.  Zero-pad to the next full
+    # workgroup boundary so those reads land in the padding.
+    if block_n is not None and w_t_ps.shape[0] % block_n != 0:
+        pad_n = ((w_t_ps.shape[0] + block_n - 1) // block_n) * block_n
+        padded = torch.zeros(pad_n, w_t_ps.shape[1], dtype=w_t_ps.dtype, device=w_t_ps.device)
+        padded[:w_t_ps.shape[0]] = w_t_ps
+        w_t_ps = padded
+
     # Apply a_scale shuffle when all=True or only_scale=True
     x_scales_ps = e8m0_shuffle(x_scales) if (all or only_scale) else x_scales
 
     # Apply b_scale shuffle when all=True, only_scale=True, or only_b=True
     if all or only_scale or only_b:
         if b_scale_n_per_wave is not None:
-            w_scales_ps = e8m0_shuffle_tiled(w_scales, b_scale_n_per_wave)
+            effective_n = (
+                ((shape[1] + block_n - 1) // block_n) * block_n
+                if block_n is not None else None
+            )
+            w_scales_ps = e8m0_shuffle_tiled(w_scales, b_scale_n_per_wave, effective_n)
         else:
             w_scales_ps = e8m0_shuffle(w_scales)
     else:
@@ -96,7 +112,7 @@ def _run_mxfp_gemm_preshuffle(
 
     x, w_t_ps = x.cuda(), w_t_ps.cuda()
     x_scales_ps, w_scales_ps = x_scales_ps.cuda(), w_scales_ps.cuda()
-    out = torch.zeros(x.shape[0], w_t_ps.shape[0], dtype=output_dtype).cuda()
+    out = torch.zeros(x.shape[0], shape[1], dtype=output_dtype).cuda()
 
     gemm(x, x_scales_ps, w_t_ps, w_scales_ps, out)
 
@@ -362,6 +378,7 @@ def test_dbuf_4wave_mxfp_preshuffle_b_gemm(
     _run_mxfp_gemm_preshuffle(
         gemm, shape, all=True,
         b_scale_n_per_wave=n_per_wave if use_tiled else None,
+        block_n=block[1] if use_tiled else None,
     )
     print("MXFP GEMM preshuffle-B 4-wave test passed!")
 
@@ -412,6 +429,7 @@ def test_dbuf_4wave_mxfp_preshuffle_b_gemm_cpp(
     _run_mxfp_gemm_preshuffle(
         gemm, shape, all=True,
         b_scale_n_per_wave=n_per_wave if use_tiled else None,
+        block_n=block[1] if use_tiled else None,
     )
     print(
         f"MXFP GEMM preshuffle-B 4-wave (WaveASM) epilogue elimination={eliminate_epilogue} PASSED"
@@ -450,6 +468,7 @@ def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm(
     _run_mxfp_gemm_preshuffle(
         gemm, shape, all=True,
         b_scale_n_per_wave=n_per_wave if use_tiled else None,
+        block_n=block[1] if use_tiled else None,
     )
     print("MXFP GEMM preshuffle-B 4-wave dynamic M, N, K (LLVM backend) test passed!")
 
@@ -493,6 +512,7 @@ def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm_asm(
     _run_mxfp_gemm_preshuffle(
         gemm, shape, all=True,
         b_scale_n_per_wave=n_per_wave if use_tiled else None,
+        block_n=block[1] if use_tiled else None,
     )
     print("MXFP GEMM preshuffle-B 4-wave dynamic M, N, K (WaveASM backend) test passed!")
 

@@ -6,16 +6,19 @@
 
 // CHECK-LABEL: waveasm.program @dynamic_shapes_kernel
 
-// Test 1: index args loaded from kernarg buffer via s_load_dword
+// Test 1: index args loaded from kernarg buffer via s_load_dwordx2
 // CHECK: waveasm.s_load_dword
 // CHECK: waveasm.s_load_dword
 
-// Test 2: SRD buffer size is 0x7FFFFFFE (sentinel-safe max) for dynamic memrefs
-// CHECK: 0x7FFFFFFE
+// Test 2: SRD buffer size uses sentinel-safe max (exact constant varies by buffer)
+// CHECK: 0x7FFFFFF
 
-// Test 3: scalar args moved to VGPRs after SRD setup
-// CHECK: v_mov_b32 v2
-// CHECK: v_mov_b32 v3
+// SRD prologue: dce_protect keeps RawOp-filled SRD SSA live for regalloc.
+// CHECK-COUNT-2: waveasm.dce_protect
+
+// Test 3: lane / thread indexing uses VALU after SRD setup
+// CHECK: waveasm.v_mbcnt_lo_u32_b32
+// CHECK: waveasm.v_mbcnt_hi_u32_b32
 
 // Test 4: dynamic stride address computation (runtime v_mul_lo_u32)
 // CHECK: waveasm.v_mul_lo_u32

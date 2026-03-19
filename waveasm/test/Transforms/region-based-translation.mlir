@@ -68,6 +68,7 @@ module {
       %cond_i32 = arith.cmpi slt, %arg0, %c10 : i32
       %cond_ext = arith.extui %cond_i32 : i1 to i32
 
+      // CHECK:      waveasm.v_readfirstlane_b32
       // CHECK:      %{{.*}} = waveasm.if %{{.*}} : !waveasm.sreg -> !waveasm.vreg {
       %result = scf.if %cond_i32 -> i32 {
         // CHECK:      waveasm.v_add_u32
@@ -100,7 +101,7 @@ module {
         // CHECK:      %{{.*}} = waveasm.loop (%[[II:.*]] = %{{.*}}) : (!waveasm.sreg) -> !waveasm.sreg {
         scf.for %j = %c0 to %c8 step %c1 {
           // Body uses both outer and inner IVs
-          // CHECK:      waveasm.v_add_u32 %[[OI]], %[[II]] : !waveasm.sreg, !waveasm.sreg -> !waveasm.vreg
+          // CHECK:      waveasm.s_add_u32 %[[OI]], %[[II]] : !waveasm.sreg, !waveasm.sreg -> !waveasm.sreg, !waveasm.sreg
           %sum = arith.addi %i, %j : index
         }
         // Inner condition

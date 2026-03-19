@@ -5,7 +5,7 @@
 // CHECK-LABEL: waveasm.program @test_complex_arith
 func.func @test_complex_arith(%arg0: i32, %arg1: i32) -> i32 {
   // Test shift operations
-  // CHECK: waveasm.v_lshlrev_b32
+  // CHECK: waveasm.s_lshl_b32
   %c3 = arith.constant 3 : i32
   %shl = arith.shli %arg0, %c3 : i32
 
@@ -41,11 +41,11 @@ func.func @test_index_computation(%arg0: index, %arg1: index) -> index {
 // CHECK-LABEL: waveasm.program @test_type_conversions
 func.func @test_type_conversions(%arg0: i32, %arg1: i32) -> i32 {
   // Test basic i32 operations with bitwise ops
-  // CHECK: waveasm.v_and_b32
+  // CHECK: waveasm.s_and_b32
   %mask = arith.constant 65535 : i32
   %masked = arith.andi %arg0, %mask : i32
 
-  // CHECK: waveasm.v_add_u32
+  // CHECK: waveasm.s_add_u32
   %result = arith.addi %masked, %arg1 : i32
   return %result : i32
 }
