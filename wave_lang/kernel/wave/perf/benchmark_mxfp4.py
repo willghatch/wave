@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+import wave_lang.kernel.lang as tkl
 from wave_lang.kernel.wave.compile import wave_compile
 from wave_lang.kernel.wave.schedules import (
     get_mxfp4_dbuf_schedule,
@@ -59,36 +60,31 @@ PRESHUFFLE_B_WAVE_SHAPE = (2, 2)
 # ---------------------------------------------------------------------------
 
 
-def _pad_shape_for_preshuffle(
-    shape: tuple[int, int, int],
-    macrotiles: tuple[int, int, int],
-) -> tuple[int, int, int]:
-    """Round N up to the next multiple of block_n for preshuffle-B static compilation.
-
-    When N is not a multiple of block_n the B tensor must be padded so
-    partial-workgroup waves read valid memory.  The kernel must be
-    compiled with the padded N so buffer assertions pass.
-    """
-    m, n, k = shape
-    mt_n = macrotiles[1]
-    if n % mt_n != 0:
-        n = ((n + mt_n - 1) // mt_n) * mt_n
-    return (m, n, k)
-
-
 def get_mxfp4_gemm_wave(
     shape: tuple[int, int, int],
     macrotiles: tuple[int, int, int],
     preshuffle_b: bool = False,
 ):
     if preshuffle_b:
-        compile_shape = _pad_shape_for_preshuffle(shape, macrotiles)
+        wave_shape = PRESHUFFLE_B_WAVE_SHAPE
+        n_per_wave = macrotiles[1] // wave_shape[1]
+        use_tiled = n_per_wave % 32 != 0
+
         gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
-            compile_shape, macrotiles,
-            wave_shape=PRESHUFFLE_B_WAVE_SHAPE,
+            shape, macrotiles,
+            wave_shape=wave_shape,
             reorder_workgroups=True,
         )
+        dynamic_symbols = [tkl.sym.M, tkl.sym.N, tkl.sym.K]
+        if use_tiled:
+            dynamic_symbols.append(tkl.sym.B_SCALE_N)
+        for sym in dynamic_symbols:
+            del options.subs[sym]
+        options.dynamic_symbols = dynamic_symbols
         options.use_buffer_ops = True
+        options.backend = "asm"
+        options.use_wave_asm_backend = True
+        options.wave_runtime = True
         options.eliminate_epilogue = True
         schedule = get_mxfp4_asymmetric_schedule(
             eliminate_epilogue=True, is_bscale_shuffled=True,
@@ -502,13 +498,14 @@ def parse_args():
 def validate_shape_and_macrotiles(
     shape: tuple[int, int, int],
     macrotiles: tuple[int, int, int],
+    dynamic: bool = False,
 ) -> None:
     """Validate shape and macrotile combination. Raises ValueError with a reason if invalid."""
     M, N, K = shape
     mt_m, mt_n, mt_k = macrotiles
     if M <= 4 or N <= 4 or K <= 4:
         raise ValueError(f"M, N, K must be > 4 (got M={M}, N={N}, K={K})")
-    if mt_m > M or mt_n > N or mt_k > K:
+    if not dynamic and (mt_m > M or mt_n > N or mt_k > K):
         raise ValueError(
             f"Macrotiles must not exceed shape dimensions: "
             f"MT_M({mt_m})<=M({M}), MT_N({mt_n})<=N({N}), MT_K({mt_k})<=K({K})"
@@ -527,6 +524,7 @@ def validate_shape_and_macrotiles(
 
 def load_shapes_csv(
     path: Path,
+    dynamic: bool = False,
 ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
     """Load shape (M,N,K) and macrotile sizes (MT_M, MT_N, MT_K) from CSV.
     Validates each row with validate_shape_and_macrotiles; raises ValueError on first invalid row.
@@ -544,7 +542,7 @@ def load_shapes_csv(
             shape = (M, N, K)
             macrotiles = (MT_M, MT_N, MT_K)
             try:
-                validate_shape_and_macrotiles(shape, macrotiles)
+                validate_shape_and_macrotiles(shape, macrotiles, dynamic=dynamic)
             except ValueError as e:
                 raise ValueError(f"{path}: row {row_idx}: {e}") from e
             rows.append((shape, macrotiles))
@@ -567,7 +565,7 @@ def main():
         macrotiles = tuple(args._tiles)
         preshuffle_b = args._preshuffle_b or args.preshuffle_b
         try:
-            validate_shape_and_macrotiles(shape, macrotiles)
+            validate_shape_and_macrotiles(shape, macrotiles, dynamic=preshuffle_b)
         except ValueError as e:
             print(f"Invalid shape/macrotile: {e}", file=sys.stderr)
             sys.exit(1)
@@ -606,7 +604,7 @@ def main():
         sys.exit(1)
 
     try:
-        shape_rows = load_shapes_csv(args.shapes)
+        shape_rows = load_shapes_csv(args.shapes, dynamic=preshuffle_b)
     except ValueError as e:
         print(f"Invalid shape/macrotile in CSV: {e}", file=sys.stderr)
         sys.exit(1)
