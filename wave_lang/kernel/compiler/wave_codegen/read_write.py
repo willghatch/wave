@@ -835,17 +835,12 @@ def _try_iv_split_offset(
     strides: list[int | IndexExpr],
     dynamic_vals: dict[IndexExpr, Any],
     use_subs_idxc: bool = True,
-    precomputed_iv_stride: dict[sympy.Symbol, IndexExpr | list[IndexExpr]] | None = None,
 ) -> Optional[Value]:
     """Compute a hoisted IV-split linearized offset for a loop-carried read.
 
     Returns the MLIR Value ``hoisted_voffset + IV * k_stride`` if the index
     expressions are provably affine in the loop IV, or ``None`` to fall back
     to the default address path.
-
-    When *precomputed_iv_stride* is supplied (from
-    ``compute_iv_stride_through_mapping``), the IV stride is known from the
-    pre-mapping index and the extraction phase is skipped entirely.
     """
     ip = InsertionPoint.current
     owner = ip.block.owner
@@ -883,53 +878,6 @@ def _try_iv_split_offset(
     has_iv = any(iv_sym in sympy.sympify(e).free_symbols for e in start_exprs)
     if not has_iv:
         return None
-
-    # ------------------------------------------------------------------
-    # Fast path: pre-computed IV stride from mapping analysis.
-    # ------------------------------------------------------------------
-    if precomputed_iv_stride and iv_sym in precomputed_iv_stride:
-        k_stride_per_iv = precomputed_iv_stride[iv_sym]
-
-        base_start_exprs = [safe_subs(e, {iv_sym: 0}) for e in start_exprs]
-
-        hoist_ip = InsertionPoint(owner)
-        subs_map = add_emitter_subs(emitter, dynamic_vals)
-        overflow_flags = arith_d.IntegerOverflowFlags.nsw
-
-        with hoist_ip:
-            lin_offset = None
-            for base_expr, stride in zip(base_start_exprs, sym_strides):
-                val = gen_sympy_index(subs_map, base_expr)
-                stride_val = gen_sympy_index(subs_map, stride)
-                term = arith_d.muli(val, stride_val, overflow_flags=overflow_flags)
-                lin_offset = (
-                    term
-                    if lin_offset is None
-                    else arith_d.addi(
-                        lin_offset, term, overflow_flags=overflow_flags
-                    )
-                )
-
-        iv_mlir = subs_map.get(iv_sym)
-        if iv_mlir is None:
-            return None
-
-        if isinstance(k_stride_per_iv, list):
-            iv_offset = _emit_cycle_offset(
-                k_stride_per_iv, iv_mlir, subs_map, overflow_flags
-            )
-        else:
-            k_stride_val = gen_sympy_index(subs_map, k_stride_per_iv)
-            iv_offset = arith_d.muli(
-                iv_mlir, k_stride_val, overflow_flags=overflow_flags
-            )
-
-        total = arith_d.addi(lin_offset, iv_offset, overflow_flags=overflow_flags)
-        return total
-
-    # ------------------------------------------------------------------
-    # Symbolic linearity proof w.r.t. the current loop's IV.
-    # ------------------------------------------------------------------
     _j = sympy.Symbol("_j", integer=True, nonnegative=True)
     iv_as_j = step_int * _j
     lin_sym = sympy.Integer(0)
@@ -1054,12 +1002,11 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
     is_global_mem = kb_src.type.memory_space is None
     buffer_ops_enabled = emitter.options.use_buffer_ops and is_global_mem
 
-    # --- LINEAR_INDEX fast path ---
+    # --- LINEAR_INDEX path (flattened reads) ---
     from ...lang.global_symbols import LINEAR_INDEX
     if LINEAR_INDEX in index:
         idx_seq = index[LINEAR_INDEX]
-        base_offset = idx_seq.start
-        ept = idx_seq.size
+        flat_offset = idx_seq.start
         iv_stride_val = idx_seq.stride
 
         precomputed_mask_expr = getattr(node, "precomputed_mask_expr", None)
@@ -1081,18 +1028,6 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
         ):
             subs_map = add_emitter_subs(emitter, dynamic_vals_map_start)
 
-            iv_mlir = None
-            if iv_stride_val != 0:
-                iv_vals, iv_syms = emitter.get_induction_vars_and_syms()
-                if iv_vals:
-                    iv_mlir = iv_vals[0]
-
-            ip = InsertionPoint.current
-            owner = ip.block.owner
-            is_in_loop = not isinstance(owner, func_d.FuncOp) and owner.name == "scf.for"
-            can_hoist = is_in_loop and iv_mlir is not None and iv_stride_val != 0
-            hoist_ip = InsertionPoint(owner) if can_hoist else None
-
             kb_type = MemRefType(kb_src.type)
             phys_strides, _ = kb_type.get_strides_and_offset()
             dyn_sentinel = ShapedType.get_dynamic_stride_or_offset()
@@ -1106,6 +1041,12 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
                 )
             else:
                 sym_strides = [sympy.Integer(s) for s in phys_strides]
+
+            ip = InsertionPoint.current
+            owner = ip.block.owner
+            is_in_loop = not isinstance(owner, func_d.FuncOp) and owner.name == "scf.for"
+            has_iv = iv_stride_val != 0 and is_in_loop
+            hoist_ip = InsertionPoint(owner) if is_in_loop else None
 
             if hoist_ip is not None:
                 with hoist_ip:
@@ -1121,16 +1062,6 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
                         lin_src = _cast_buffer_and_encode_stride(
                             lin_src, strides_vals, element_type, valid_bytes,
                         )
-                    base_val = gen_sympy_index(subs_map, base_offset)
-
-                overflow_flags = arith_d.IntegerOverflowFlags.nsw
-                k_stride_val = gen_sympy_index(subs_map, iv_stride_val)
-                iv_offset = arith_d.muli(
-                    iv_mlir, k_stride_val, overflow_flags=overflow_flags
-                )
-                total_offset = arith_d.addi(
-                    base_val, iv_offset, overflow_flags=overflow_flags
-                )
             else:
                 strides_vals = [gen_sympy_index(subs_map, s) for s in sym_strides]
                 zero_indices = [arith_d.constant(IndexType.get(), 0)] * len(sym_strides)
@@ -1144,7 +1075,8 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
                     lin_src = _cast_buffer_and_encode_stride(
                         lin_src, strides_vals, element_type, valid_bytes,
                     )
-                total_offset = gen_sympy_index(subs_map, base_offset)
+
+            total_offset = gen_sympy_index(subs_map, flat_offset)
 
             if mask is None:
                 result = vector_d.load(vector_type, lin_src, [total_offset])
@@ -1158,11 +1090,9 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
             emitter.bind_node_proxy(node, IRProxyValue(result))
             return
 
-        # Shared memory or other non-standard paths: fall through to
-        # _create_vec_read_write with a single-dim index.
-        # Build a 1-D start index from the flat offset.
+        # Shared memory or other non-standard paths.
         subs_map = add_emitter_subs(emitter, dynamic_vals_map_start)
-        flat_idx_val = gen_sympy_index(subs_map, base_offset)
+        flat_idx_val = gen_sympy_index(subs_map, flat_offset)
         start_indices = [flat_idx_val]
         start_indices_wg = [flat_idx_val]
         start_indices_th = [arith_d.constant(IndexType.get(), 0)]
@@ -1184,8 +1114,7 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
         emitter.bind_node_proxy(node, IRProxyValue(result))
         return
 
-    # --- Legacy N-D index path (non-flattened reads) ---
-    iv_stride_from_mapping = node.meta.get("iv_stride", None)
+    # --- N-D index path (non-flattened reads: dynamic mapping vals, etc.) ---
     precomputed_mask_expr = getattr(node, "precomputed_mask_expr", None)
     if precomputed_mask_expr is not None and not buffer_ops_enabled:
         mask = gen_sympy_index(add_emitter_subs(emitter), precomputed_mask_expr)
@@ -1215,7 +1144,6 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
     is_global = get_custom(memory).type.address_space != SHARED_ADDRESS_SPACE
     use_llvm_load = flags != MemoryAccessFlags.NONE
 
-    # IV-split fast path for global reads: hoist address before the loop.
     if (
         is_global
         and not use_llvm_load
@@ -1241,7 +1169,6 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
             index,
             iv_strides,
             dynamic_vals_map_start,
-            precomputed_iv_stride=iv_stride_from_mapping,
         )
         if total_offset is not None:
             ip = InsertionPoint.current
@@ -1721,8 +1648,7 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
         )
         return
 
-    # --- Legacy N-D path ---
-    iv_stride_from_mapping = node.meta.get("iv_stride", None)
+    # --- N-D path (non-flattened reads: dynamic mapping vals, etc.) ---
     if src_mapping:
         dyn_vals = tuple(
             cast_vector(emitter, reg, element_type=IndexType.get())
@@ -1777,7 +1703,6 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
         list(sym_stride_vals),
         src_dynamic_vals_map_start,
         use_subs_idxc=True,
-        precomputed_iv_stride=iv_stride_from_mapping,
     )
 
     if src_offset is not None:
