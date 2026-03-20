@@ -1573,7 +1573,10 @@ def get_mxfp4_dbuf_mixed_pingpong_shuffle_schedule(use_stagger: bool = True):
 
 
 def get_mxfp4_asymmetric_schedule(
-    eliminate_epilogue: bool = False, is_bscale_shuffled: bool = False
+    eliminate_epilogue: bool = False, is_bscale_shuffled: bool = False,
+    waitcnt_slack: int = 0,
+    interleave_offsets: list[int] | None = None,
+    interleave_intervals: list[int] | None = None,
 ):
     """Return an asymmetric-prefetch MXFP4 schedule for wave_compile().
 
@@ -1783,8 +1786,8 @@ def get_mxfp4_asymmetric_schedule(
         # Interleave MFMAs with memory ops (matching aiter f4gemm pattern).
         # Clamp start_offsets so they fit within each partition when the M
         # tile count is odd (e.g. 7 tiles split into 4+3).
-        base_offsets = [0, 3, 2, 0]
-        base_intervals = [4, 4, 2, 4]
+        base_offsets = interleave_offsets if interleave_offsets is not None else [0, 3, 2, 0]
+        base_intervals = interleave_intervals if interleave_intervals is not None else [4, 4, 2, 4]
 
         def _clamp_offsets(n, offsets):
             return [min(o, max(0, n - 1)) for o in offsets]
@@ -1829,7 +1832,7 @@ def get_mxfp4_asymmetric_schedule(
                     tkw.SchedulingBarrier([]),
                     interleaved_mma_0,
                     tkw.SchedulingBarrier([]),
-                    tkw.MemoryCounterWaitBarrier(load=loop_B_g2v_bs, ds=0),
+                    tkw.MemoryCounterWaitBarrier(load=loop_B_g2v_bs + waitcnt_slack, ds=0),
                     tkw.SchedulingBarrier([]),
                 ],
             ),
@@ -1840,7 +1843,7 @@ def get_mxfp4_asymmetric_schedule(
                     tkw.SchedulingBarrier([]),
                     interleaved_mma_1,
                     tkw.SchedulingBarrier([]),
-                    tkw.MemoryCounterWaitBarrier(load=loop_A_s2v_bs, ds=0),
+                    tkw.MemoryCounterWaitBarrier(load=loop_A_s2v_bs + waitcnt_slack, ds=0),
                     tkw.SchedulingBarrier([]),
                 ]
             ),
