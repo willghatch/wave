@@ -177,17 +177,26 @@ def flatten_read_indices(
             continue
 
         if _is_shared_memory(mem_node):
+            print(f"[flatten] SKIP {node.name}: shared memory")
             continue
 
         memory = get_custom(mem_node)
         symbolic_shape = memory.type.symbolic_shape
         symbolic_dims = [infer_dim(d) for d in symbolic_shape]
 
+        has_mapping = mapping is not None and not mapping.is_identity()
+        has_dyn_vals = bool(custom.mapping_dynamic_vals)
+
         flat_start = _linearize_to_flat(
             mapping, index, symbolic_shape, symbolic_dims,
             div_fwd, div_bwd, idxc,
         )
         if flat_start is None:
+            print(
+                f"[flatten] SKIP {node.name}: could not linearize"
+                f"  mapped={has_mapping}  dyn_vals={has_dyn_vals}"
+                f"  shape={symbolic_shape}"
+            )
             continue
 
         ept = custom.elements_per_thread
@@ -204,3 +213,9 @@ def flatten_read_indices(
         custom.index = new_index
         custom.update_arg("mapping", None)
         custom.update_arg("bounds", new_bounds)
+
+        print(
+            f"[flatten] OK {node.name}:"
+            f"  mapped={has_mapping}  dyn_vals={has_dyn_vals}"
+            f"  ept={ept_val}  flat={flat_start}"
+        )

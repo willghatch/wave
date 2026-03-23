@@ -27,6 +27,7 @@ from ..._support.indexing import IndexSequence, IndexingContext
 from ..._support.tracing import CapturedTrace
 from ...lang.global_symbols import LINEAR_INDEX
 from ...ops.wave_ops import Iterate, Read, GatherToLDS, get_custom
+from ..assumptions import get_divisibility_subs
 from ..constraints import Constraint
 from ..utils.general_utils import is_flattened_index, get_flat_offset
 from ..utils.mapping_utils import mem_simplify
@@ -123,6 +124,44 @@ def _try_numerical_probe(flat, iv_sym, step):
     return base, sympy.Integer(stride_val)
 
 
+def _try_with_div_subs(flat, iv_sym, step, div_fwd, div_bwd):
+    """Try stride extraction after applying divisibility substitutions.
+
+    Mapped-read flat expressions contain ``floor(K/d)`` / ``Mod(K, d)``
+    terms that block both symbolic and numerical probing.  Divisibility
+    constraints (e.g. ``K % 256 == 0``) let us replace ``K`` with
+    ``256 * _K_div_256``, collapsing those terms.
+
+    The stride is extracted from the simplified expression but the base
+    is computed from the ORIGINAL flat to preserve floor/Mod structure
+    needed for correct MLIR integer lowering.
+    """
+    if not div_fwd:
+        return None
+
+    fwd_dict = dict(div_fwd)
+    simplified = sympy.sympify(flat).subs(fwd_dict)
+
+    result = _try_symbolic_stride(simplified, iv_sym, step)
+    method = "symbolic+divsubs" if result is not None else None
+
+    if result is None:
+        result = _try_numerical_probe(simplified, iv_sym, step)
+        method = "numerical+divsubs" if result is not None else None
+
+    if result is None:
+        return None
+
+    _, stride = result
+
+    if div_bwd:
+        bwd_dict = dict(div_bwd)
+        stride = mem_simplify(sympy.sympify(stride).subs(bwd_dict))
+
+    base = safe_subs(flat, {iv_sym: sympy.Integer(0)})
+    return base, stride, method
+
+
 def annotate_iv_strides(
     trace: CapturedTrace,
     constraints=(),
@@ -132,6 +171,8 @@ def annotate_iv_strides(
     Walks all subgraphs; for those inside Iterate ops, identifies the IV
     and for each flattened read tries to extract the stride.
     """
+    div_fwd, div_bwd = get_divisibility_subs(constraints)
+
     for subgraph in trace.region_graph.subgraphs.values():
         parent_node = getattr(subgraph, "parent_op", None)
         if parent_node is None:
@@ -149,22 +190,54 @@ def annotate_iv_strides(
                 continue
 
             is_g2l = isinstance(custom, GatherToLDS)
+            op_kind = "GatherToLDS" if is_g2l else "Read"
             index = custom.src_index if is_g2l else custom.index
 
             if not is_flattened_index(index):
+                print(
+                    f"[iv-stride] SKIP {node.name} ({op_kind}):"
+                    f" not flattened"
+                )
                 continue
 
             flat = get_flat_offset(index)
             if iv_sym not in flat.free_symbols:
+                print(
+                    f"[iv-stride] SKIP {node.name} ({op_kind}):"
+                    f" IV {iv_sym} not in flat expression"
+                )
                 continue
 
+            print(
+                f"[iv-stride] {node.name} ({op_kind}):"
+                f"  IV={iv_sym}  step={step}"
+            )
+
+            method = None
             result = _try_symbolic_stride(flat, iv_sym, step)
-            if result is None:
+            if result is not None:
+                method = "symbolic"
+                base, stride = result
+            else:
                 result = _try_numerical_probe(flat, iv_sym, step)
+                if result is not None:
+                    method = "numerical"
+                    base, stride = result
+
             if result is None:
+                div_result = _try_with_div_subs(
+                    flat, iv_sym, step, div_fwd, div_bwd,
+                )
+                if div_result is not None:
+                    base, stride, method = div_result
+
+            if result is None and method is None:
+                print(
+                    f"[iv-stride] FAIL {node.name} ({op_kind}):"
+                    f" could not extract stride for IV {iv_sym}"
+                )
                 continue
 
-            base, stride = result
             ept = index[LINEAR_INDEX].size
             new_offset = base + iv_sym * stride
             new_index = {LINEAR_INDEX: IndexSequence(new_offset, ept, stride)}
@@ -173,3 +246,9 @@ def annotate_iv_strides(
                 custom.src_index = new_index
             else:
                 custom.index = new_index
+
+            print(
+                f"[iv-stride] OK {node.name} ({op_kind}):"
+                f"  method={method}  stride={stride}"
+                f"  base={base}"
+            )
