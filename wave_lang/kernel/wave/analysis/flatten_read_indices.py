@@ -12,7 +12,9 @@ For every eligible Read (unmapped and mapped), this pass:
 3. Converts bounds to expression-keyed form via ``delinearize_index``.
 4. Replaces the index with ``{LINEAR_INDEX: IndexSequence(flat, ept, 1)}``.
 
-Reads with ``mapping_dynamic_vals`` or shared-memory targets are skipped.
+Reads with shared-memory targets are skipped.  Reads with
+``mapping_dynamic_vals`` are flattened normally; the dynamic val symbols
+(``$dynamic_val0``, etc.) remain as free symbols in the flat expression.
 
 For mapped reads the flat expression is intentionally left unsimplified
 so that ``gen_sympy_index`` lowers each floor/Mod term independently,
@@ -110,12 +112,8 @@ def flatten_read_indices(
         index = custom.index
         mem_node = custom.memory
         bounds = custom.bounds
-        dyn_vals = custom.mapping_dynamic_vals
 
         if is_flattened_index(index):
-            continue
-
-        if dyn_vals:
             continue
 
         memory = get_custom(mem_node)

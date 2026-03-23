@@ -140,6 +140,8 @@ def _build_dyn_vals_map(
     mapping: Optional[IndexMapping], dynamic_vals: tuple[Value, ...]
 ) -> dict[IndexExpr, Value]:
     if mapping is None:
+        if dynamic_vals:
+            return _build_dyn_vals_map_from_nodes(dynamic_vals)
         return {}
 
     assert len(mapping.dynamic_val_indices) == len(
@@ -148,6 +150,23 @@ def _build_dyn_vals_map(
     return {
         sym: _extract0(val)
         for sym, val in zip(mapping.dynamic_val_indices.keys(), dynamic_vals)
+    }
+
+
+def _build_dyn_vals_map_from_nodes(
+    dynamic_vals: tuple[Value, ...],
+) -> dict[IndexExpr, Value]:
+    """Build ``$dynamic_val{i} -> mlir_value`` map without a mapping object.
+
+    After ``flatten_read_indices`` clears the mapping, the dynamic val
+    symbols (``$dynamic_val0``, ...) remain as free symbols in the flat
+    expression.  This helper reconstructs the substitution map using the
+    positional convention: ``dynamic_vals[i]`` corresponds to
+    ``IndexMapping.dynamic_val(i)``.
+    """
+    return {
+        IndexMapping.dynamic_val(i): _extract0(val)
+        for i, val in enumerate(dynamic_vals)
     }
 
 
