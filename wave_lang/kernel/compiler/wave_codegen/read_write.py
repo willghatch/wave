@@ -1391,37 +1391,23 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
             IndexingContext.current(), src_symbolic_shape, allow_mixed_shapes=True
         )
         subs_map = add_emitter_subs(emitter, src_dynamic_vals_map_start)
-        strides = [gen_sympy_index(subs_map, s) for s in sym_stride_vals]
 
-        iv_sym = None
-        iv_mlir = None
-        if iv_stride_val != 0:
-            for sym in sympy.sympify(base_offset).free_symbols:
-                if str(sym).startswith("$ARG"):
-                    mlir_val = subs_map.get(sym)
-                    if mlir_val is not None:
-                        iv_sym = sym
-                        iv_mlir = mlir_val
-                        break
+        cur_ip = InsertionPoint.current
+        owner = cur_ip.block.owner
+        is_in_loop = not isinstance(owner, func_d.FuncOp) and owner.name == "scf.for"
+        hoist_ip = InsertionPoint(owner) if is_in_loop else None
 
-        if iv_sym is not None and iv_stride_val != 0:
-            cur_ip = InsertionPoint.current
-            owner = cur_ip.block.owner
-            hoist_ip = InsertionPoint(owner)
-            overflow_flags = arith_d.IntegerOverflowFlags.nsw
-
+        if hoist_ip is not None:
             with hoist_ip:
-                base_val = gen_sympy_index(subs_map, base_offset)
+                strides = [gen_sympy_index(subs_map, s) for s in sym_stride_vals]
                 zero_indices = [arith_d.constant(IndexType.get(), 0)] * len(strides)
                 lin_src, _ = _linearize_memref(src, zero_indices, zero_indices, strides)
-
-            k_stride_val = gen_sympy_index(subs_map, iv_stride_val)
-            iv_offset = arith_d.muli(iv_mlir, k_stride_val, overflow_flags=overflow_flags)
-            src_offset = arith_d.addi(base_val, iv_offset, overflow_flags=overflow_flags)
         else:
+            strides = [gen_sympy_index(subs_map, s) for s in sym_stride_vals]
             zero_indices = [arith_d.constant(IndexType.get(), 0)] * len(strides)
             lin_src, _ = _linearize_memref(src, zero_indices, zero_indices, strides)
-            src_offset = gen_sympy_index(subs_map, base_offset)
+
+        src_offset = gen_sympy_index(subs_map, base_offset)
 
         valid_bytes_override = None
         guard_condition = node.meta.get("g2s_guard", None)

@@ -5,7 +5,7 @@
 
 """Flatten N-D read indices to 1-D physical offsets (LINEAR_INDEX).
 
-For every eligible Read and GatherToLDS (unmapped and mapped), this pass:
+For every eligible Read (unmapped and mapped), this pass:
 
 1. Resolves the index mapping (if any) into physical coordinates.
 2. Linearizes them into a single flat offset using memory strides.
@@ -34,7 +34,7 @@ from ..._support.indexing import IndexingContext, IndexSequence
 from ..._support.tracing import CapturedTrace
 from ...compiler.utils import strides_from_symbolic_shape
 from ...lang.global_symbols import LINEAR_INDEX, SHARED_ADDRESS_SPACE
-from ...ops.wave_ops import Read, GatherToLDS, get_custom
+from ...ops.wave_ops import Read, get_custom
 from ..assumptions import get_divisibility_subs
 from ..constraints import Constraint
 from ..utils.general_utils import (
@@ -161,20 +161,17 @@ def flatten_read_indices(
     trace: CapturedTrace,
     constraints: Sequence[Constraint] = (),
 ):
-    """Flatten N-D read indices to 1-D LINEAR_INDEX for eligible Reads and GatherToLDS."""
+    """Flatten N-D read indices to 1-D LINEAR_INDEX for eligible Reads."""
     idxc = IndexingContext.current()
     div_fwd, div_bwd = get_divisibility_subs(constraints)
 
-    for node in trace.walk(
-        lambda n: isinstance(get_custom(n), (Read, GatherToLDS))
-    ):
+    for node in trace.walk(lambda n: isinstance(get_custom(n), Read)):
         custom = get_custom(node)
-        is_g2l = isinstance(custom, GatherToLDS)
 
-        index = custom.src_index if is_g2l else custom.index
-        mem_node = custom.src if is_g2l else custom.memory
-        bounds = custom.src_bounds if is_g2l else custom.bounds
-        mapping = custom.src_mapping if is_g2l else custom.mapping
+        index = custom.index
+        mem_node = custom.memory
+        bounds = custom.bounds
+        mapping = custom.mapping
 
         if is_flattened_index(index):
             continue
@@ -204,11 +201,6 @@ def flatten_read_indices(
 
         new_index = {LINEAR_INDEX: IndexSequence(flat_start, ept_val, 1)}
 
-        if is_g2l:
-            custom.src_index = new_index
-            custom.update_arg("src_mapping", None)
-            custom.update_arg("src_bounds", new_bounds)
-        else:
-            custom.index = new_index
-            custom.update_arg("mapping", None)
-            custom.update_arg("bounds", new_bounds)
+        custom.index = new_index
+        custom.update_arg("mapping", None)
+        custom.update_arg("bounds", new_bounds)
