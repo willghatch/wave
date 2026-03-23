@@ -75,7 +75,6 @@ from .emitter import (
     get_type_or_element_type,
     handle_op,
 )
-from ...wave.constraints import TilingConstraint
 
 
 def _get_start_index(i: IndexSequence | IndexExpr) -> IndexExpr:
@@ -802,150 +801,6 @@ def _create_vec_read_write(
             return
 
 
-def _emit_cycle_offset(
-    cycle: list[IndexExpr],
-    iv_mlir: Value,
-    subs_map: dict,
-    overflow_flags,
-) -> Value:
-    """Emit MLIR for cycle-based IV offset.
-
-    For a repeating stride cycle [s0, s1, ...] of length N:
-        offset = (IV // N) * macro_stride + cumulative[IV % N]
-    where macro_stride = sum(cycle) and cumulative = prefix sums of cycle.
-    """
-    n = len(cycle)
-    macro_stride = sum(cycle)
-    cumulative = [sympy.Integer(0)]
-    for s in cycle[:-1]:
-        cumulative.append(cumulative[-1] + s)
-
-    idx_ty = IndexType.get()
-
-    is_pow2 = (n & (n - 1)) == 0 and n > 0
-    n_val = arith_d.constant(idx_ty, n)
-
-    if is_pow2:
-        log2n = int(math.log2(n))
-        shift = arith_d.constant(idx_ty, log2n)
-        iv_div = arith_d.shrui(iv_mlir, shift)
-        mask_val = arith_d.constant(idx_ty, n - 1)
-        iv_mod = arith_d.andi(iv_mlir, mask_val)
-    else:
-        iv_div = arith_d.divui(iv_mlir, n_val)
-        iv_mod = arith_d.remui(iv_mlir, n_val)
-
-    macro_val = gen_sympy_index(subs_map, macro_stride)
-    macro_term = arith_d.muli(iv_div, macro_val, overflow_flags=overflow_flags)
-
-    cum_offset = arith_d.constant(idx_ty, 0)
-    for i in range(n - 1, -1, -1):
-        c_val = gen_sympy_index(subs_map, cumulative[i])
-        i_val = arith_d.constant(idx_ty, i)
-        cmp = arith_d.cmpi(arith_d.CmpIPredicate.eq, iv_mod, i_val)
-        cum_offset = arith_d.select(cmp, c_val, cum_offset)
-
-    return arith_d.addi(macro_term, cum_offset, overflow_flags=overflow_flags)
-
-
-def _try_iv_split_offset(
-    emitter: WaveEmitter,
-    index: dict[IndexExpr, IndexSequence | IndexExpr],
-    strides: list[int | IndexExpr],
-    dynamic_vals: dict[IndexExpr, Any],
-    use_subs_idxc: bool = True,
-) -> Optional[Value]:
-    """Compute a hoisted IV-split linearized offset for a loop-carried read.
-
-    Returns the MLIR Value ``hoisted_voffset + IV * k_stride`` if the index
-    expressions are provably affine in the loop IV, or ``None`` to fall back
-    to the default address path.
-    """
-    ip = InsertionPoint.current
-    owner = ip.block.owner
-    if isinstance(owner, func_d.FuncOp):
-        return None
-    if owner.name != "scf.for":
-        return None
-
-    current_iv = owner.induction_variable
-
-    dim = next((d for d, v in emitter.induction_vars.items() if v == current_iv), None)
-    if dim is None:
-        return None
-    iv_sym = next(
-        (
-            c.induction_var
-            for c in emitter.constraints
-            if isinstance(c, TilingConstraint) and c.dim == dim
-        ),
-        None,
-    )
-    if iv_sym is None:
-        return None
-
-    step_int = _get_constant_value(owner.operands[2])
-    if step_int is None or step_int <= 0:
-        return None
-
-    start_exprs = _get_start_indices(index)
-    if len(start_exprs) != len(strides):
-        return None
-
-    sym_strides = [sympy.sympify(s) for s in strides]
-
-    has_iv = any(iv_sym in sympy.sympify(e).free_symbols for e in start_exprs)
-    if not has_iv:
-        return None
-    _j = sympy.Symbol("_j", integer=True, nonnegative=True)
-    iv_as_j = step_int * _j
-    lin_sym = sympy.Integer(0)
-    for expr, stride in zip(start_exprs, sym_strides):
-        e = safe_subs(expr, {iv_sym: iv_as_j})
-        if use_subs_idxc:
-            e = subs_idxc(e)
-        e = simplify(e)
-        lin_sym += e * stride
-    lin_sym = simplify(lin_sym)
-
-    coeff = lin_sym.coeff(_j)
-    remainder = simplify(lin_sym - coeff * _j)
-    if coeff == 0 or _j in remainder.free_symbols:
-        return None
-
-    if coeff.is_Integer:
-        k_stride_per_iv_int, rem = divmod(int(coeff), step_int)
-        if rem != 0:
-            return None
-        k_stride_per_iv = sympy.Integer(k_stride_per_iv_int)
-    else:
-        k_stride_per_iv = simplify(coeff / step_int)
-
-    base_start_exprs = [safe_subs(e, {iv_sym: 0}) for e in start_exprs]
-
-    hoist_ip = InsertionPoint(owner)
-    subs_map = add_emitter_subs(emitter, dynamic_vals)
-    overflow_flags = arith_d.IntegerOverflowFlags.nsw
-
-    with hoist_ip:
-        lin_offset = None
-        for base_expr, stride in zip(base_start_exprs, sym_strides):
-            val = gen_sympy_index(subs_map, base_expr)
-            stride_val = gen_sympy_index(subs_map, stride)
-            term = arith_d.muli(val, stride_val, overflow_flags=overflow_flags)
-            lin_offset = (
-                term
-                if lin_offset is None
-                else arith_d.addi(lin_offset, term, overflow_flags=overflow_flags)
-            )
-        k_stride_val = gen_sympy_index(subs_map, k_stride_per_iv)
-
-    iv_mlir = subs_map.get(iv_sym)
-    if iv_mlir is None:
-        return None
-    iv_offset = arith_d.muli(iv_mlir, k_stride_val, overflow_flags=overflow_flags)
-    return arith_d.addi(lin_offset, iv_offset, overflow_flags=overflow_flags)
-
 
 def _build_mask_with_mapping(
     emitter: WaveEmitter,
@@ -1160,78 +1015,11 @@ def handle_read(emitter: WaveEmitter, node: fx.Node):
     else:
         mask = _build_mask(emitter, index, elements_per_thread, bounds)
 
-    is_global = get_custom(memory).type.address_space != SHARED_ADDRESS_SPACE
-    use_llvm_load = flags != MemoryAccessFlags.NONE
-
-    if (
-        is_global
-        and not use_llvm_load
-        and not read_meets_hw_transpose_requirements(
-            get_custom(node), emitter.constraints, emitter.options.target
-        )
-    ):
-        kb_type = MemRefType(kb_src.type)
-        phys_strides, _ = kb_type.get_strides_and_offset()
-        dyn_sentinel = ShapedType.get_dynamic_stride_or_offset()
-        if any(s == dyn_sentinel for s in phys_strides):
-            iv_strides = list(
-                strides_from_symbolic_shape(
-                    IndexingContext.current(),
-                    input_shape,
-                    allow_mixed_shapes=True,
-                )
-            )
-        else:
-            iv_strides = [sympy.Integer(s) for s in phys_strides]
-        total_offset = _try_iv_split_offset(
-            emitter,
-            index,
-            iv_strides,
-            dynamic_vals_map_start,
-        )
-        if total_offset is not None:
-            ip = InsertionPoint.current
-            owner = ip.block.owner
-            hoist_ip = InsertionPoint(owner)
-            subs_map = add_emitter_subs(emitter, dynamic_vals_map_start)
-            with hoist_ip:
-                strides_vals = [gen_sympy_index(subs_map, s) for s in iv_strides]
-                zero_indices = [arith_d.constant(IndexType.get(), 0)] * len(
-                    iv_strides
-                )
-                lin_src, _ = _linearize_memref(
-                    kb_src, zero_indices, zero_indices, strides_vals
-                )
-
-                if buffer_ops_enabled and emitter.options.eliminate_epilogue:
-                    valid_bytes = _compute_valid_bytes(
-                        lin_src,
-                        element_type,
-                        input_shape,
-                        emitter,
-                    )
-                    lin_src = _cast_buffer_and_encode_stride(
-                        lin_src,
-                        strides_vals,
-                        element_type,
-                        valid_bytes,
-                    )
-            if mask is None:
-                result = vector_d.load(vector_type, lin_src, [total_offset])
-            else:
-                element_type = vector_type.element_type
-                zero = arith_d.constant(element_type, get_constant_attr(0, element_type))
-                passthru = vector_d.broadcast(vector_type, zero)
-                result = vector_d.maskedload(
-                    vector_type, lin_src, [total_offset], mask, passthru
-                )
-            emitter.bind_node_proxy(node, IRProxyValue(result))
-            return
-
     start_indices, start_indices_wg, start_indices_th = _build_start_indices(
         emitter, index, dynamic_vals_map_start
     )
 
+    use_llvm_load = flags != MemoryAccessFlags.NONE
     if use_llvm_load:
         result = _create_llvm_read_write(
             kb_src, kb_ir_type, start_indices, vector_type, flags
@@ -1709,33 +1497,18 @@ def handle_gather_to_lds(emitter: WaveEmitter, node: fx.Node):
         i32 = IntegerType.get_signless(32)
         dst_index = [assume_index_subgroup_uniform(idx, i32) for idx in dst_index]
 
-    # Symbolic strides shared by iv-split and fallback linearization.
     sym_stride_vals = strides_from_symbolic_shape(
         IndexingContext.current(), src_symbolic_shape, allow_mixed_shapes=True
     )
     subs_map = add_emitter_subs(emitter, src_dynamic_vals_map_start)
     strides = [gen_sympy_index(subs_map, s) for s in sym_stride_vals]
 
-    src_offset = _try_iv_split_offset(
-        emitter,
-        new_src_idx,
-        list(sym_stride_vals),
-        src_dynamic_vals_map_start,
-        use_subs_idxc=True,
+    src_index, src_index_wg, src_index_th = _build_start_indices(
+        emitter, new_src_idx, src_dynamic_vals_map_start
     )
-
-    if src_offset is not None:
-        # IV-split path: offset=0 reinterpret_cast, full address in src_offset.
-        zero_indices = [arith_d.constant(IndexType.get(), 0)] * len(strides)
-        lin_src, _ = _linearize_memref(src, zero_indices, zero_indices, strides)
-    else:
-        # Fallback: wg offset baked into memref base, th offset as voffset.
-        src_index, src_index_wg, src_index_th = _build_start_indices(
-            emitter, new_src_idx, src_dynamic_vals_map_start
-        )
-        lin_src, src_offset = _linearize_memref(
-            src, src_index_wg, src_index_th, strides
-        )
+    lin_src, src_offset = _linearize_memref(
+        src, src_index_wg, src_index_th, strides
+    )
 
     valid_bytes_override = None
     guard_condition = node.meta.get("g2s_guard", None)

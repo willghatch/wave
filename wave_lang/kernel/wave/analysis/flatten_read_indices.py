@@ -5,14 +5,14 @@
 
 """Flatten N-D read indices to 1-D physical offsets (LINEAR_INDEX).
 
-For every eligible Read (unmapped and mapped), this pass:
+For every eligible Read and GatherToLDS (unmapped and mapped), this pass:
 
 1. Resolves the index mapping (if any) into physical coordinates.
 2. Linearizes them into a single flat offset using memory strides.
 3. Converts bounds to expression-keyed form via ``delinearize_index``.
 4. Replaces the index with ``{LINEAR_INDEX: IndexSequence(flat, ept, 1)}``.
 
-Reads with shared-memory targets are skipped.  Reads with
+Shared-memory targets are skipped.  Operations with
 ``mapping_dynamic_vals`` are flattened normally; the dynamic val symbols
 (``$dynamic_val0``, etc.) remain as free symbols in the flat expression.
 
@@ -34,7 +34,7 @@ from ..._support.indexing import IndexingContext, IndexSequence
 from ..._support.tracing import CapturedTrace
 from ...compiler.utils import strides_from_symbolic_shape
 from ...lang.global_symbols import LINEAR_INDEX, SHARED_ADDRESS_SPACE
-from ...ops.wave_ops import Read, get_custom
+from ...ops.wave_ops import Read, GatherToLDS, get_custom
 from ..assumptions import get_divisibility_subs
 from ..constraints import Constraint
 from ..utils.general_utils import (
@@ -72,105 +72,126 @@ def _convert_bounds(bounds, flat_start, ept, symbolic_shape, symbolic_dims):
     return new_bounds or None
 
 
-def _get_physical_starts(custom, symbolic_shape, symbolic_dims):
-    """Return per-dim physical start expressions for a Read.
+def _get_physical_starts(mapping, index, symbolic_shape, symbolic_dims):
+    """Return per-dim physical start expressions for a read operation.
 
     For mapped reads, applies the mapping via ``transform_index_on_mapping``.
     For unmapped / identity-mapped reads, reads starts directly from the index.
     Returns ``None`` when required dimensions are missing.
     """
-    if custom.mapping is not None and not custom.has_identity_mapping():
+    if mapping is not None and not mapping.is_identity():
         transformed = transform_index_on_mapping(
-            custom.mapping, symbolic_shape, custom.index, is_read=True
+            mapping, symbolic_shape, index, is_read=True
         )
         if not all(dim in transformed for dim in symbolic_dims):
             return None
         return {dim: transformed[dim] for dim in symbolic_dims}
-    if not all(dim in custom.index for dim in symbolic_dims):
+    if not all(dim in index for dim in symbolic_dims):
         return None
     return {
         dim: (
-            custom.index[dim].start
-            if isinstance(custom.index[dim], IndexSequence)
-            else custom.index[dim]
+            index[dim].start
+            if isinstance(index[dim], IndexSequence)
+            else index[dim]
         )
         for dim in symbolic_dims
     }
+
+
+def _is_shared_memory(mem_node):
+    """Return True if *mem_node* targets shared address space."""
+    memory = get_custom(mem_node)
+    return (
+        hasattr(memory, "type")
+        and hasattr(memory.type, "address_space")
+        and subs_idxc(memory.type.address_space) == SHARED_ADDRESS_SPACE
+    )
+
+
+def _linearize_to_flat(
+    mapping, index, symbolic_shape, symbolic_dims, div_fwd, div_bwd, idxc,
+):
+    """Compute the flat LINEAR_INDEX start for *index* given *mapping*.
+
+    Returns ``(flat_start, new_bounds_or_None)`` or ``None`` when the
+    index cannot be flattened.
+    """
+    has_mapping = mapping is not None and not mapping.is_identity()
+
+    phys_starts = _get_physical_starts(mapping, index, symbolic_shape, symbolic_dims)
+    if phys_starts is None:
+        return None
+
+    mem_strides = list(
+        strides_from_symbolic_shape(
+            idxc, symbolic_shape, allow_mixed_shapes=True
+        )
+    )
+
+    if has_mapping:
+        dim_exprs = [sympy.sympify(phys_starts[dim]) for dim in symbolic_dims]
+        flat_start = sum(
+            expr * stride
+            for expr, stride in zip(dim_exprs, mem_strides)
+        )
+    else:
+        dim_exprs = [sympy.sympify(phys_starts[dim]) for dim in symbolic_dims]
+        dim_exprs = [subs_idxc(e) for e in dim_exprs]
+
+        if div_fwd:
+            fwd_dict = dict(div_fwd)
+            dim_exprs = [sympy.sympify(e).subs(fwd_dict) for e in dim_exprs]
+            applied_strides = [sympy.sympify(s).subs(fwd_dict) for s in mem_strides]
+        else:
+            floor_subs = _infer_floor_to_exact(mem_strides)
+            if floor_subs:
+                dim_exprs = [sympy.sympify(e).subs(floor_subs) for e in dim_exprs]
+            applied_strides = mem_strides
+
+        flat_start = linearize_dims(dim_exprs, applied_strides)
+
+        if div_bwd:
+            bwd_dict = dict(div_bwd)
+            flat_start = mem_simplify(sympy.sympify(flat_start).subs(bwd_dict))
+
+    return flat_start
 
 
 def flatten_read_indices(
     trace: CapturedTrace,
     constraints: Sequence[Constraint] = (),
 ):
-    """Flatten N-D read indices to 1-D LINEAR_INDEX for all eligible Reads."""
+    """Flatten N-D read indices to 1-D LINEAR_INDEX for eligible Reads and GatherToLDS."""
     idxc = IndexingContext.current()
     div_fwd, div_bwd = get_divisibility_subs(constraints)
 
-    for node in trace.walk(lambda n: isinstance(get_custom(n), Read)):
+    for node in trace.walk(
+        lambda n: isinstance(get_custom(n), (Read, GatherToLDS))
+    ):
         custom = get_custom(node)
+        is_g2l = isinstance(custom, GatherToLDS)
 
-        index = custom.index
-        mem_node = custom.memory
-        bounds = custom.bounds
+        index = custom.src_index if is_g2l else custom.index
+        mem_node = custom.src if is_g2l else custom.memory
+        bounds = custom.src_bounds if is_g2l else custom.bounds
+        mapping = custom.src_mapping if is_g2l else custom.mapping
 
         if is_flattened_index(index):
             continue
 
-        memory = get_custom(mem_node)
-        if (
-            hasattr(memory, "type")
-            and hasattr(memory.type, "address_space")
-            and subs_idxc(memory.type.address_space) == SHARED_ADDRESS_SPACE
-        ):
+        if _is_shared_memory(mem_node):
             continue
 
+        memory = get_custom(mem_node)
         symbolic_shape = memory.type.symbolic_shape
         symbolic_dims = [infer_dim(d) for d in symbolic_shape]
 
-        has_mapping = custom.mapping is not None and not (
-            hasattr(custom, "has_identity_mapping")
-            and custom.has_identity_mapping()
+        flat_start = _linearize_to_flat(
+            mapping, index, symbolic_shape, symbolic_dims,
+            div_fwd, div_bwd, idxc,
         )
-
-        phys_starts = _get_physical_starts(custom, symbolic_shape, symbolic_dims)
-        if phys_starts is None:
+        if flat_start is None:
             continue
-
-        mem_strides = list(
-            strides_from_symbolic_shape(
-                idxc, symbolic_shape, allow_mixed_shapes=True
-            )
-        )
-
-        if has_mapping:
-            # Mapped reads: build the flat expression WITHOUT algebraic
-            # simplification.  The raw sum-of-products preserves per-dim
-            # floor/Mod structure so gen_sympy_index lowers each term to
-            # the correct integer MLIR op.
-            dim_exprs = [sympy.sympify(phys_starts[dim]) for dim in symbolic_dims]
-            flat_start = sum(
-                expr * stride
-                for expr, stride in zip(dim_exprs, mem_strides)
-            )
-        else:
-            dim_exprs = [sympy.sympify(phys_starts[dim]) for dim in symbolic_dims]
-            dim_exprs = [subs_idxc(e) for e in dim_exprs]
-
-            if div_fwd:
-                fwd_dict = dict(div_fwd)
-                dim_exprs = [sympy.sympify(e).subs(fwd_dict) for e in dim_exprs]
-                applied_strides = [sympy.sympify(s).subs(fwd_dict) for s in mem_strides]
-            else:
-                floor_subs = _infer_floor_to_exact(mem_strides)
-                if floor_subs:
-                    dim_exprs = [sympy.sympify(e).subs(floor_subs) for e in dim_exprs]
-                applied_strides = mem_strides
-
-            flat_start = linearize_dims(dim_exprs, applied_strides)
-
-            if div_bwd:
-                bwd_dict = dict(div_bwd)
-                flat_start = mem_simplify(sympy.sympify(flat_start).subs(bwd_dict))
 
         ept = custom.elements_per_thread
         ept_val = subs_idxc(ept) if not isinstance(ept, int) else ept
@@ -183,6 +204,11 @@ def flatten_read_indices(
 
         new_index = {LINEAR_INDEX: IndexSequence(flat_start, ept_val, 1)}
 
-        custom.index = new_index
-        custom.update_arg("mapping", None)
-        custom.update_arg("bounds", new_bounds)
+        if is_g2l:
+            custom.src_index = new_index
+            custom.update_arg("src_mapping", None)
+            custom.update_arg("src_bounds", new_bounds)
+        else:
+            custom.index = new_index
+            custom.update_arg("mapping", None)
+            custom.update_arg("bounds", new_bounds)
