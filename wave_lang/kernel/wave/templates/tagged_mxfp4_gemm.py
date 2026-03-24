@@ -387,6 +387,7 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
     reorder_workgroups=True,
     group_size_n=32,
     output_dtype=tkl.f32,
+    b_address_space: tkl.AddressSpace = GLOBAL_ADDRESS_SPACE,
 ):
     """Return a tagged MXFP4 scaled GEMM kernel with preshuffled B and B_scale.
 
@@ -415,6 +416,7 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
     BLOCK_K = tkl.sym.BLOCK_K
     GROUP_SIZE_N = tkl.sym.GROUP_SIZE_N
     A_ADDRESS_SPACE = tkl.sym.A_ADDRESS_SPACE
+    B_ADDRESS_SPACE = tkl.sym.B_ADDRESS_SPACE
     C_ADDRESS_SPACE = tkl.sym.C_ADDRESS_SPACE
     K_PACKED = tkl.sym.K_PACKED
     K_SCALE_SHUFFLED = tkl.sym.K_SCALE_SHUFFLED
@@ -524,8 +526,8 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
     def gemm(
         a: tkl.Memory[M, K / 2, A_ADDRESS_SPACE, tkl.i8],
         a_scale: tkl.Memory[M, K / 32, A_ADDRESS_SPACE, tkl.i8],
-        b: tkl.Memory[N, K / 2, GLOBAL_ADDRESS_SPACE, tkl.i8],
-        b_scale: tkl.Memory[N, K / 32, GLOBAL_ADDRESS_SPACE, tkl.i8],
+        b: tkl.Memory[N, K / 2, B_ADDRESS_SPACE, tkl.i8],
+        b_scale: tkl.Memory[N, K / 32, B_ADDRESS_SPACE, tkl.i8],
         c: tkl.Memory[M, N, C_ADDRESS_SPACE, output_dtype],
     ):
         c_reg = tkl.Register[M, N, tkl.f32](0.0)
@@ -553,6 +555,7 @@ def get_tagged_mxfp4_gemm_preshuffle_b(
 
     hyperparams = {
         A_ADDRESS_SPACE: a_address_space,
+        B_ADDRESS_SPACE: b_address_space,
         C_ADDRESS_SPACE: GLOBAL_ADDRESS_SPACE,
         BLOCK_M: block_shape[0],
         BLOCK_N: block_shape[1],

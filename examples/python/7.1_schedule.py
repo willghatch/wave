@@ -27,6 +27,7 @@ from wave_lang.kernel.wave.schedules import (
     get_mxfp4_dbuf_pingpong_schedule,
     get_mxfp4_dbuf_mixed_pingpong_schedule,
     get_mxfp4_asymmetric_schedule,
+    get_mxfp4_asymmetric_mirrored_schedule,
     get_mxfp4_dbuf_mixed_pingpong_shuffle_schedule,
     get_mxfp4_dbuf_pingpong_schedule_Bshuffled,
     get_mxfp4_dbuf_pingpong_schedule_Bshuffled_lds,
@@ -429,14 +430,28 @@ def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm_asm(
     block=(128, 256, 256),
     eliminate_epilogue=True,
 ):
-    """Preshuffle-B MXFP4 GEMM with dynamic M, N, K."""
-    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(shape, block, wave_shape=(2, 2), reorder_workgroups=True)
+    """Preshuffle-B MXFP4 GEMM with dynamic M, N, K.
+
+    Uses wave_shape=(4,1) with mirrored asymmetric schedule:
+      - A (data + scale): global -> VGPRs directly
+      - B (data + scale): global -> LDS -> VGPRs
+    """
+    gemm, options = get_tagged_mxfp4_gemm_preshuffle_b(
+        shape,
+        block,
+        wave_shape=(4, 1),
+        a_address_space=GLOBAL_ADDRESS_SPACE,
+        b_address_space=SHARED_ADDRESS_SPACE,
+        reorder_workgroups=True,
+    )
     # Make M, N, K dynamic so the compiler does not specialize on problem size.
     dynamic_symbols = [tkl.sym.M, tkl.sym.N, tkl.sym.K]
     for sym in dynamic_symbols:
         del options.subs[sym]
     options.dynamic_symbols = dynamic_symbols
     options.use_buffer_ops = True
+    options.minimize_shared_allocs = True
+    options.linearize_shared_access = True
     options.backend = "asm"
     options.use_wave_asm_backend = True
     options.wave_runtime = True
@@ -444,8 +459,8 @@ def test_dbuf_4wave_mxfp_dynamic_preshuffle_b_gemm_asm(
     options.dump_intermediates = "build/intermediates/"
     options.print_mlir_file = "gemm_mxfp4_dbuf_4wave_asymmetric.mlir"
     options.print_mlir = True
-    schedule = get_mxfp4_asymmetric_schedule(
-        eliminate_epilogue=eliminate_epilogue, is_bscale_shuffled=True
+    schedule = get_mxfp4_asymmetric_mirrored_schedule(
+        eliminate_epilogue=eliminate_epilogue, is_ascale_shuffled=True
     )
     options.print_ir_after = "all" if is_debug else []
     options = set_default_run_config(options)
