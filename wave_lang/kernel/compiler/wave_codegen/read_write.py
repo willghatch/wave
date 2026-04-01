@@ -1091,6 +1091,10 @@ def _handle_read_linear_index(
     ):
         subs_map = add_emitter_subs(emitter, dynamic_vals_map_start)
         sym_strides = _sym_strides_for_flat_memref(kb_src, input_shape)
+        # LINEAR_INDEX global reads use maskedload on a linearized memref, not
+        # amdgpu buffer fat-pointer + per-lane scalar loads, so numerics match
+        # under IREE (VMFB) launch as well as the wave runtime.
+        linear_buffer_ops = False
         lin_src = _linear_read_linearize_memref_maybe_hoisted(
             emitter,
             kb_src,
@@ -1098,7 +1102,7 @@ def _handle_read_linear_index(
             subs_map,
             kb_ir_type.element_type,
             input_shape,
-            buffer_ops_enabled,
+            linear_buffer_ops,
         )
         total_offset = gen_sympy_index(subs_map, flat_offset)
         result = _linear_read_emit_global_vector_load(
@@ -1107,7 +1111,7 @@ def _handle_read_linear_index(
             total_offset,
             mask,
             elements_per_thread,
-            buffer_ops_enabled,
+            linear_buffer_ops,
         )
         emitter.bind_node_proxy(node, IRProxyValue(result))
         return
