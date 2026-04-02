@@ -46,7 +46,10 @@ from ..._support.indexing import (
 )
 from ..base import ValidationError
 from ..builder import IRProxyValue
-from ..utils import strides_from_symbolic_shape
+from ..utils import (
+    strides_from_symbolic_shape,
+    symbolic_strides_match_physical_memory as _symbolic_strides_match_physical,
+)
 from ...lang.global_symbols import *
 from ...lang.wave_types import IndexMapping
 from ...ops.wave_ops import (
@@ -260,27 +263,6 @@ def _get_strides_from_memref(mem: Value) -> list[Value]:
     metadata = memref_d.extract_strided_metadata(mem)
     # Strides start at index 2 + rank (after base, offset, sizes).
     return list(metadata[2 + rank : 2 + 2 * rank])
-
-
-def _symbolic_strides_match_physical(memory: CustomOp, symbolic_shape) -> bool:
-    """Return True when it is safe to linearize a write using symbolic strides.
-
-    Memories with an explicit physical_layout whose shape differs from the
-    symbolic shape will have memref strides that don't match the strides
-    computed by strides_from_symbolic_shape.  Linearizing with the wrong
-    strides produces incorrect offsets, so we must fall back to
-    multi-dimensional stores in that case.
-    """
-    mem_type = memory.type
-    if mem_type is None:
-        return True
-    layout = mem_type.physical_layout
-    if layout is None:
-        return True
-    layout_shape = layout.shape
-    if len(layout_shape) != len(symbolic_shape):
-        return False
-    return all(l == s for l, s in zip(layout_shape, symbolic_shape))
 
 
 def _linearize_memref(

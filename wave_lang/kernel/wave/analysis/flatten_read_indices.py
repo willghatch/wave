@@ -32,7 +32,10 @@ import sympy
 
 from ..._support.indexing import IndexingContext, IndexSequence
 from ..._support.tracing import CapturedTrace
-from ...compiler.utils import strides_from_symbolic_shape
+from ...compiler.utils import (
+    strides_from_symbolic_shape,
+    symbolic_strides_match_physical_memory,
+)
 from ...lang.global_symbols import LINEAR_INDEX, SHARED_ADDRESS_SPACE
 from ...ops.wave_ops import MemoryAccessFlags, Read, get_custom
 from ..assumptions import get_divisibility_subs
@@ -222,18 +225,25 @@ def flatten_read_indices(
         if _is_shared_memory(mem_node):
             continue
 
-        # Runtime stride arguments are not represented in the symbolic linearization
-        # used here; strides_from_symbolic_shape would assume a dense layout and
-        # gen_sympy_index would not map to kernel stride args.  Skip flattening until
-        # stride symbols are threaded through IndexingContext (see _sym_strides_for_flat_memref).
+        memory = get_custom(mem_node)
+        symbolic_shape = memory.type.symbolic_shape
+
+        # Dynamic strides pass leading stride arguments at launch.  Symbolic
+        # LINEAR_INDEX flattening uses dense strides from ``symbolic_shape`` via
+        # ``strides_from_symbolic_shape``; that matches runtime stride args only
+        # when the buffer type carries an explicit ``MemoryLayout`` that aligns
+        # with the logical shape.  Without it, tensors may still be non-contiguous
+        # at runtime (e.g. PyTorch slices) while ``physical_layout`` is absent.
+        # Skip flatten in those cases and when logical vs physical layout skews.
         if dynamic_strides:
-            continue
+            layout = getattr(memory.type, "physical_layout", None)
+            if layout is None or not symbolic_strides_match_physical_memory(
+                memory, symbolic_shape
+            ):
+                continue
 
         if custom.flags != MemoryAccessFlags.NONE:
             continue
-
-        memory = get_custom(mem_node)
-        symbolic_shape = memory.type.symbolic_shape
         symbolic_dims = [infer_dim(d) for d in symbolic_shape]
 
         layout = getattr(memory.type, "physical_layout", None)

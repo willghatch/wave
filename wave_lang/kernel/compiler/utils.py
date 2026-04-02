@@ -1,7 +1,33 @@
 from math import prod
-from typing import Optional
+from typing import Any, Optional
 
 from .._support.indexing import IndexingContext, IndexSymbol
+
+
+def symbolic_strides_match_physical_memory(memory: Any, symbolic_shape: tuple) -> bool:
+    """Return True when dense strides from *symbolic_shape* match the buffer layout.
+
+    Memories with an explicit ``physical_layout`` whose shape differs from the
+    symbolic shape have memref strides that do not match
+    :func:`strides_from_symbolic_shape`.  Linearizing read indices with the wrong
+    implied strides is incorrect; callers must skip flattening in that case.
+
+    Used together with an explicit ``physical_layout`` check in
+    ``flatten_read_indices`` when ``dynamic_strides`` is enabled: runtime stride
+    arguments can still mismatch symbolic dense strides if ``physical_layout``
+    is omitted (e.g. PyTorch slice views), so flattening is only allowed when
+    the type system records a ``MemoryLayout`` that matches the logical shape.
+    """
+    mem_type = getattr(memory, "type", None)
+    if mem_type is None:
+        return True
+    layout = getattr(mem_type, "physical_layout", None)
+    if layout is None:
+        return True
+    layout_shape = layout.shape
+    if len(layout_shape) != len(symbolic_shape):
+        return False
+    return all(l == s for l, s in zip(layout_shape, symbolic_shape))
 
 
 def strides_from_symbolic_shape(
