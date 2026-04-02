@@ -32,6 +32,7 @@ import sympy
 
 from ..._support.indexing import IndexingContext, IndexSequence
 from ..._support.tracing import CapturedTrace
+from ..compile_options import WaveCompileOptions
 from ...compiler.utils import (
     strides_from_symbolic_shape,
     symbolic_strides_match_physical_memory,
@@ -205,9 +206,13 @@ def _linearize_to_flat(
 def flatten_read_indices(
     trace: CapturedTrace,
     constraints: Sequence[Constraint] = (),
-    dynamic_strides: bool = False,
+    options: WaveCompileOptions | None = None,
 ):
-    """Flatten N-D read indices to 1-D LINEAR_INDEX for eligible Reads."""
+    """Flatten N-D read indices to 1-D LINEAR_INDEX for eligible Reads.
+
+    *options* is required when invoked from ``compile.py``; a default of ``None``
+    keeps ad-hoc unit tests from constructing a full options object.
+    """
     idxc = IndexingContext.current()
     div_fwd, div_bwd = get_divisibility_subs(constraints)
 
@@ -228,18 +233,22 @@ def flatten_read_indices(
         memory = get_custom(mem_node)
         symbolic_shape = memory.type.symbolic_shape
 
-        # Dynamic strides pass leading stride arguments at launch.  Symbolic
-        # LINEAR_INDEX flattening uses dense strides from ``symbolic_shape`` via
-        # ``strides_from_symbolic_shape``; that matches runtime stride args only
-        # when the buffer type carries an explicit ``MemoryLayout`` that aligns
-        # with the logical shape.  Without it, tensors may still be non-contiguous
-        # at runtime (e.g. PyTorch slices) while ``physical_layout`` is absent.
-        # Skip flatten in those cases and when logical vs physical layout skews.
-        if dynamic_strides:
+        # LLVM + wave runtime dynamic stride ABI: leading stride arguments are
+        # passed at launch.  Flattening to LINEAR_INDEX uses dense strides from
+        # ``symbolic_shape``; that is wrong when logical layout skews vs
+        # ``physical_layout``, or when ``allow_noncontiguous_runtime_buffers``
+        # is set and there is no ``MemoryLayout`` (slice views may have
+        # non-dense leading strides).  WaveASM uses ``dynamic_strides == False``;
+        # keep read linearization for that stack by default.
+        if (
+            options is not None
+            and options.dynamic_strides
+            and options.backend == "llvm"
+        ):
             layout = getattr(memory.type, "physical_layout", None)
-            if layout is None or not symbolic_strides_match_physical_memory(
-                memory, symbolic_shape
-            ):
+            if not symbolic_strides_match_physical_memory(memory, symbolic_shape):
+                continue
+            if options.allow_noncontiguous_runtime_buffers and layout is None:
                 continue
 
         if custom.flags != MemoryAccessFlags.NONE:

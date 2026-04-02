@@ -614,7 +614,7 @@ def build_graph_passes(
                     flatten_read_indices,
                     trace,
                     launchable.constraints,
-                    options.dynamic_strides,
+                    options,
                 )
             ]
             if options.linearize_reads and not options.use_water_backend

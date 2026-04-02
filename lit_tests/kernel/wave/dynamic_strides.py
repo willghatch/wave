@@ -22,6 +22,7 @@ def test_dynamic_strides_gemm():
         dynamic_symbols=dynamic_symbols,
         wave_runtime=True,
         compile_to_mlir=True,
+        allow_noncontiguous_runtime_buffers=True,
     )
     gemm = wave_compile(options, gemm)
     print(gemm.asm)

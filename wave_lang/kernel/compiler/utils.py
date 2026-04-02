@@ -12,11 +12,11 @@ def symbolic_strides_match_physical_memory(memory: Any, symbolic_shape: tuple) -
     :func:`strides_from_symbolic_shape`.  Linearizing read indices with the wrong
     implied strides is incorrect; callers must skip flattening in that case.
 
-    Used together with an explicit ``physical_layout`` check in
-    ``flatten_read_indices`` when ``dynamic_strides`` is enabled: runtime stride
-    arguments can still mismatch symbolic dense strides if ``physical_layout``
-    is omitted (e.g. PyTorch slice views), so flattening is only allowed when
-    the type system records a ``MemoryLayout`` that matches the logical shape.
+    Used in ``flatten_read_indices`` when the LLVM dynamic stride ABI is active
+    (``WaveCompileOptions.dynamic_strides``): skewed ``physical_layout`` always
+    opts out of flatten.  When ``physical_layout`` is absent, flattening is
+    skipped only if ``WaveCompileOptions.allow_noncontiguous_runtime_buffers``
+    is True (non-contiguous slice tests).
     """
     mem_type = getattr(memory, "type", None)
     if mem_type is None:
