@@ -202,6 +202,7 @@ def _linearize_to_flat(
 def flatten_read_indices(
     trace: CapturedTrace,
     constraints: Sequence[Constraint] = (),
+    dynamic_strides: bool = False,
 ):
     """Flatten N-D read indices to 1-D LINEAR_INDEX for eligible Reads."""
     idxc = IndexingContext.current()
@@ -219,6 +220,13 @@ def flatten_read_indices(
             continue
 
         if _is_shared_memory(mem_node):
+            continue
+
+        # Runtime stride arguments are not represented in the symbolic linearization
+        # used here; strides_from_symbolic_shape would assume a dense layout and
+        # gen_sympy_index would not map to kernel stride args.  Skip flattening until
+        # stride symbols are threaded through IndexingContext (see _sym_strides_for_flat_memref).
+        if dynamic_strides:
             continue
 
         if custom.flags != MemoryAccessFlags.NONE:

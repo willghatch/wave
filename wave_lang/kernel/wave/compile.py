@@ -609,7 +609,14 @@ def build_graph_passes(
             launchable.reordering_constraints,
         ),
         *(
-            [partial(flatten_read_indices, trace, launchable.constraints)]
+            [
+                partial(
+                    flatten_read_indices,
+                    trace,
+                    launchable.constraints,
+                    options.dynamic_strides,
+                )
+            ]
             if options.linearize_reads and not options.use_water_backend
             else []
         ),
