@@ -32,7 +32,6 @@ import sympy
 
 from ..._support.indexing import IndexingContext, IndexSequence
 from ..._support.tracing import CapturedTrace
-from ..compile_options import WaveCompileOptions
 from ...compiler.utils import (
     strides_from_symbolic_shape,
     symbolic_strides_match_physical_memory,
@@ -40,6 +39,7 @@ from ...compiler.utils import (
 from ...lang.global_symbols import LINEAR_INDEX, SHARED_ADDRESS_SPACE
 from ...ops.wave_ops import MemoryAccessFlags, Read, get_custom
 from ..assumptions import get_divisibility_subs
+from ..compile_options import WaveCompileOptions
 from ..constraints import Constraint
 from ..utils.general_utils import (
     infer_dim,
@@ -232,20 +232,15 @@ def flatten_read_indices(
 
         memory = get_custom(mem_node)
         symbolic_shape = memory.type.symbolic_shape
+        layout = getattr(memory.type, "physical_layout", None)
 
-        # LLVM + wave runtime dynamic stride ABI: leading stride arguments are
-        # passed at launch.  Flattening to LINEAR_INDEX uses dense strides from
-        # ``symbolic_shape``; that is wrong when logical layout skews vs
-        # ``physical_layout``, or when ``allow_noncontiguous_runtime_buffers``
-        # is set and there is no ``MemoryLayout`` (slice views may have
-        # non-dense leading strides).  WaveASM uses ``dynamic_strides == False``;
-        # keep read linearization for that stack by default.
-        if (
-            options is not None
-            and options.dynamic_strides
-            and options.backend == "llvm"
-        ):
-            layout = getattr(memory.type, "physical_layout", None)
+        # Dynamic-strides-specific guards: under the LLVM + wave runtime
+        # ABI the only correct dense-stride assumption is when physical
+        # layout matches or is absent AND non-contiguous buffers are not
+        # expected.  The symbolic_strides_match_physical_memory check
+        # handles layout skew (e.g. attention's transposed layouts); the
+        # allow_noncontiguous_runtime_buffers opt-out handles slice views.
+        if options is not None and options.dynamic_strides:
             if not symbolic_strides_match_physical_memory(memory, symbolic_shape):
                 continue
             if options.allow_noncontiguous_runtime_buffers and layout is None:
@@ -255,7 +250,6 @@ def flatten_read_indices(
             continue
         symbolic_dims = [infer_dim(d) for d in symbolic_shape]
 
-        layout = getattr(memory.type, "physical_layout", None)
         stride_shape = layout.shape if layout is not None else symbolic_shape
 
         phys_starts = _get_physical_starts(

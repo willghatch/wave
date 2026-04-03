@@ -1073,9 +1073,9 @@ def _handle_read_linear_index(
     ):
         subs_map = add_emitter_subs(emitter, dynamic_vals_map_start)
         sym_strides = _sym_strides_for_flat_memref(kb_src, input_shape)
-        # LINEAR_INDEX global reads use maskedload on a linearized memref, not
-        # amdgpu buffer fat-pointer + per-lane scalar loads, so numerics match
-        # under IREE (VMFB) launch as well as the wave runtime.
+        # Invariant: LINEAR_INDEX global reads always use maskedload on a
+        # linearized memref, never buffer fat-pointer ops.  This ensures
+        # numerics match under both IREE (VMFB) and wave runtime launch.
         linear_buffer_ops = False
         lin_src = _linear_read_linearize_memref_maybe_hoisted(
             emitter,

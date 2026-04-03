@@ -808,9 +808,10 @@ def test_mxfp4_scaled_mma_unaligned_16x16x128():
     # CHECK-DAG:        %[[THREAD_ID_X:.*]] = gpu.thread_id  x upper_bound 256
     # CHECK-DAG:        %[[THREAD_ID_Y:.*]] = gpu.thread_id  y upper_bound 2
     # CHECK-DAG:        %{{.*}} = memref.alloc() : memref<{{.*}}xi8, #gpu.address_space<workgroup>>
-    # CHECK-DAG:        %{{.*}} = memref.reinterpret_cast %{{.*}} to offset: [0], sizes: [2147483646], strides: [1] : memref<i8> to memref<2147483646xi8, strided<[1]>>
+    # 2147483646 = (2^31 - 1) / 1 - 1 : max i8 element count for a 32-bit SRD
+    # CHECK-DAG:        %[[RC:.*]] = memref.reinterpret_cast %{{.*}} to offset: [0], sizes: [2147483646], strides: [1] : memref<i8> to memref<2147483646xi8, strided<[1]>>
     # CHECK-DAG:        arith.select %{{.*}}, %{{.*}}, %{{.*}} : index
-    # CHECK-DAG:        vector.maskedload %reinterpret_cast{{.*}}[%{{.*}}], %{{.*}}, %{{.*}} : memref<2147483646xi8, strided<[1]>>, vector<16xi1>, vector<16xi8> into vector<16xi8>
+    # CHECK-DAG:        vector.maskedload %[[RC]][%{{.*}}], %{{.*}}, %{{.*}} : memref<2147483646xi8, strided<[1]>>, vector<16xi1>, vector<16xi8> into vector<16xi8>
 
 
 @run_test
