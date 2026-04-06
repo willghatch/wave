@@ -345,11 +345,12 @@ IfOp RegionBuilder::buildIfFromSCFIf(scf::IfOp ifOp) {
     conditionValue = S_MOV_B32::create(builder, loc, sregType, conditionValue);
   } else if (isVGPRType(conditionValue.getType())) {
     auto sregType = ctx.createSRegType();
+    auto sccType = ctx.createSCCType();
     Value scalarCond =
         V_READFIRSTLANE_B32::create(builder, loc, sregType, conditionValue);
     auto zeroImm = ConstantOp::create(builder, loc, ctx.createImmType(0), 0);
     conditionValue =
-        S_CMP_GT_U32::create(builder, loc, sregType, scalarCond, zeroImm);
+        S_CMP_GT_U32::create(builder, loc, sccType, scalarCond, zeroImm);
   }
 
   // Infer result types by peeking at what the then region will yield

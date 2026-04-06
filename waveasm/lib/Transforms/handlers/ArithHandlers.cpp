@@ -410,6 +410,7 @@ LogicalResult handleArithCmpI(Operation *op, TranslationContext &ctx) {
 
   if (allUsesAreScfIf) {
     auto sregType = ctx.createSRegType();
+    auto sccType = ctx.createSCCType();
     auto promoteToSGPR = [&](Value v) -> Value {
       if (isImmType(v.getType()))
         return v;
@@ -424,34 +425,34 @@ LogicalResult handleArithCmpI(Operation *op, TranslationContext &ctx) {
     Value result;
     switch (cmpOp.getPredicate()) {
     case arith::CmpIPredicate::eq:
-      result = S_CMP_EQ_U32::create(builder, loc, sregType, lhsS, rhsS);
+      result = S_CMP_EQ_U32::create(builder, loc, sccType, lhsS, rhsS);
       break;
     case arith::CmpIPredicate::ne:
-      result = S_CMP_NE_U32::create(builder, loc, sregType, lhsS, rhsS);
+      result = S_CMP_NE_U32::create(builder, loc, sccType, lhsS, rhsS);
       break;
     case arith::CmpIPredicate::slt:
-      result = S_CMP_LT_I32::create(builder, loc, sregType, lhsS, rhsS);
+      result = S_CMP_LT_I32::create(builder, loc, sccType, lhsS, rhsS);
       break;
     case arith::CmpIPredicate::sle:
-      result = S_CMP_LE_I32::create(builder, loc, sregType, lhsS, rhsS);
+      result = S_CMP_LE_I32::create(builder, loc, sccType, lhsS, rhsS);
       break;
     case arith::CmpIPredicate::sgt:
-      result = S_CMP_GT_I32::create(builder, loc, sregType, lhsS, rhsS);
+      result = S_CMP_GT_I32::create(builder, loc, sccType, lhsS, rhsS);
       break;
     case arith::CmpIPredicate::sge:
-      result = S_CMP_GE_I32::create(builder, loc, sregType, lhsS, rhsS);
+      result = S_CMP_GE_I32::create(builder, loc, sccType, lhsS, rhsS);
       break;
     case arith::CmpIPredicate::ult:
-      result = S_CMP_LT_U32::create(builder, loc, sregType, lhsS, rhsS);
+      result = S_CMP_LT_U32::create(builder, loc, sccType, lhsS, rhsS);
       break;
     case arith::CmpIPredicate::ule:
-      result = S_CMP_LE_U32::create(builder, loc, sregType, lhsS, rhsS);
+      result = S_CMP_LE_U32::create(builder, loc, sccType, lhsS, rhsS);
       break;
     case arith::CmpIPredicate::ugt:
-      result = S_CMP_GT_U32::create(builder, loc, sregType, lhsS, rhsS);
+      result = S_CMP_GT_U32::create(builder, loc, sccType, lhsS, rhsS);
       break;
     case arith::CmpIPredicate::uge:
-      result = S_CMP_GE_U32::create(builder, loc, sregType, lhsS, rhsS);
+      result = S_CMP_GE_U32::create(builder, loc, sccType, lhsS, rhsS);
       break;
     }
     ctx.getMapper().mapValue(cmpOp.getResult(), result);
