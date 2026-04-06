@@ -14,6 +14,7 @@ from .tagged_mxfp4_gemm import (
     get_tagged_splitk_mxfp4_gemm,
     get_tagged_splitk_mxfp4_gemm_preshuffle_b,
     get_tagged_splitk_mxfp4_gemm_preshuffle_scales,
+    get_tagged_streamk_mxfp4_gemm,
 )
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "get_tagged_splitk_mxfp4_gemm",
     "get_tagged_splitk_mxfp4_gemm_preshuffle_b",
     "get_tagged_splitk_mxfp4_gemm_preshuffle_scales",
+    "get_tagged_streamk_mxfp4_gemm",
 ]
