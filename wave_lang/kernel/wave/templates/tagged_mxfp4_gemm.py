@@ -959,6 +959,49 @@ def get_tagged_streamk_mxfp4_gemm(
     )
 
 
+def get_tagged_streamk_mxfp4_gemm_preshuffle_scales(
+    shape: tuple[int, int, int] = (256, 256, 256),
+    block_shape: tuple[int, int, int] = (128, 128, 128),
+    wave_shape: tuple[int, int] = (2, 2),
+    mfma_variant: ScaledMMAType = ScaledMMAType.F32_16x16x128_F8F6F4,
+    a_address_space: tkl.AddressSpace = GLOBAL_ADDRESS_SPACE,
+    output_type: "tkl.DataType" = tkl.f32,
+    num_ctas: int = 304,
+):
+    """Return a tagged stream-K MXFP4 GEMM kernel with preshuffled scales.
+
+    Stream-K distributes K-loop iterations across a fixed number of CTAs
+    (persistent kernel).  Each CTA dynamically determines which output tile(s)
+    and K-range(s) to process, using atomic_add for accumulation.  The caller
+    must zero-initialize C before launch.
+
+    A and B data are read from global memory with plain CTA-offset mappings.
+    A and B scales are read from global memory using e8m0 preshuffle mappings.
+
+    Args:
+        shape: (M, N, K) problem dimensions.
+        block_shape: (BLOCK_M, BLOCK_N, BLOCK_K) tile sizes.
+        wave_shape: (WAVE_M, WAVE_N) waves per workgroup.
+        mfma_variant: Scaled MMA instruction type.
+        a_address_space: Address space for A/B data.
+        output_type: Element type of output tensor C.
+        num_ctas: Number of CTAs (workgroups) to launch.
+
+    Returns:
+        (kernel_function, WaveCompileOptions)
+    """
+    return _get_tagged_streamk_mxfp4_gemm_impl(
+        shape,
+        block_shape,
+        wave_shape,
+        mfma_variant,
+        a_address_space,
+        preshuffle_scales=True,
+        output_type=output_type,
+        num_ctas=num_ctas,
+    )
+
+
 def _get_tagged_streamk_mxfp4_gemm_impl(
     shape: tuple[int, int, int],
     block_shape: tuple[int, int, int],
@@ -966,14 +1009,27 @@ def _get_tagged_streamk_mxfp4_gemm_impl(
     mfma_variant: ScaledMMAType,
     a_address_space: tkl.AddressSpace,
     *,
+    preshuffle_scales: bool = False,
     output_type: "tkl.DataType" = tkl.f32,
     num_ctas: int = 304,
 ):
-    """Implementation for tagged stream-K MXFP4 GEMM kernel.
+    """Shared implementation for tagged stream-K MXFP4 GEMM kernels.
 
     Uses a persistent-kernel approach: a fixed number of CTAs iterate over
     work units.  Each work unit covers a contiguous range of K-loop iterations
     for one output tile.  Partial results are accumulated into C via atomic_add.
+
+    When preshuffle_scales is False:
+        all data and scales are read from global memory with plain CTA-offset
+        mappings.
+    When preshuffle_scales is True:
+        A and B data use plain CTA-offset mappings; A and B scales are read
+        from global memory using e8m0 preshuffle mappings (with CTA offsets).
+
+    Note: preshuffle_B is not supported for stream-K.  The B preshuffle
+    mapping uses nonlinear arithmetic on the K iterator (floor-div, modulo)
+    which does not compose correctly with stream-K's dynamic
+    TilingConstraint(K, start=..., iters=...).
     """
     from wave_lang.kernel._support.indexing import sym
     from wave_lang.kernel._support.dtype import i32
@@ -998,6 +1054,9 @@ def _get_tagged_streamk_mxfp4_gemm_impl(
     BLOCK_N = tkl.sym.BLOCK_N
     BLOCK_K = tkl.sym.BLOCK_K
     ADDRESS_SPACE = tkl.sym.ADDRESS_SPACE
+    K_SCALE_SHUFFLED = tkl.sym.K_SCALE_SHUFFLED
+
+    k_scale_shuffled_val = (((k // 32) + 7) // 8) * 8
 
     NUM_CTAS = sym.NUM_CTAS
     N_TILES = sym.N_TILES
@@ -1014,35 +1073,92 @@ def _get_tagged_streamk_mxfp4_gemm_impl(
     i = tkw.IndexMapping.iterator(0)
     j = tkw.IndexMapping.iterator(1)
 
+    # --- A data read mapping (always plain offset) ---
     a_read_mapping = tkw.IndexMapping(
         num_iterators=2,
         inputs={M: i + CTA_M_OFFSET, K: j},
         outputs={M: i, K: j},
     )
 
-    a_scale_read_mapping = tkw.IndexMapping(
-        num_iterators=2,
-        inputs={M: i + CTA_M_OFFSET, K: j},
-        outputs={M: i, K: j},
-    )
-
+    # --- B data read mapping ---
+    # NOTE: preshuffle_B is not supported for stream-K because the B
+    # preshuffle mapping uses nonlinear arithmetic on the K iterator
+    # (floor-div, modulo), which does not compose correctly with the
+    # dynamic TilingConstraint(K, start=..., iters=...) that stream-K
+    # requires.  The dynamic K start symbol propagates into the
+    # preshuffle expression and the compiler generates incorrect code.
+    # preshuffle_scales works because the e8m0 scale mappings operate
+    # on the K/32 scale dimension, not the K/2 data dimension.
     b_read_mapping = tkw.IndexMapping(
         num_iterators=2,
         inputs={N: i + CTA_N_OFFSET, K: j},
         outputs={N: i, K: j},
     )
 
-    b_scale_read_mapping = tkw.IndexMapping(
-        num_iterators=2,
-        inputs={N: i + CTA_N_OFFSET, K: j},
-        outputs={N: i, K: j},
-    )
+    # --- Scale read mappings ---
+    a_scale_read_mapping = None
+    b_scale_read_mapping = None
+    if preshuffle_scales:
+        # A scale e8m0 preshuffle with CTA_M_OFFSET
+        i_a = tkw.IndexMapping.iterator(0)
+        j_a = tkw.IndexMapping.iterator(1)
+        _flat_a = (
+            (j_a // 32) * ((k_scale_shuffled_val // 8) * 256)
+            + (i_a // 8) * 256
+            + ((i_a % 8) % 4) * 64
+            + ((j_a % 32) % 16) * 4
+            + (((i_a % 8) // 4) * 2)
+            + ((j_a % 32) // 16)
+        )
+        a_scale_read_mapping = tkw.IndexMapping(
+            num_iterators=2,
+            inputs={
+                M: _flat_a // k_scale_shuffled_val + CTA_M_OFFSET,
+                K: _flat_a % k_scale_shuffled_val,
+            },
+            outputs={K: i_a, M: j_a},
+        )
+
+        # B scale e8m0 preshuffle with CTA_N_OFFSET
+        kk = tkw.IndexMapping.iterator(0)
+        n_s = tkw.IndexMapping.iterator(1)
+        _flat_b = (
+            (n_s // 32) * ((k_scale_shuffled_val // 8) * 256)
+            + (kk // 8) * 256
+            + ((kk % 8) % 4) * 64
+            + ((n_s % 32) % 16) * 4
+            + (((kk % 8) // 4) * 2)
+            + ((n_s % 32) // 16)
+        )
+        b_scale_read_mapping = tkw.IndexMapping(
+            num_iterators=2,
+            inputs={
+                N: _flat_b // k_scale_shuffled_val + CTA_N_OFFSET,
+                K: _flat_b % k_scale_shuffled_val,
+            },
+            outputs={K: kk, N: n_s},
+        )
+    else:
+        a_scale_read_mapping = tkw.IndexMapping(
+            num_iterators=2,
+            inputs={M: i + CTA_M_OFFSET, K: j},
+            outputs={M: i, K: j},
+        )
+        b_scale_read_mapping = tkw.IndexMapping(
+            num_iterators=2,
+            inputs={N: i + CTA_N_OFFSET, K: j},
+            outputs={N: i, K: j},
+        )
 
     c_write_mapping = tkw.IndexMapping(
         num_iterators=2,
         inputs={M: i, N: j},
         outputs={M: i + CTA_M_OFFSET, N: j + CTA_N_OFFSET},
     )
+
+    # Address spaces: scales from global when preshuffled.
+    a_scale_space = GLOBAL_ADDRESS_SPACE if preshuffle_scales else ADDRESS_SPACE
+    b_scale_space = GLOBAL_ADDRESS_SPACE if preshuffle_scales else ADDRESS_SPACE
 
     constraints: list[tkw.Constraint] = [
         tkw.GridConstraint(NUM_CTAS),
@@ -1064,9 +1180,9 @@ def _get_tagged_streamk_mxfp4_gemm_impl(
     @tkw.wave(constraints)
     def streamk_mxfp4_gemm(
         a: tkl.Memory[M, K / 2, ADDRESS_SPACE, tkl.i8],
-        a_scale: tkl.Memory[M, K / 32, ADDRESS_SPACE, tkl.i8],
+        a_scale: tkl.Memory[M, K / 32, a_scale_space, tkl.i8],
         b: tkl.Memory[N, K / 2, ADDRESS_SPACE, tkl.i8],
-        b_scale: tkl.Memory[N, K / 32, ADDRESS_SPACE, tkl.i8],
+        b_scale: tkl.Memory[N, K / 32, b_scale_space, tkl.i8],
         c: tkl.Memory[M, N, GLOBAL_ADDRESS_SPACE, output_type],
     ):
         cta_id = tkw.scalar(WORKGROUP_0, i32)
@@ -1161,6 +1277,9 @@ def _get_tagged_streamk_mxfp4_gemm_impl(
         SK_ITERS_PCU: sk_iters_pcu,
         SK_EXTRA_ITERS: sk_extra_iters,
     }
+    if preshuffle_scales:
+        hyperparams[K_SCALE_SHUFFLED] = k_scale_shuffled_val
+
     options = WaveCompileOptions(
         subs=hyperparams,
         canonicalize=True,
