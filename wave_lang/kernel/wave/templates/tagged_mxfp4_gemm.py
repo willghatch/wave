@@ -15,6 +15,8 @@ Provides:
   - get_tagged_splitk_mxfp4_gemm:                       split-K (A, B, scales via LDS)
   - get_tagged_splitk_mxfp4_gemm_preshuffle_scales:     split-K with preshuffled scales
   - get_tagged_splitk_mxfp4_gemm_preshuffle_b:          split-K with preshuffled B + scales
+  - get_tagged_multibuffer_splitk_mxfp4_gemm:             split-K workspace + separate reduction (no atomics)
+  - get_tagged_mbsk_splitk_mxfp4_gemm:                  split-K workspace + sync buffer, single kernel
 
 Required tags: k_loop, read_a, read_a_scale, read_b, read_b_scale,
 bitcast_a, bitcast_a_scale, bitcast_b, bitcast_b_scale, scaled_mma.
@@ -915,6 +917,50 @@ def get_tagged_splitk_mxfp4_gemm_preshuffle_b(
         a_address_space,
         preshuffle_B=True,
         output_type=output_type,
+    )
+
+
+def get_tagged_multibuffer_splitk_mxfp4_gemm(
+    shape: tuple[int, int, int] = (1024, 1024, 8192),
+    num_splits: int = 2,
+    block_shape: tuple[int, int, int] = (128, 128, 256),
+    wave_shape: tuple[int, int] = (2, 2),
+    mfma_variant: ScaledMMAType = ScaledMMAType.F32_16x16x128_F8F6F4,
+    a_address_space: tkl.AddressSpace = SHARED_ADDRESS_SPACE,
+    output_type: "tkl.DataType" = tkl.f32,
+):
+    """Return tagged split-K MXFP4 GEMM main kernel, options, reduction kernel, and options.
+
+    MultipleBuffer split-K writes each split's partial result to a workspace buffer,
+    then a separate reduction kernel sums partials into C (no atomic_add on C).
+
+    Raises:
+        NotImplementedError: Until the main and reduction kernels are implemented.
+    """
+    raise NotImplementedError(
+        "get_tagged_multibuffer_splitk_mxfp4_gemm: main + reduction kernels not implemented yet"
+    )
+
+
+def get_tagged_mbsk_splitk_mxfp4_gemm(
+    shape: tuple[int, int, int] = (1024, 1024, 8192),
+    num_splits: int = 2,
+    block_shape: tuple[int, int, int] = (128, 128, 256),
+    wave_shape: tuple[int, int] = (2, 2),
+    mfma_variant: ScaledMMAType = ScaledMMAType.F32_16x16x128_F8F6F4,
+    a_address_space: tkl.AddressSpace = SHARED_ADDRESS_SPACE,
+    output_type: "tkl.DataType" = tkl.f32,
+):
+    """Return tagged MBSK (MultipleBufferSingleKernel) split-K MXFP4 GEMM + compile options.
+
+    Single kernel uses a workspace for partials and a synchronizer buffer for
+    cross-workgroup coordination before reduction.
+
+    Raises:
+        NotImplementedError: Until the kernel is implemented.
+    """
+    raise NotImplementedError(
+        "get_tagged_mbsk_splitk_mxfp4_gemm: kernel not implemented yet"
     )
 
 
