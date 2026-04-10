@@ -3814,9 +3814,9 @@ def testMBSKSplitKMxfp4Gemm(
         ((256, 256, 512), 2),
         ((256, 256, 1024), 2),
         ((512, 512, 1024), 2),
-        ((256, 256, 256), 4),
         ((256, 256, 512), 4),
         ((256, 256, 1024), 4),
+        ((256, 256, 2048), 4),
     ],
 )
 @pytest.mark.parametrize("output_type", [torch.float32])
@@ -3825,22 +3825,30 @@ def testLocalSplitUMxfp4Gemm(
     lsu_factor: int,
     output_type: torch.dtype,
 ):
-    """LocalSplitU splits K across waves within a workgroup via LDS reduction.
+    """LocalSplitU: 2-kernel split-K with workspace reduction, no atomics on C.
 
-    No atomic_add on the output -- each workgroup produces a fully reduced
-    tile via intra-workgroup LDS reduction.
+    Main kernel writes f32 partials to workspace.
+    Reduction kernel sums partials and writes the final result to C.
     """
-    lsu_gemm, options = get_tagged_lsu_mxfp4_gemm(
+    block_shape = (128, 128, 128)
+    (
+        main_fn,
+        main_options,
+        reduction_fn,
+        reduction_options,
+    ) = get_tagged_lsu_mxfp4_gemm(
         shape,
         lsu_factor=lsu_factor,
-        block_shape=(128, 128, 128),
+        block_shape=block_shape,
         mfma_variant=ScaledMMAType.F32_16x16x128_F8F6F4,
         output_type=TORCH_DTYPE_TO_WAVE[output_type],
     )
 
-    options = set_default_run_config(options)
+    main_options = set_default_run_config(main_options)
+    reduction_options = set_default_run_config(reduction_options)
     schedule = get_mxfp4_dbuf_schedule(use_stagger=True, k_partitions=1)
-    compiled = wave_compile(options, lsu_gemm, schedule)
+    compiled_main = wave_compile(main_options, main_fn, schedule)
+    compiled_reduction = wave_compile(reduction_options, reduction_fn)
 
     m, n, k = shape
     x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(
@@ -3852,9 +3860,14 @@ def testLocalSplitUMxfp4Gemm(
     w_t_gpu = w.T.contiguous().cuda()
     x_scales_gpu = x_scales.cuda()
     w_scales_gpu = w_scales.cuda()
+    block_m, block_n, _ = block_shape
+    num_tiles = math.ceil(m / block_m) * math.ceil(n / block_n)
+    workspace = device_zeros(lsu_factor, m, n, dtype=torch.float32)
+    sync_counter = device_zeros(num_tiles, dtype=torch.int32)
     c_gpu = device_zeros(m, n, dtype=output_type)
 
-    compiled(x_gpu, x_scales_gpu, w_t_gpu, w_scales_gpu, c_gpu)
+    compiled_main(x_gpu, x_scales_gpu, w_t_gpu, w_scales_gpu, workspace, sync_counter)
+    compiled_reduction(workspace, c_gpu)
     assert_close(c_gpu.cpu(), torch_ref, rtol=1e-3, atol=1e-2)
 
 

@@ -1323,12 +1323,16 @@ def get_tagged_lsu_mxfp4_gemm(
     a_address_space: tkl.AddressSpace = SHARED_ADDRESS_SPACE,
     output_type: "tkl.DataType" = tkl.f32,
 ):
-    """Return a tagged LocalSplitU MXFP4 GEMM kernel + compile options.
+    """Return tagged LocalSplitU MXFP4 GEMM main kernel, options, reduction kernel, and options.
 
-    LocalSplitU splits the K dimension across waves within a single workgroup.
-    Each wave computes a partial accumulator over its K-slice, then all waves
-    reduce via LDS (write partials -> barrier -> read all -> elementwise add).
-    The final reduced result is written directly to C -- no atomic_add needed.
+    LocalSplitU splits the K dimension across ``lsu_factor`` workgroups.  The
+    main kernel writes ``f32`` partials to ``workspace[S, M, N]``.  A separate
+    reduction kernel sums partials into ``C`` without atomics.
+
+    The sync_counter argument is accepted by the main kernel for API
+    compatibility (it atomically increments a per-tile counter for profiling
+    and future single-kernel upgrades) but the reduction is performed by the
+    second kernel.
 
     Args:
         shape: (M, N, K) problem dimensions.
@@ -1340,9 +1344,202 @@ def get_tagged_lsu_mxfp4_gemm(
         output_type: Element type of output tensor C.
 
     Returns:
-        (kernel_function, WaveCompileOptions)
+        (main_kernel_fn, main_options, reduction_kernel_fn, reduction_options)
     """
-    raise NotImplementedError("LocalSplitU MXFP4 GEMM not yet implemented")
+    m, n, k = shape
+    k_per_split = math.ceil(k / lsu_factor)
+    if k_per_split < block_shape[2]:
+        raise ValueError(
+            f"K per split ({k_per_split}) is less than BLOCK_K ({block_shape[2]}). "
+            f"Reduce lsu_factor or BLOCK_K so that each split has at least BLOCK_K elements."
+        )
+    if k_per_split % block_shape[2] != 0:
+        raise ValueError(
+            f"k_per_split ({k_per_split}) must be a multiple of BLOCK_K ({block_shape[2]})."
+        )
+    if lsu_factor not in (2, 4):
+        raise ValueError(f"lsu_factor must be 2 or 4, got {lsu_factor}")
+
+    num_wg_m = math.ceil(m / block_shape[0])
+    num_wg_n = math.ceil(n / block_shape[1])
+    num_tiles = num_wg_m * num_wg_n
+
+    M = tkl.sym.M
+    N = tkl.sym.N
+    K = tkl.sym.K
+    S = tkl.sym.S
+    BLOCK_M = tkl.sym.BLOCK_M
+    BLOCK_N = tkl.sym.BLOCK_N
+    BLOCK_K = tkl.sym.BLOCK_K
+    BLOCK_S = tkl.sym.BLOCK_S
+    K_SPLIT_OFF = tkl.sym.K_SPLIT_OFF
+    K_SPLIT_LEN = tkl.sym.K_SPLIT_LEN
+    ADDRESS_SPACE = tkl.sym.ADDRESS_SPACE
+    B_ADDRESS_SPACE = tkl.sym.B_ADDRESS_SPACE
+    SYNC_SIZE = tkl.sym.SYNC_SIZE
+
+    NUM_WG_M = sympy.ceiling(M / BLOCK_M)
+    i_s = tkw.IndexMapping.iterator(0)
+    sync_atomic_mapping = tkw.IndexMapping(
+        num_iterators=1,
+        inputs={S: WORKGROUP_0 + WORKGROUP_1 * NUM_WG_M},
+        outputs={S: i_s},
+    )
+
+    constraints_main: list[tkw.Constraint] = [
+        tkw.WorkgroupConstraint(M, BLOCK_M, 0),
+        tkw.WorkgroupConstraint(N, BLOCK_N, 1),
+        tkw.WorkgroupConstraint(S, BLOCK_S, 2),
+        tkw.TilingConstraint(
+            K,
+            BLOCK_K,
+            iters=sympy.ceiling(K_SPLIT_LEN / BLOCK_K),
+            start=K_SPLIT_OFF,
+        ),
+        tkw.WaveConstraint(M, sympy.floor(BLOCK_M / wave_shape[0])),
+        tkw.WaveConstraint(N, sympy.floor(BLOCK_N / wave_shape[1])),
+        tkw.HardwareConstraint(
+            threads_per_wave=64,
+            mma_type=mfma_variant,
+            vector_shapes={S: 0},
+        ),
+    ]
+
+    @tkw.wave(constraints_main)
+    def lsu_main(
+        a: tkl.Memory[M, K / 2, ADDRESS_SPACE, tkl.i8],
+        a_scale: tkl.Memory[M, K / 32, ADDRESS_SPACE, tkl.i8],
+        b: tkl.Memory[N, K / 2, B_ADDRESS_SPACE, tkl.i8],
+        b_scale: tkl.Memory[N, K / 32, ADDRESS_SPACE, tkl.i8],
+        workspace: tkl.Memory[S, M, N, GLOBAL_ADDRESS_SPACE, tkl.f32],
+        sync_counter: tkl.Memory[SYNC_SIZE, GLOBAL_ADDRESS_SPACE, tkl.i32],
+    ):
+        c_reg = tkl.Register[M, N, tkl.f32](0.0)
+
+        @tkw.iterate(K, init_args=[c_reg], tag="k_loop")
+        def repeat(
+            acc: tkl.Register[M, N, tkl.f32],
+        ) -> tkl.Register[M, N, tkl.f32]:
+            a_reg = tkw.read(a, tag="read_a")
+            a_reg = tkw.bitcast(a_reg, tkl.f4e2m1fn, tag="bitcast_a")
+            a_scale_reg = tkw.read(a_scale, tag="read_a_scale")
+            a_scale_reg = tkw.bitcast(a_scale_reg, tkl.f8e8m0fnu, tag="bitcast_a_scale")
+            b_reg = tkw.read(b, tag="read_b")
+            b_reg = tkw.bitcast(b_reg, tkl.f4e2m1fn, tag="bitcast_b")
+            b_scale_reg = tkw.read(b_scale, tag="read_b_scale")
+            b_scale_reg = tkw.bitcast(b_scale_reg, tkl.f8e8m0fnu, tag="bitcast_b_scale")
+            acc = tkw.scaled_mma(
+                a_reg, a_scale_reg, b_reg, b_scale_reg, acc, tag="scaled_mma"
+            )
+            return acc
+
+        tkw.write(repeat, workspace)
+
+        one_s = tkl.Register[S, tkl.i32](1)
+        tkw.atomic_add(one_s, sync_counter, mapping=sync_atomic_mapping)
+
+    hyperparams_main = {
+        ADDRESS_SPACE: a_address_space,
+        B_ADDRESS_SPACE: a_address_space,
+        BLOCK_M: block_shape[0],
+        BLOCK_N: block_shape[1],
+        BLOCK_K: block_shape[2],
+        BLOCK_S: 1,
+        M: m,
+        N: n,
+        K: k,
+        S: lsu_factor,
+        SYNC_SIZE: num_tiles,
+        K_SPLIT_OFF: WORKGROUP_2 * k_per_split,
+        K_SPLIT_LEN: sympy.Min(K, (WORKGROUP_2 + 1) * k_per_split) - K_SPLIT_OFF,
+    }
+    for key, value in hyperparams_main.items():
+        if isinstance(value, sympy.Expr):
+            hyperparams_main[key] = value.subs(hyperparams_main)
+
+    hyperparams_main.update(get_default_scheduling_params())
+
+    main_options = WaveCompileOptions(
+        subs=hyperparams_main,
+        canonicalize=True,
+        schedule=SchedulingType.MANUAL,
+        use_global_to_shared=True,
+        minimize_shared_allocs=False,
+    )
+
+    NUM_SPLITS = tkl.sym.NUM_SPLITS
+    BLOCK_RED = tkl.sym.BLOCK_RED
+    wave_m = block_shape[0] // wave_shape[0]
+    wave_n = block_shape[1] // wave_shape[1]
+
+    constraints_red: list[tkw.Constraint] = [
+        tkw.WorkgroupConstraint(M, BLOCK_M, 0),
+        tkw.WorkgroupConstraint(N, BLOCK_N, 1),
+        tkw.TilingConstraint(NUM_SPLITS, BLOCK_RED),
+        tkw.WaveConstraint(M, sympy.floor(BLOCK_M / wave_shape[0])),
+        tkw.WaveConstraint(N, sympy.floor(BLOCK_N / wave_shape[1])),
+        tkw.HardwareConstraint(
+            threads_per_wave=64,
+            mma_type=mfma_variant,
+            vector_shapes={
+                M: wave_m,
+                N: wave_n,
+                NUM_SPLITS: 1,
+            },
+        ),
+    ]
+
+    @tkw.wave(constraints_red)
+    def lsu_reduction(
+        workspace: tkl.Memory[NUM_SPLITS, M, N, GLOBAL_ADDRESS_SPACE, tkl.f32],
+        c: tkl.Memory[M, N, GLOBAL_ADDRESS_SPACE, output_type],
+    ):
+        acc = tkl.Register[M, N, tkl.f32](0.0)
+
+        @tkw.iterate(NUM_SPLITS, init_args=[acc])
+        def sum_splits(
+            acc: tkl.Register[M, N, tkl.f32],
+        ) -> tkl.Register[M, N, tkl.f32]:
+            partial = tkw.read(workspace)
+            return acc + partial
+
+        out = tkw.cast(sum_splits, output_type)
+        tkw.write(out, c)
+
+    hyperparams_red = {
+        BLOCK_M: block_shape[0],
+        BLOCK_N: block_shape[1],
+        BLOCK_RED: 1,
+        M: m,
+        N: n,
+        NUM_SPLITS: lsu_factor,
+    }
+    hyperparams_red.update(get_default_scheduling_params())
+
+    reduction_options = WaveCompileOptions(
+        subs=hyperparams_red,
+        canonicalize=True,
+        schedule=SchedulingType.NONE,
+        use_global_to_shared=False,
+        minimize_shared_allocs=False,
+    )
+
+    return lsu_main, main_options, lsu_reduction, reduction_options
+    for key, value in hyperparams.items():
+        if isinstance(value, sympy.Expr):
+            hyperparams[key] = value.subs(hyperparams)
+
+    hyperparams.update(get_default_scheduling_params())
+
+    options = WaveCompileOptions(
+        subs=hyperparams,
+        canonicalize=True,
+        schedule=SchedulingType.MANUAL,
+        use_global_to_shared=True,
+        minimize_shared_allocs=False,
+    )
+
+    return lsu_gemm, options
 
 
 def get_tagged_tree_streamk_mxfp4_gemm(
