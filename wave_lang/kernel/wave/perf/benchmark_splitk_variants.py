@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Benchmark split-K MXFP4 variants (atomic, multibuffer, MBSK) vs baseline.
+"""Benchmark split-K MXFP4 variants vs baseline.
 
 Compares:
   - baseline: get_tagged_mxfp4_gemm (S=1)
   - atomic: get_tagged_splitk_mxfp4_gemm
   - multibuffer: get_tagged_multibuffer_splitk_mxfp4_gemm (main + reduction)
   - mbsk: get_tagged_mbsk_splitk_mxfp4_gemm
+  - lsu: get_tagged_lsu_mxfp4_gemm (LocalSplitU, 2-kernel)
+  - tree_streamk: get_tagged_tree_streamk_mxfp4_gemm (StreamK + atomic_add)
 
 Usage (from worktree root with WAVE_DIR and deps set):
     python wave_lang/kernel/wave/perf/benchmark_splitk_variants.py [--csv PATH]
@@ -26,10 +28,12 @@ from wave_lang.kernel.wave.compile import wave_compile
 from wave_lang.kernel.wave.constraints import ScaledMMAType
 from wave_lang.kernel.wave.schedules import get_mxfp4_dbuf_schedule
 from wave_lang.kernel.wave.templates.tagged_mxfp4_gemm import (
+    get_tagged_lsu_mxfp4_gemm,
     get_tagged_mbsk_splitk_mxfp4_gemm,
     get_tagged_multibuffer_splitk_mxfp4_gemm,
     get_tagged_mxfp4_gemm,
     get_tagged_splitk_mxfp4_gemm,
+    get_tagged_tree_streamk_mxfp4_gemm,
 )
 from wave_lang.kernel.wave.utils.mxfp_utils import generate_gemm_afp4wfp4_inputs
 from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
@@ -181,6 +185,64 @@ def compile_and_bench_mbsk(
     return benchmark_kernel(run)
 
 
+def compile_and_bench_lsu(
+    shape: tuple[int, int, int],
+    block_shape: tuple[int, int, int],
+    num_splits: int,
+) -> float:
+    main_fn, main_options, red_fn, red_options = get_tagged_lsu_mxfp4_gemm(
+        shape,
+        lsu_factor=num_splits,
+        block_shape=block_shape,
+        mfma_variant=ScaledMMAType.F32_16x16x128_F8F6F4,
+    )
+    main_options = set_default_run_config(main_options)
+    red_options = set_default_run_config(red_options)
+    schedule = get_mxfp4_dbuf_schedule(use_stagger=True, k_partitions=1)
+    compiled_main = wave_compile(main_options, main_fn, schedule)
+    compiled_red = wave_compile(red_options, red_fn)
+
+    m, n, k = shape
+    block_m, block_n, _ = block_shape
+    num_tiles = math.ceil(m / block_m) * math.ceil(n / block_n)
+    x, w, x_s, w_s = generate_gemm_afp4wfp4_inputs(shape, device=torch.device("cuda"))
+    w_t = w.T.contiguous()
+
+    def run() -> None:
+        workspace = device_zeros(num_splits, m, n, dtype=torch.float32)
+        sync_counter = device_zeros(num_tiles, dtype=torch.int32)
+        c = device_zeros(m, n, dtype=torch.float32)
+        compiled_main(x, x_s, w_t, w_s, workspace, sync_counter)
+        compiled_red(workspace, c)
+
+    return benchmark_kernel(run)
+
+
+def compile_and_bench_tree_streamk(
+    shape: tuple[int, int, int],
+    block_shape: tuple[int, int, int],
+    num_ctas: int,
+) -> float:
+    gemm, options = get_tagged_tree_streamk_mxfp4_gemm(
+        shape,
+        block_shape=block_shape,
+        mfma_variant=ScaledMMAType.F32_16x16x128_F8F6F4,
+        num_ctas=num_ctas,
+    )
+    options = set_default_run_config(options)
+    compiled = wave_compile(options, gemm)
+
+    m, n, k = shape
+    x, w, x_s, w_s = generate_gemm_afp4wfp4_inputs(shape, device=torch.device("cuda"))
+    w_t = w.T.contiguous()
+
+    def run() -> None:
+        c = device_zeros(m, n, dtype=torch.float32)
+        compiled(x, x_s, w_t, w_s, c)
+
+    return benchmark_kernel(run)
+
+
 def runtime_to_tflops(runtime_us: float, flops: float) -> float:
     if runtime_us <= 0:
         return float("nan")
@@ -223,6 +285,11 @@ def main() -> int:
         flops = get_flops(m, n, k)
         print(f"\n=== Shape ({m}, {n}, {k}), split S={num_splits} ===", flush=True)
 
+        block_m, block_n, block_k = BLOCK_SHAPE
+        num_tiles = math.ceil(m / block_m) * math.ceil(n / block_n)
+        num_ctas = num_tiles * num_splits
+        k_per_split = math.ceil(k / num_splits)
+
         variants: list[tuple[str, Callable[[], float]]] = [
             ("baseline", lambda: compile_and_bench_baseline(shape, BLOCK_SHAPE)),
             ("atomic", lambda: compile_and_bench_atomic(shape, BLOCK_SHAPE, num_splits)),
@@ -233,9 +300,40 @@ def main() -> int:
             ("mbsk", lambda: compile_and_bench_mbsk(shape, BLOCK_SHAPE, num_splits)),
         ]
 
+        if k_per_split >= block_k:
+            variants.append(
+                ("lsu", lambda: compile_and_bench_lsu(shape, BLOCK_SHAPE, num_splits)),
+            )
+        else:
+            variants.append(("lsu", None))
+
+        variants.append(
+            (
+                "tree_streamk",
+                lambda: compile_and_bench_tree_streamk(shape, BLOCK_SHAPE, num_ctas),
+            ),
+        )
+
         for name, bench_fn in variants:
+            if bench_fn is None:
+                row = {
+                    "m": m, "n": n, "k": k,
+                    "split_S": num_splits,
+                    "variant": name,
+                    "runtime_us": "SKIPPED",
+                    "tflops": "SKIPPED",
+                    "status": "skipped",
+                }
+                print(f"  {name}: SKIPPED (k_per_split < BLOCK_K)", flush=True)
+                rows.append(row)
+                continue
             rt, status = safe_bench(name, bench_fn)
-            split_s = 1 if name == "baseline" else num_splits
+            if name == "baseline":
+                split_s = 1
+            elif name == "tree_streamk":
+                split_s = num_ctas
+            else:
+                split_s = num_splits
             if rt is None:
                 row = {
                     "m": m,
