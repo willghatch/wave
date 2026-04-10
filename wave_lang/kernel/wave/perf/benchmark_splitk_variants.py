@@ -39,7 +39,25 @@ from wave_lang.kernel.wave.utils.mxfp_utils import generate_gemm_afp4wfp4_inputs
 from wave_lang.kernel.wave.utils.run_utils import set_default_run_config
 from wave_lang.kernel.wave.utils.torch_utils import device_zeros
 
-BLOCK_SHAPE = (128, 128, 128)
+
+def mxfp4_baseline_block_shape(shape: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Use BLOCK_K=256 when K is large enough and divisible by 256 (fewer K iters)."""
+    _, _, k = shape
+    if k >= 256 and k % 256 == 0:
+        return (128, 128, 256)
+    return (128, 128, 128)
+
+
+def mxfp4_splitk_block_shape(
+    shape: tuple[int, int, int], num_splits: int
+) -> tuple[int, int, int]:
+    """Use BLOCK_K=256 when each K-split length is a multiple of 256."""
+    _, _, k = shape
+    k_per_split = math.ceil(k / num_splits)
+    if k_per_split >= 256 and k_per_split % 256 == 0:
+        return (128, 128, 256)
+    return (128, 128, 128)
+
 
 # (M, N, K), num_splits for split-K variants; baseline always S=1.
 CONFIGS: list[tuple[tuple[int, int, int], int]] = [
@@ -60,7 +78,9 @@ def get_flops(m: int, n: int, k: int) -> float:
     return 2.0 * m * n * k
 
 
-def benchmark_kernel(run_fn: Callable[[], None], warmup: int = 3, iters: int = 10) -> float:
+def benchmark_kernel(
+    run_fn: Callable[[], None], warmup: int = 3, iters: int = 10
+) -> float:
     """Return mean runtime in microseconds (trimmed mean)."""
     for _ in range(warmup):
         run_fn()
@@ -82,7 +102,9 @@ def benchmark_kernel(run_fn: Callable[[], None], warmup: int = 3, iters: int = 1
     return sum(trimmed) / len(trimmed)
 
 
-def compile_and_bench_baseline(shape: tuple[int, int, int], block_shape: tuple[int, int, int]) -> float:
+def compile_and_bench_baseline(
+    shape: tuple[int, int, int], block_shape: tuple[int, int, int]
+) -> float:
     gemm, options = get_tagged_mxfp4_gemm(shape, block_shape)
     options = set_default_run_config(options)
     schedule = get_mxfp4_dbuf_schedule(use_stagger=True, k_partitions=1)
@@ -130,11 +152,13 @@ def compile_and_bench_multibuffer(
     block_shape: tuple[int, int, int],
     num_splits: int,
 ) -> float:
-    main_fn, main_options, red_fn, red_options = get_tagged_multibuffer_splitk_mxfp4_gemm(
-        shape,
-        num_splits=num_splits,
-        block_shape=block_shape,
-        mfma_variant=ScaledMMAType.F32_16x16x128_F8F6F4,
+    main_fn, main_options, red_fn, red_options = (
+        get_tagged_multibuffer_splitk_mxfp4_gemm(
+            shape,
+            num_splits=num_splits,
+            block_shape=block_shape,
+            mfma_variant=ScaledMMAType.F32_16x16x128_F8F6F4,
+        )
     )
     main_options = set_default_run_config(main_options)
     red_options = set_default_run_config(red_options)
@@ -285,24 +309,29 @@ def main() -> int:
         flops = get_flops(m, n, k)
         print(f"\n=== Shape ({m}, {n}, {k}), split S={num_splits} ===", flush=True)
 
-        block_m, block_n, block_k = BLOCK_SHAPE
+        block_baseline = mxfp4_baseline_block_shape(shape)
+        block_split = mxfp4_splitk_block_shape(shape, num_splits)
+        block_m, block_n, block_k = block_split
         num_tiles = math.ceil(m / block_m) * math.ceil(n / block_n)
         num_ctas = num_tiles * num_splits
         k_per_split = math.ceil(k / num_splits)
 
         variants: list[tuple[str, Callable[[], float]]] = [
-            ("baseline", lambda: compile_and_bench_baseline(shape, BLOCK_SHAPE)),
-            ("atomic", lambda: compile_and_bench_atomic(shape, BLOCK_SHAPE, num_splits)),
+            ("baseline", lambda: compile_and_bench_baseline(shape, block_baseline)),
+            (
+                "atomic",
+                lambda: compile_and_bench_atomic(shape, block_split, num_splits),
+            ),
             (
                 "multibuffer",
-                lambda: compile_and_bench_multibuffer(shape, BLOCK_SHAPE, num_splits),
+                lambda: compile_and_bench_multibuffer(shape, block_split, num_splits),
             ),
-            ("mbsk", lambda: compile_and_bench_mbsk(shape, BLOCK_SHAPE, num_splits)),
+            ("mbsk", lambda: compile_and_bench_mbsk(shape, block_split, num_splits)),
         ]
 
         if k_per_split >= block_k:
             variants.append(
-                ("lsu", lambda: compile_and_bench_lsu(shape, BLOCK_SHAPE, num_splits)),
+                ("lsu", lambda: compile_and_bench_lsu(shape, block_split, num_splits)),
             )
         else:
             variants.append(("lsu", None))
@@ -310,14 +339,16 @@ def main() -> int:
         variants.append(
             (
                 "tree_streamk",
-                lambda: compile_and_bench_tree_streamk(shape, BLOCK_SHAPE, num_ctas),
+                lambda: compile_and_bench_tree_streamk(shape, block_baseline, num_ctas),
             ),
         )
 
         for name, bench_fn in variants:
             if bench_fn is None:
                 row = {
-                    "m": m, "n": n, "k": k,
+                    "m": m,
+                    "n": n,
+                    "k": k,
                     "split_S": num_splits,
                     "variant": name,
                     "runtime_us": "SKIPPED",
