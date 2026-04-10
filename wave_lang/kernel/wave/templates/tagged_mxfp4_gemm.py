@@ -1122,15 +1122,140 @@ def get_tagged_mbsk_splitk_mxfp4_gemm(
 ):
     """Return tagged MBSK (MultipleBufferSingleKernel) split-K MXFP4 GEMM + compile options.
 
-    Single kernel uses a workspace for partials and a synchronizer buffer for
-    cross-workgroup coordination before reduction.
-
-    Raises:
-        NotImplementedError: Until the kernel is implemented.
+    Transitional single-kernel implementation: each split workgroup writes its
+    ``f32`` partial to ``workspace[S, M, N]`` (same layout as the multibuffer
+    main kernel) and accumulates into ``C`` via ``atomic_add``, so callers get
+    a correct result with one launch.      Each workgroup performs a no-op ``atomic_add(0, sync_buffer[tile])`` where
+    ``tile = WORKGROUP_0 + WORKGROUP_1 * ceil(M / BLOCK_M)``, keeping the sync
+    buffer in the launch signature and matching the test layout.  True
+    tile-level synchronization is reserved for a later kernel.
     """
-    raise NotImplementedError(
-        "get_tagged_mbsk_splitk_mxfp4_gemm: kernel not implemented yet"
+    m, n, k = shape
+    k_per_split = math.ceil(k / num_splits)
+    if k_per_split < block_shape[2]:
+        raise ValueError(
+            f"K per split ({k_per_split}) is less than BLOCK_K ({block_shape[2]}). "
+            f"Reduce num_splits or BLOCK_K so that each split has at least BLOCK_K elements."
+        )
+    if k_per_split % block_shape[2] != 0:
+        raise ValueError(
+            f"k_per_split ({k_per_split}) must be a multiple of BLOCK_K ({block_shape[2]})."
+        )
+
+    num_wg_m = math.ceil(m / block_shape[0])
+    num_wg_n = math.ceil(n / block_shape[1])
+    num_tiles = num_wg_m * num_wg_n
+
+    M = tkl.sym.M
+    N = tkl.sym.N
+    K = tkl.sym.K
+    S = tkl.sym.S
+    BLOCK_M = tkl.sym.BLOCK_M
+    BLOCK_N = tkl.sym.BLOCK_N
+    BLOCK_K = tkl.sym.BLOCK_K
+    BLOCK_S = tkl.sym.BLOCK_S
+    K_SPLIT_OFF = tkl.sym.K_SPLIT_OFF
+    K_SPLIT_LEN = tkl.sym.K_SPLIT_LEN
+    ADDRESS_SPACE = tkl.sym.ADDRESS_SPACE
+    B_ADDRESS_SPACE = tkl.sym.B_ADDRESS_SPACE
+    SYNC_SIZE = tkl.sym.SYNC_SIZE
+
+    NUM_WG_M = sympy.ceiling(M / BLOCK_M)
+    i_s = tkw.IndexMapping.iterator(0)
+    # Atomic lowering keys the mapping by the lhs register shape (S); the memory
+    # is 1-D sync_buffer[SYNC_SIZE] with index (wg0, wg1) flattened.
+    sync_atomic_mapping = tkw.IndexMapping(
+        num_iterators=1,
+        inputs={S: WORKGROUP_0 + WORKGROUP_1 * NUM_WG_M},
+        outputs={S: i_s},
     )
+
+    constraints: list[tkw.Constraint] = [
+        tkw.WorkgroupConstraint(M, BLOCK_M, 0),
+        tkw.WorkgroupConstraint(N, BLOCK_N, 1),
+        tkw.WorkgroupConstraint(S, BLOCK_S, 2),
+        tkw.TilingConstraint(
+            K,
+            BLOCK_K,
+            iters=sympy.ceiling(K_SPLIT_LEN / BLOCK_K),
+            start=K_SPLIT_OFF,
+        ),
+        tkw.WaveConstraint(M, sympy.floor(BLOCK_M / wave_shape[0])),
+        tkw.WaveConstraint(N, sympy.floor(BLOCK_N / wave_shape[1])),
+        tkw.HardwareConstraint(
+            threads_per_wave=64,
+            mma_type=mfma_variant,
+            vector_shapes={S: 0},
+        ),
+    ]
+
+    @tkw.wave(constraints)
+    def mbsk_splitk_gemm(
+        a: tkl.Memory[M, K / 2, ADDRESS_SPACE, tkl.i8],
+        a_scale: tkl.Memory[M, K / 32, ADDRESS_SPACE, tkl.i8],
+        b: tkl.Memory[N, K / 2, B_ADDRESS_SPACE, tkl.i8],
+        b_scale: tkl.Memory[N, K / 32, ADDRESS_SPACE, tkl.i8],
+        workspace: tkl.Memory[S, M, N, GLOBAL_ADDRESS_SPACE, tkl.f32],
+        sync_buffer: tkl.Memory[SYNC_SIZE, GLOBAL_ADDRESS_SPACE, tkl.i32],
+        c: tkl.Memory[M, N, GLOBAL_ADDRESS_SPACE, output_type],
+    ):
+        c_reg = tkl.Register[M, N, tkl.f32](0.0)
+
+        @tkw.iterate(K, init_args=[c_reg], tag="k_loop")
+        def repeat(
+            acc: tkl.Register[M, N, tkl.f32],
+        ) -> tkl.Register[M, N, tkl.f32]:
+            a_reg = tkw.read(a, tag="read_a")
+            a_reg = tkw.bitcast(a_reg, tkl.f4e2m1fn, tag="bitcast_a")
+            a_scale_reg = tkw.read(a_scale, tag="read_a_scale")
+            a_scale_reg = tkw.bitcast(a_scale_reg, tkl.f8e8m0fnu, tag="bitcast_a_scale")
+            b_reg = tkw.read(b, tag="read_b")
+            b_reg = tkw.bitcast(b_reg, tkl.f4e2m1fn, tag="bitcast_b")
+            b_scale_reg = tkw.read(b_scale, tag="read_b_scale")
+            b_scale_reg = tkw.bitcast(b_scale_reg, tkl.f8e8m0fnu, tag="bitcast_b_scale")
+            acc = tkw.scaled_mma(
+                a_reg, a_scale_reg, b_reg, b_scale_reg, acc, tag="scaled_mma"
+            )
+            return acc
+
+        tkw.write(repeat, workspace)
+        # No-op atomic on sync_buffer per tile so the buffer stays live across
+        # compilation (reads folded away) and records tile participation later.
+        zero_s = tkl.Register[S, tkl.i32](0)
+        tkw.atomic_add(zero_s, sync_buffer, mapping=sync_atomic_mapping)
+        repeat_out = tkw.cast(repeat, output_type)
+        tkw.atomic_add(repeat_out, c)
+
+    hyperparams = {
+        ADDRESS_SPACE: a_address_space,
+        B_ADDRESS_SPACE: a_address_space,
+        BLOCK_M: block_shape[0],
+        BLOCK_N: block_shape[1],
+        BLOCK_K: block_shape[2],
+        BLOCK_S: 1,
+        M: m,
+        N: n,
+        K: k,
+        S: num_splits,
+        SYNC_SIZE: num_tiles,
+        K_SPLIT_OFF: WORKGROUP_2 * k_per_split,
+        K_SPLIT_LEN: sympy.Min(K, (WORKGROUP_2 + 1) * k_per_split) - K_SPLIT_OFF,
+    }
+    for key, value in hyperparams.items():
+        if isinstance(value, sympy.Expr):
+            hyperparams[key] = value.subs(hyperparams)
+
+    hyperparams.update(get_default_scheduling_params())
+
+    options = WaveCompileOptions(
+        subs=hyperparams,
+        canonicalize=True,
+        schedule=SchedulingType.MANUAL,
+        use_global_to_shared=True,
+        minimize_shared_allocs=False,
+    )
+
+    return mbsk_splitk_gemm, options
 
 
 def _reorder_mxfp4_workgroups(m, n, block_m, block_n, group_size_n):
