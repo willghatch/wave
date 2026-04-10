@@ -1535,6 +1535,9 @@ def get_tagged_tree_streamk_mxfp4_gemm(
     a_address_space: tkl.AddressSpace = GLOBAL_ADDRESS_SPACE,
     output_type: "tkl.DataType" = tkl.f32,
     num_ctas: int = 304,
+    *,
+    use_global_to_shared: bool | None = None,
+    auto_large_block_k: bool = True,
 ):
     """Return a tagged stream-K MXFP4 GEMM kernel + compile options.
 
@@ -1554,6 +1557,11 @@ def get_tagged_tree_streamk_mxfp4_gemm(
         a_address_space: Address space for A/B data and scales.
         output_type: Element type of output tensor C.
         num_ctas: Number of CTAs (workgroups) to launch.
+        use_global_to_shared: When None, pick GatherToLDS vs direct global using a
+            shape heuristic (large MN, single-tile tall-K, or auto BLOCK_K=256).
+            When True or False, force that path.
+        auto_large_block_k: If True and BLOCK_K is 128, use 256 when K >= 16384 and
+            K is divisible by 256.
 
     Returns:
         (kernel_function, WaveCompileOptions)
@@ -1563,6 +1571,12 @@ def get_tagged_tree_streamk_mxfp4_gemm(
 
     m, n, k = shape
     block_m, block_n, block_k = block_shape
+
+    block_k_upgraded = False
+    if auto_large_block_k and block_k == 128 and k >= 16384 and k % 256 == 0:
+        block_k = 256
+        block_shape = (block_m, block_n, block_k)
+        block_k_upgraded = True
 
     num_tiles_m = math.ceil(m / block_m)
     num_tiles_n = math.ceil(n / block_n)
@@ -1662,12 +1676,10 @@ def get_tagged_tree_streamk_mxfp4_gemm(
 
         extra_iter = tkw.minimum(cta_id, sk_extra_iters_val)
         work_unit_start = cta_id * sk_iters_pcu_val + extra_iter
-        next_extra_iter = tkw.minimum(
-            cta_id + tkw.scalar(1, i32), sk_extra_iters_val
-        )
+        next_extra_iter = tkw.minimum(cta_id + tkw.scalar(1, i32), sk_extra_iters_val)
         work_unit_end = (
-            (cta_id + tkw.scalar(1, i32)) * sk_iters_pcu_val + next_extra_iter
-        )
+            cta_id + tkw.scalar(1, i32)
+        ) * sk_iters_pcu_val + next_extra_iter
 
         tkw.set_symbol(WORK_UNIT_END, work_unit_end)
         sk_condition = WORK_UNIT_START < WORK_UNIT_END
@@ -1687,12 +1699,12 @@ def get_tagged_tree_streamk_mxfp4_gemm(
             )
             output_tile_id = cta_k_start // iters_per_tile_val
 
-            m_offset = (
-                output_tile_id // tkw.scalar(N_TILES, i32)
-            ) * tkw.scalar(BLOCK_M, i32)
-            n_offset = (
-                output_tile_id % tkw.scalar(N_TILES, i32)
-            ) * tkw.scalar(BLOCK_N, i32)
+            m_offset = (output_tile_id // tkw.scalar(N_TILES, i32)) * tkw.scalar(
+                BLOCK_M, i32
+            )
+            n_offset = (output_tile_id % tkw.scalar(N_TILES, i32)) * tkw.scalar(
+                BLOCK_N, i32
+            )
             tkw.set_symbol(CTA_M_OFFSET, m_offset)
             tkw.set_symbol(CTA_N_OFFSET, n_offset)
 
@@ -1752,9 +1764,21 @@ def get_tagged_tree_streamk_mxfp4_gemm(
         SK_EXTRA_ITERS: sk_extra_iters,
     }
 
+    if use_global_to_shared is None:
+        mn = m * n
+        # GatherToLDS helps large output grids and tall-K single-tile cases, and
+        # pairs with auto BLOCK_K=256.  Mid-sized squares (e.g. 256^2) with
+        # moderate K are faster with direct global loads.
+        use_g2s = mn >= 262144 or (mn <= 16384 and k >= 32768) or block_k_upgraded
+    else:
+        use_g2s = use_global_to_shared
+    minimize_sa = not use_g2s
+
     options = WaveCompileOptions(
         subs=hyperparams,
         canonicalize=True,
+        use_global_to_shared=use_g2s,
+        minimize_shared_allocs=minimize_sa,
     )
 
     return tree_streamk_mxfp4_gemm, options
