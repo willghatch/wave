@@ -3918,11 +3918,7 @@ def testTreeStreamKMxfp4Gemm(
     x_scales_gpu = x_scales.cuda()
     w_scales_gpu = w_scales.cuda()
 
-    num_tiles = math.ceil(m / block_m) * math.ceil(n / block_n)
-    iters_per_tile = math.ceil(k / block_k)
-    workspace = device_zeros(num_ctas, block_m, block_n, dtype=torch.float32)
-    flag_buffer = device_zeros(num_tiles * iters_per_tile, dtype=torch.int32)
     c_gpu = device_zeros(m, n, dtype=output_type)
 
-    compiled(x_gpu, x_scales_gpu, w_t_gpu, w_scales_gpu, workspace, flag_buffer, c_gpu)
+    compiled(x_gpu, x_scales_gpu, w_t_gpu, w_scales_gpu, c_gpu)
     assert_close(c_gpu.cpu(), torch_ref, rtol=1e-3, atol=1e-2)

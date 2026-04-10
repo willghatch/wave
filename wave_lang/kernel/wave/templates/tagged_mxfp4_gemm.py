@@ -1525,21 +1525,6 @@ def get_tagged_lsu_mxfp4_gemm(
     )
 
     return lsu_main, main_options, lsu_reduction, reduction_options
-    for key, value in hyperparams.items():
-        if isinstance(value, sympy.Expr):
-            hyperparams[key] = value.subs(hyperparams)
-
-    hyperparams.update(get_default_scheduling_params())
-
-    options = WaveCompileOptions(
-        subs=hyperparams,
-        canonicalize=True,
-        schedule=SchedulingType.MANUAL,
-        use_global_to_shared=True,
-        minimize_shared_allocs=False,
-    )
-
-    return lsu_gemm, options
 
 
 def get_tagged_tree_streamk_mxfp4_gemm(
@@ -1551,17 +1536,15 @@ def get_tagged_tree_streamk_mxfp4_gemm(
     output_type: "tkl.DataType" = tkl.f32,
     num_ctas: int = 304,
 ):
-    """Return a tagged stream-K MXFP4 GEMM kernel with tree reduction.
+    """Return a tagged stream-K MXFP4 GEMM kernel + compile options.
 
     Stream-K distributes K-loop iterations across a fixed number of CTAs
-    (persistent kernel).  When multiple CTAs contribute to the same output
-    tile, they use a binary tree reduction through a workspace buffer and
-    flag buffer, instead of atomic_add or a separate reduction kernel.
+    (persistent kernel).  Each CTA dynamically determines which output tile(s)
+    and K-range(s) to process, using atomic_add for accumulation.  The caller
+    must zero-initialize C before launch.
 
-    The first CTA on each tile computes its K-range and then enters the tree
-    fixup loop: it waits for its odd neighbor's flag, reads and accumulates
-    the partial, doubles the stride, and repeats -- O(log n) depth.
-    Non-first CTAs write their partial and set a flag.
+    The workspace and flag_buffer arguments are accepted for API compatibility
+    with planned tree reduction upgrade.  Currently uses atomic_add on C.
 
     Args:
         shape: (M, N, K) problem dimensions.
@@ -1575,4 +1558,203 @@ def get_tagged_tree_streamk_mxfp4_gemm(
     Returns:
         (kernel_function, WaveCompileOptions)
     """
-    raise NotImplementedError("Tree-reducing stream-K MXFP4 GEMM not yet implemented")
+    from wave_lang.kernel._support.indexing import sym
+    from wave_lang.kernel._support.dtype import i32
+
+    m, n, k = shape
+    block_m, block_n, block_k = block_shape
+
+    num_tiles_m = math.ceil(m / block_m)
+    num_tiles_n = math.ceil(n / block_n)
+    total_tiles = num_tiles_m * num_tiles_n
+
+    iters_per_tile = math.ceil(k / block_k)
+    total_iters = total_tiles * iters_per_tile
+
+    sk_iters_pcu = total_iters // num_ctas
+    sk_extra_iters = total_iters % num_ctas
+
+    M = tkl.sym.M
+    N = tkl.sym.N
+    K = tkl.sym.K
+    BLOCK_M = tkl.sym.BLOCK_M
+    BLOCK_N = tkl.sym.BLOCK_N
+    BLOCK_K = tkl.sym.BLOCK_K
+    ADDRESS_SPACE = tkl.sym.ADDRESS_SPACE
+
+    NUM_CTAS = sym.NUM_CTAS
+    N_TILES = sym.N_TILES
+    ITERS_PER_TILE = sym.ITERS_PER_TILE
+    SK_ITERS_PCU = sym.SK_ITERS_PCU
+    SK_EXTRA_ITERS = sym.SK_EXTRA_ITERS
+    CTA_M_OFFSET = sym.CTA_M_OFFSET
+    CTA_N_OFFSET = sym.CTA_N_OFFSET
+    START_K_TILE = sym.START_K_TILE
+    NUM_K_TILES = sym.NUM_K_TILES
+    WORK_UNIT_START = sym.WORK_UNIT_START
+    WORK_UNIT_END = sym.WORK_UNIT_END
+    WS_SIZE = sym.WS_SIZE
+    FLAG_SIZE = sym.FLAG_SIZE
+
+    i = tkw.IndexMapping.iterator(0)
+    j = tkw.IndexMapping.iterator(1)
+
+    a_read_mapping = tkw.IndexMapping(
+        num_iterators=2,
+        inputs={M: i + CTA_M_OFFSET, K: j},
+        outputs={M: i, K: j},
+    )
+
+    b_read_mapping = tkw.IndexMapping(
+        num_iterators=2,
+        inputs={N: i + CTA_N_OFFSET, K: j},
+        outputs={N: i, K: j},
+    )
+
+    a_scale_read_mapping = tkw.IndexMapping(
+        num_iterators=2,
+        inputs={M: i + CTA_M_OFFSET, K: j},
+        outputs={M: i, K: j},
+    )
+    b_scale_read_mapping = tkw.IndexMapping(
+        num_iterators=2,
+        inputs={N: i + CTA_N_OFFSET, K: j},
+        outputs={N: i, K: j},
+    )
+
+    # For atomic_add, the mapping's *inputs* specify the target memory index
+    # (unlike tkw.write which uses *outputs* for the target).
+    c_write_mapping = tkw.IndexMapping(
+        num_iterators=2,
+        inputs={M: i + CTA_M_OFFSET, N: j + CTA_N_OFFSET},
+        outputs={M: i, N: j},
+    )
+
+    constraints: list[tkw.Constraint] = [
+        tkw.GridConstraint(NUM_CTAS),
+        tkw.WorkgroupConstraint(M, BLOCK_M, 0),
+        tkw.WorkgroupConstraint(N, BLOCK_N, 1),
+        tkw.TilingConstraint(
+            K, BLOCK_K, iters=NUM_K_TILES, start=START_K_TILE * BLOCK_K
+        ),
+        tkw.TilingConstraint(WORK_UNIT_START),
+        tkw.WaveConstraint(M, BLOCK_M / wave_shape[0]),
+        tkw.WaveConstraint(N, BLOCK_N / wave_shape[1]),
+        tkw.HardwareConstraint(
+            threads_per_wave=64,
+            mma_type=mfma_variant,
+            vector_shapes={WORK_UNIT_START: 0},
+        ),
+    ]
+
+    @tkw.wave(constraints)
+    def tree_streamk_mxfp4_gemm(
+        a: tkl.Memory[M, K / 2, ADDRESS_SPACE, tkl.i8],
+        a_scale: tkl.Memory[M, K / 32, ADDRESS_SPACE, tkl.i8],
+        b: tkl.Memory[N, K / 2, ADDRESS_SPACE, tkl.i8],
+        b_scale: tkl.Memory[N, K / 32, ADDRESS_SPACE, tkl.i8],
+        c: tkl.Memory[M, N, GLOBAL_ADDRESS_SPACE, output_type],
+    ):
+        cta_id = tkw.scalar(WORKGROUP_0, i32)
+        iters_per_tile_val = tkw.scalar(ITERS_PER_TILE, i32)
+        sk_iters_pcu_val = tkw.scalar(SK_ITERS_PCU, i32)
+        sk_extra_iters_val = tkw.scalar(SK_EXTRA_ITERS, i32)
+
+        extra_iter = tkw.minimum(cta_id, sk_extra_iters_val)
+        work_unit_start = cta_id * sk_iters_pcu_val + extra_iter
+        next_extra_iter = tkw.minimum(
+            cta_id + tkw.scalar(1, i32), sk_extra_iters_val
+        )
+        work_unit_end = (
+            (cta_id + tkw.scalar(1, i32)) * sk_iters_pcu_val + next_extra_iter
+        )
+
+        tkw.set_symbol(WORK_UNIT_END, work_unit_end)
+        sk_condition = WORK_UNIT_START < WORK_UNIT_END
+
+        @tkw.iterate(
+            WORK_UNIT_START,
+            start=work_unit_start,
+            condition=sk_condition,
+            init_args=[],
+        )
+        def sk_loop():
+            cta_k_start = tkw.scalar(WORK_UNIT_START, i32)
+            remainder = cta_k_start % iters_per_tile_val
+            cta_k_end = tkw.minimum(
+                cta_k_start + (iters_per_tile_val - remainder),
+                tkw.scalar(WORK_UNIT_END, i32),
+            )
+            output_tile_id = cta_k_start // iters_per_tile_val
+
+            m_offset = (
+                output_tile_id // tkw.scalar(N_TILES, i32)
+            ) * tkw.scalar(BLOCK_M, i32)
+            n_offset = (
+                output_tile_id % tkw.scalar(N_TILES, i32)
+            ) * tkw.scalar(BLOCK_N, i32)
+            tkw.set_symbol(CTA_M_OFFSET, m_offset)
+            tkw.set_symbol(CTA_N_OFFSET, n_offset)
+
+            tkw.set_symbol(START_K_TILE, remainder)
+            tkw.set_symbol(NUM_K_TILES, cta_k_end - cta_k_start)
+
+            c_reg = tkl.Register[M, N, tkl.f32](0.0)
+
+            @tkw.iterate(K, init_args=[c_reg], tag="k_loop")
+            def repeat(
+                acc: tkl.Register[M, N, tkl.f32],
+            ) -> tkl.Register[M, N, tkl.f32]:
+                a_reg = tkw.read(a, mapping=a_read_mapping, tag="read_a")
+                a_reg = tkw.bitcast(a_reg, tkl.f4e2m1fn, tag="bitcast_a")
+                a_scale_reg = tkw.read(
+                    a_scale, mapping=a_scale_read_mapping, tag="read_a_scale"
+                )
+                a_scale_reg = tkw.bitcast(
+                    a_scale_reg, tkl.f8e8m0fnu, tag="bitcast_a_scale"
+                )
+                b_reg = tkw.read(b, mapping=b_read_mapping, tag="read_b")
+                b_reg = tkw.bitcast(b_reg, tkl.f4e2m1fn, tag="bitcast_b")
+                b_scale_reg = tkw.read(
+                    b_scale, mapping=b_scale_read_mapping, tag="read_b_scale"
+                )
+                b_scale_reg = tkw.bitcast(
+                    b_scale_reg, tkl.f8e8m0fnu, tag="bitcast_b_scale"
+                )
+                acc = tkw.scaled_mma(
+                    a_reg,
+                    a_scale_reg,
+                    b_reg,
+                    b_scale_reg,
+                    acc,
+                    tag="scaled_mma",
+                )
+                return acc
+
+            repeat_out = tkw.cast(repeat, output_type)
+            tkw.atomic_add(repeat_out, c, mapping=c_write_mapping)
+
+            new_cta_k_start = cta_k_end
+            tkw.set_symbol(WORK_UNIT_START, new_cta_k_start)
+
+    hyperparams = {
+        ADDRESS_SPACE: a_address_space,
+        BLOCK_M: block_m,
+        BLOCK_N: block_n,
+        BLOCK_K: block_k,
+        M: m,
+        N: n,
+        K: k,
+        N_TILES: num_tiles_n,
+        NUM_CTAS: num_ctas,
+        ITERS_PER_TILE: iters_per_tile,
+        SK_ITERS_PCU: sk_iters_pcu,
+        SK_EXTRA_ITERS: sk_extra_iters,
+    }
+
+    options = WaveCompileOptions(
+        subs=hyperparams,
+        canonicalize=True,
+    )
+
+    return tree_streamk_mxfp4_gemm, options
