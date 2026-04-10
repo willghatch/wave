@@ -1,0 +1,57 @@
+* Split-K MXFP4 variant benchmark (intermediate report)
+
+** Summary
+
+Hardware/software: ROCm/HIP stack via PyTorch (= =cuda= timing API), worktree =splitk-hblt=, block shape (128, 128, 128).  Warmup 3, 10 timed iterations, trimmed mean (drop 10% each end).  Full CSV: =splitk_variant_benchmark_results.csv=; console log: =benchmark_output.txt=.
+
+Fastest variant per (M, N, K), split S:
+
+| Config                         | S | Fastest   | Notes                                      |
+|--------------------------------+---+-----------+--------------------------------------------|
+| 128 x 128 x 65536              | 8 | atomic    | Large K, many splits; baseline slowest       |
+| 128 x 128 x 32768              | 4 | multibuffer | MBSK timing anomaly (see below)          |
+| 256 x 256 x 8192               | 2 | baseline  |                                            |
+| 256 x 256 x 32768              | 4 | atomic    | Slight edge over baseline                  |
+| 512 x 512 x 8192               | 2 | baseline  |                                            |
+| 1024 x 1024 x 8192             | 2 | baseline  | multibuffer ~1.83x baseline; atomic ~3.5x  |
+| 256 x 256 x 8192               | 4 | baseline  |                                            |
+| 512 x 512 x 16384              | 2 | baseline  | multibuffer second                         |
+| 128 x 128 x 65536              | 4 | atomic    |                                            |
+| 256 x 256 x 512                | 2 | baseline  | Small K; all split-K slower                |
+
+** Data table (runtime us / TFLOPS)
+
+| M   | N   | K     | S | baseline   | atomic     | multibuffer | mbsk       |
+|-----+-----+-------+---+------------+------------+-------------+------------|
+| 128 | 128 | 65536 | 8 | 455.65 / 4.71 | 217.32 / 9.88 | 269.38 / 7.97 | 362.22 / 5.93 |
+| 128 | 128 | 32768 | 4 | 298.60 / 3.60 | 207.72 / 5.17 | 203.89 / 5.27 | 5969.02 / 0.18 |
+| 256 | 256 | 8192  | 2 | 211.24 / 5.08 | 274.74 / 3.91 | 330.77 / 3.25 | 365.20 / 2.94 |
+| 256 | 256 | 32768 | 4 | 338.71 / 12.68 | 288.46 / 14.89 | 337.49 / 12.73 | 525.12 / 8.18 |
+| 512 | 512 | 8192  | 2 | 260.60 / 16.48 | 403.99 / 10.63 | 372.01 / 11.55 | 552.94 / 7.77 |
+| 1024| 1024| 8192  | 2 | 268.93 / 63.88 | 930.71 / 18.46 | 507.79 / 33.83 | 1138.65 / 15.09 |
+| 256 | 256 | 8192  | 4 | 203.78 / 5.27 | 273.16 / 3.93 | 360.11 / 2.98 | 425.16 / 2.53 |
+| 512 | 512 | 16384 | 2 | 276.63 / 31.05 | 427.70 / 20.08 | 385.47 / 22.28 | 566.74 / 15.16 |
+| 128 | 128 | 65536 | 4 | 459.01 / 4.68 | 254.41 / 8.44 | 266.04 / 8.07 | 387.34 / 5.54 |
+| 256 | 256 | 512   | 2 | 174.51 / 0.38 | 246.86 / 0.27 | 307.66 / 0.22 | 366.99 / 0.18 |
+
+** Failures
+
+No compile or benchmark failures; all variants returned =ok=.
+
+** Analysis
+
+- *Multibuffer vs atomic:* Multibuffer beats atomic on 128 x 128 x 32768, S=4 (if MBSK outlier is ignored as a one-off).  On 1024 x 1024 x 8192, multibuffer is much faster than atomic (507.79 us vs 930.71 us) though both lose to baseline.  On most other configs atomic is slightly faster or comparable to multibuffer; multibuffer never beats baseline on large MN cases here.
+- *MBSK vs atomic:* MBSK is slower than atomic on every configuration in this run except the suspect 128 x 128 x 32768 row, where MBSK reports ~5969 us (~29x slower than atomic) despite status =ok=.  That single point should be re-timed (possible stall, power state, or measurement glitch).  Ignoring that row, MBSK is not faster than atomic anywhere.
+- *vs baseline:* Baseline wins on most medium/large MN shapes.  Split-K wins clearly on skinny 128 x 128 cases with large K (65536 and 32768), especially atomic.  Small K (256 x 256 x 512) punishes all split-K variants.
+- *Where non-atomic split-K helps most:* The multibuffer second-kernel design removes atomic contention on C; the largest practical win over atomic in this set is 1024 x 1024 x 8192.  For skinny-tall K, atomic split-K remains the best split variant; multibuffer is competitive on 128 x 128 x 32768.
+
+** Recommendations (step 4)
+
+1. *Prioritize atomic split-K* for the 128 x 128, very large K regime where it already beats baseline (~2.1x on 65536, S=8).
+2. *Investigate and optimize multibuffer* for large-tile problems where atomics hurt (e.g. 1024 x 1024 x 8192): multibuffer is ~1.83x faster than atomic there but still ~1.89x slower than baseline; closing that gap is a concrete target.
+3. *Treat MBSK as transitional:* fix correctness/sync path if needed, then re-benchmark; current kernel is slower than atomic and shows one anomalous timing—verify before investing in MBSK-specific tuning.
+4. *Re-run* the 128 x 128 x 32768 MBSK case in isolation to confirm whether ~5969 us is reproducible.
+
+** Agent copy
+
+Canonical working copy with CSV and log: =.git/agent-files/work/2026-04-10T13-00_splitk-hblt-work-1_8f8a95/step3-benchmarks/benchmark-report.org=
