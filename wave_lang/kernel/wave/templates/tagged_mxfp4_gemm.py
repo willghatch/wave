@@ -17,6 +17,8 @@ Provides:
   - get_tagged_splitk_mxfp4_gemm_preshuffle_b:          split-K with preshuffled B + scales
   - get_tagged_multibuffer_splitk_mxfp4_gemm:             split-K workspace + separate reduction (no atomics)
   - get_tagged_mbsk_splitk_mxfp4_gemm:                  split-K workspace + sync buffer, single kernel
+  - get_tagged_lsu_mxfp4_gemm:                           LocalSplitU (intra-WG K-split via LDS reduction)
+  - get_tagged_tree_streamk_mxfp4_gemm:                  stream-K with binary tree reduction
 
 Required tags: k_loop, read_a, read_a_scale, read_b, read_b_scale,
 bitcast_a, bitcast_a_scale, bitcast_b, bitcast_b_scale, scaled_mma.
@@ -1310,3 +1312,70 @@ def _reorder_mxfp4_workgroups(m, n, block_m, block_n, group_size_n):
     )
 
     return new_wg0, new_wg1
+
+
+def get_tagged_lsu_mxfp4_gemm(
+    shape: tuple[int, int, int] = (1024, 1024, 8192),
+    lsu_factor: int = 2,
+    block_shape: tuple[int, int, int] = (128, 128, 256),
+    wave_shape: tuple[int, int] = (2, 2),
+    mfma_variant: ScaledMMAType = ScaledMMAType.F32_16x16x128_F8F6F4,
+    a_address_space: tkl.AddressSpace = SHARED_ADDRESS_SPACE,
+    output_type: "tkl.DataType" = tkl.f32,
+):
+    """Return a tagged LocalSplitU MXFP4 GEMM kernel + compile options.
+
+    LocalSplitU splits the K dimension across waves within a single workgroup.
+    Each wave computes a partial accumulator over its K-slice, then all waves
+    reduce via LDS (write partials -> barrier -> read all -> elementwise add).
+    The final reduced result is written directly to C -- no atomic_add needed.
+
+    Args:
+        shape: (M, N, K) problem dimensions.
+        lsu_factor: Number of K-slices per workgroup (2 or 4).
+        block_shape: (BLOCK_M, BLOCK_N, BLOCK_K) tile sizes.
+        wave_shape: (WAVE_M, WAVE_N) waves per workgroup for M,N dims.
+        mfma_variant: Scaled MMA instruction type.
+        a_address_space: Address space for A and A_scale (typically SHARED).
+        output_type: Element type of output tensor C.
+
+    Returns:
+        (kernel_function, WaveCompileOptions)
+    """
+    raise NotImplementedError("LocalSplitU MXFP4 GEMM not yet implemented")
+
+
+def get_tagged_tree_streamk_mxfp4_gemm(
+    shape: tuple[int, int, int] = (256, 256, 256),
+    block_shape: tuple[int, int, int] = (128, 128, 128),
+    wave_shape: tuple[int, int] = (2, 2),
+    mfma_variant: ScaledMMAType = ScaledMMAType.F32_16x16x128_F8F6F4,
+    a_address_space: tkl.AddressSpace = GLOBAL_ADDRESS_SPACE,
+    output_type: "tkl.DataType" = tkl.f32,
+    num_ctas: int = 304,
+):
+    """Return a tagged stream-K MXFP4 GEMM kernel with tree reduction.
+
+    Stream-K distributes K-loop iterations across a fixed number of CTAs
+    (persistent kernel).  When multiple CTAs contribute to the same output
+    tile, they use a binary tree reduction through a workspace buffer and
+    flag buffer, instead of atomic_add or a separate reduction kernel.
+
+    The first CTA on each tile computes its K-range and then enters the tree
+    fixup loop: it waits for its odd neighbor's flag, reads and accumulates
+    the partial, doubles the stride, and repeats -- O(log n) depth.
+    Non-first CTAs write their partial and set a flag.
+
+    Args:
+        shape: (M, N, K) problem dimensions.
+        block_shape: (BLOCK_M, BLOCK_N, BLOCK_K) tile sizes.
+        wave_shape: (WAVE_M, WAVE_N) waves per workgroup.
+        mfma_variant: Scaled MMA instruction type.
+        a_address_space: Address space for A/B data and scales.
+        output_type: Element type of output tensor C.
+        num_ctas: Number of CTAs (workgroups) to launch.
+
+    Returns:
+        (kernel_function, WaveCompileOptions)
+    """
+    raise NotImplementedError("Tree-reducing stream-K MXFP4 GEMM not yet implemented")

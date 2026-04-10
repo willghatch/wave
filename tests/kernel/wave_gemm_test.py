@@ -62,9 +62,11 @@ from wave_lang.kernel.wave.templates.gemm import (
     get_persistent_reordering_kernel,
 )
 from wave_lang.kernel.wave.templates.tagged_mxfp4_gemm import (
+    get_tagged_lsu_mxfp4_gemm,
     get_tagged_mbsk_splitk_mxfp4_gemm,
     get_tagged_multibuffer_splitk_mxfp4_gemm,
     get_tagged_splitk_mxfp4_gemm,
+    get_tagged_tree_streamk_mxfp4_gemm,
 )
 from wave_lang.kernel.wave.templates.test_kernels import (
     get_gemm_prefetch_kernel_and_schedule,
@@ -3800,4 +3802,114 @@ def testMBSKSplitKMxfp4Gemm(
         sync_buffer,
         c_gpu,
     )
+    assert_close(c_gpu.cpu(), torch_ref, rtol=1e-3, atol=1e-2)
+
+
+@require_e2e
+@require_cdna4
+@pytest.mark.parametrize(
+    "shape, lsu_factor",
+    [
+        ((256, 256, 256), 2),
+        ((256, 256, 512), 2),
+        ((256, 256, 1024), 2),
+        ((512, 512, 1024), 2),
+        ((256, 256, 256), 4),
+        ((256, 256, 512), 4),
+        ((256, 256, 1024), 4),
+    ],
+)
+@pytest.mark.parametrize("output_type", [torch.float32])
+def testLocalSplitUMxfp4Gemm(
+    shape: tuple[int, int, int],
+    lsu_factor: int,
+    output_type: torch.dtype,
+):
+    """LocalSplitU splits K across waves within a workgroup via LDS reduction.
+
+    No atomic_add on the output -- each workgroup produces a fully reduced
+    tile via intra-workgroup LDS reduction.
+    """
+    lsu_gemm, options = get_tagged_lsu_mxfp4_gemm(
+        shape,
+        lsu_factor=lsu_factor,
+        block_shape=(128, 128, 128),
+        mfma_variant=ScaledMMAType.F32_16x16x128_F8F6F4,
+        output_type=TORCH_DTYPE_TO_WAVE[output_type],
+    )
+
+    options = set_default_run_config(options)
+    schedule = get_mxfp4_dbuf_schedule(use_stagger=True, k_partitions=1)
+    compiled = wave_compile(options, lsu_gemm, schedule)
+
+    m, n, k = shape
+    x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(
+        shape, device=torch.device("cpu")
+    )
+    torch_ref = torchScaledGemmMXFP4(x, w, x_scales, w_scales)
+
+    x_gpu = x.cuda()
+    w_t_gpu = w.T.contiguous().cuda()
+    x_scales_gpu = x_scales.cuda()
+    w_scales_gpu = w_scales.cuda()
+    c_gpu = device_zeros(m, n, dtype=output_type)
+
+    compiled(x_gpu, x_scales_gpu, w_t_gpu, w_scales_gpu, c_gpu)
+    assert_close(c_gpu.cpu(), torch_ref, rtol=1e-3, atol=1e-2)
+
+
+@require_e2e
+@require_cdna4
+@pytest.mark.parametrize(
+    "shape, num_ctas",
+    [
+        ((128, 128, 128), 1),
+        ((128, 128, 256), 2),
+        ((256, 256, 256), 8),
+        ((256, 256, 512), 16),
+        ((512, 512, 1024), 16),
+    ],
+)
+@pytest.mark.parametrize("output_type", [torch.float32])
+def testTreeStreamKMxfp4Gemm(
+    shape: tuple[int, int, int],
+    num_ctas: int,
+    output_type: torch.dtype,
+):
+    """StreamK with tree reduction: single-kernel, O(log n) fixup depth.
+
+    Uses workspace + flag buffer for binary tree reduction instead of
+    linear spinlock or atomic_add.
+    """
+    m, n, k = shape
+    block_m, block_n, block_k = 128, 128, 128
+
+    streamk_gemm, options = get_tagged_tree_streamk_mxfp4_gemm(
+        shape,
+        block_shape=(block_m, block_n, block_k),
+        mfma_variant=ScaledMMAType.F32_16x16x128_F8F6F4,
+        output_type=TORCH_DTYPE_TO_WAVE[output_type],
+        num_ctas=num_ctas,
+    )
+
+    options = set_default_run_config(options)
+    compiled = wave_compile(options, streamk_gemm)
+
+    x, w, x_scales, w_scales = generate_gemm_afp4wfp4_inputs(
+        shape, device=torch.device("cpu")
+    )
+    torch_ref = torchScaledGemmMXFP4(x, w, x_scales, w_scales)
+
+    x_gpu = x.cuda()
+    w_t_gpu = w.T.contiguous().cuda()
+    x_scales_gpu = x_scales.cuda()
+    w_scales_gpu = w_scales.cuda()
+
+    num_tiles = math.ceil(m / block_m) * math.ceil(n / block_n)
+    iters_per_tile = math.ceil(k / block_k)
+    workspace = device_zeros(num_ctas, block_m, block_n, dtype=torch.float32)
+    flag_buffer = device_zeros(num_tiles * iters_per_tile, dtype=torch.int32)
+    c_gpu = device_zeros(m, n, dtype=output_type)
+
+    compiled(x_gpu, x_scales_gpu, w_t_gpu, w_scales_gpu, workspace, flag_buffer, c_gpu)
     assert_close(c_gpu.cpu(), torch_ref, rtol=1e-3, atol=1e-2)
