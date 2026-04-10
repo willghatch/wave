@@ -3698,11 +3698,11 @@ def testSplitKMxfp4Gemm(
 @pytest.mark.parametrize(
     "shape, num_splits",
     [
+        ((256, 256, 256), 2),
         ((256, 256, 512), 2),
         ((256, 256, 512), 4),
-        ((128, 128, 1024), 2),
-        ((128, 128, 1024), 4),
-        ((512, 512, 1024), 2),
+        ((256, 256, 1024), 4),
+        ((512, 512, 1024), 4),
     ],
 )
 def testMultiBufferSplitKMxfp4Gemm(
@@ -3750,10 +3750,10 @@ def testMultiBufferSplitKMxfp4Gemm(
 @pytest.mark.parametrize(
     "shape, num_splits",
     [
+        ((256, 256, 256), 2),
         ((256, 256, 512), 2),
         ((256, 256, 512), 4),
-        ((128, 128, 1024), 2),
-        ((128, 128, 1024), 4),
+        ((256, 256, 1024), 4),
     ],
 )
 def testMBSKSplitKMxfp4Gemm(
