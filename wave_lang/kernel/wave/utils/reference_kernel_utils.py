@@ -115,8 +115,10 @@ def sparse_scaled_dot_product_attention(
         block_size, dim=1
     )
     # Broadcast to [B, H, S_q, S_kv]
-    elem_mask = elem_mask.unsqueeze(0).unsqueeze(0).expand_as(
-        torch.empty(query.shape[0], query.shape[1], S_q, S_kv)
+    elem_mask = (
+        elem_mask.unsqueeze(0)
+        .unsqueeze(0)
+        .expand_as(torch.empty(query.shape[0], query.shape[1], S_q, S_kv))
     )
     elem_mask = elem_mask.to(query.device)
 

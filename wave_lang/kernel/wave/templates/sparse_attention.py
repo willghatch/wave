@@ -84,9 +84,7 @@ def prepare_sparse_attention_inputs(
         kv_token_indices = torch.cat(
             [kv_token_indices, torch.zeros(pad_rows, stride, dtype=torch.int32)]
         )
-        row_lengths = torch.cat(
-            [row_lengths, torch.zeros(pad_rows, dtype=torch.int32)]
-        )
+        row_lengths = torch.cat([row_lengths, torch.zeros(pad_rows, dtype=torch.int32)])
     elif kv_token_indices.shape[0] > query_seq_len:
         kv_token_indices = kv_token_indices[:query_seq_len]
         row_lengths = row_lengths[:query_seq_len]
@@ -121,7 +119,7 @@ def get_sparse_bshd_attention_kernel(
     M = tkl.sym.M
     N = tkl.sym.N
     K1 = tkl.sym.K1
-    K2 = tkl.sym.K2     # max_blocks_per_row * BLOCK_K2
+    K2 = tkl.sym.K2  # max_blocks_per_row * BLOCK_K2
     H = tkl.sym.H
     N_KV = tkl.sym.N_KV
     BLOCK_B = tkl.sym.BLOCK_B

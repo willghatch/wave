@@ -147,9 +147,9 @@ class TestSparsePatternUtils:
             end = min(num_kv_blocks - 1, i + window_blocks // 2)
             expected_len = end - start + 1
             row_len = (offsets[i + 1] - offsets[i]).item()
-            assert row_len == expected_len, (
-                f"Q block {i}: expected {expected_len} KV blocks, got {row_len}"
-            )
+            assert (
+                row_len == expected_len
+            ), f"Q block {i}: expected {expected_len} KV blocks, got {row_len}"
 
     def test_causal_local_window_pattern(self):
         """Combined causal + local window: Q block i attends to
@@ -254,9 +254,7 @@ class TestSparseAttentionReference:
 
         offsets, indices = dense_block_pattern(num_q_blocks, num_kv_blocks)
 
-        ref = sparse_scaled_dot_product_attention(
-            q, k, v, offsets, indices, block_size
-        )
+        ref = sparse_scaled_dot_product_attention(q, k, v, offsets, indices, block_size)
         torch_ref = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
         assert_close(ref, torch_ref, atol=1e-5, rtol=1e-5)
@@ -277,9 +275,7 @@ class TestSparseAttentionReference:
 
         offsets, indices = causal_block_pattern(num_q_blocks, num_kv_blocks)
 
-        ref = sparse_scaled_dot_product_attention(
-            q, k, v, offsets, indices, block_size
-        )
+        ref = sparse_scaled_dot_product_attention(q, k, v, offsets, indices, block_size)
 
         # The block-level causal mask is coarser than element-level causal.
         # Within each diagonal block, the block-sparse reference attends to all
@@ -318,9 +314,7 @@ class TestSparseAttentionReference:
             num_q_blocks, num_kv_blocks, window_blocks, causal=True
         )
 
-        ref = sparse_scaled_dot_product_attention(
-            q, k, v, offsets, indices, block_size
-        )
+        ref = sparse_scaled_dot_product_attention(q, k, v, offsets, indices, block_size)
 
         # Build element-level mask from block pattern
         mask = block_sparse_to_dense_mask(offsets, indices, num_q_blocks, num_kv_blocks)
@@ -355,9 +349,7 @@ class TestSparseAttentionReference:
         mask[1, :] = False
         offsets, indices = dense_mask_to_block_sparse(mask)
 
-        ref = sparse_scaled_dot_product_attention(
-            q, k, v, offsets, indices, block_size
-        )
+        ref = sparse_scaled_dot_product_attention(q, k, v, offsets, indices, block_size)
 
         # Row 1 (tokens block_size:2*block_size) should be zeros
         assert (ref[:, :, block_size : 2 * block_size, :] == 0).all()
@@ -430,7 +422,9 @@ def _run_sparse_attention_kernel(
     q = device_randn(1, query_seq_len, num_heads, head_size, dtype=torch.float16)
     k = device_randn(1, kv_seq_len, num_heads, head_size, dtype=torch.float16)
     v = device_randn(1, kv_seq_len, num_heads, head_size_kv, dtype=torch.float16)
-    output = device_zeros(1, query_seq_len, num_heads, head_size_kv, dtype=torch.float32)
+    output = device_zeros(
+        1, query_seq_len, num_heads, head_size_kv, dtype=torch.float32
+    )
 
     # Move auxiliary tensors to device
     kv_token_indices_dev = kv_token_indices.to(q.device)
@@ -468,9 +462,7 @@ class TestSparseAttentionKernel:
     )
     def test_sparse_attention_dense_pattern(self, input_shape, mfma_variant):
         """With fully-dense CSR pattern, kernel output must match reference."""
-        _run_sparse_attention_kernel(
-            input_shape, mfma_variant, dense_block_pattern
-        )
+        _run_sparse_attention_kernel(input_shape, mfma_variant, dense_block_pattern)
 
     @pytest.mark.parametrize("input_shape", sparse_attention_shapes)
     @pytest.mark.parametrize(
@@ -484,9 +476,7 @@ class TestSparseAttentionKernel:
     )
     def test_sparse_attention_causal_pattern(self, input_shape, mfma_variant):
         """With causal CSR pattern, kernel output must match reference."""
-        _run_sparse_attention_kernel(
-            input_shape, mfma_variant, causal_block_pattern
-        )
+        _run_sparse_attention_kernel(input_shape, mfma_variant, causal_block_pattern)
 
     @pytest.mark.parametrize("input_shape", sparse_attention_shapes)
     @pytest.mark.parametrize(
@@ -504,9 +494,7 @@ class TestSparseAttentionKernel:
         def local_window_fn(num_q, num_kv):
             return local_window_block_pattern(num_q, num_kv, 3, causal=True)
 
-        _run_sparse_attention_kernel(
-            input_shape, mfma_variant, local_window_fn
-        )
+        _run_sparse_attention_kernel(input_shape, mfma_variant, local_window_fn)
 
     @pytest.mark.parametrize("input_shape", sparse_attention_shapes)
     @pytest.mark.parametrize(
@@ -529,9 +517,7 @@ class TestSparseAttentionKernel:
                 base_off, base_idx, num_q, num_kv, 1
             )
 
-        _run_sparse_attention_kernel(
-            input_shape, mfma_variant, mixed_fn
-        )
+        _run_sparse_attention_kernel(input_shape, mfma_variant, mixed_fn)
 
     @pytest.mark.parametrize(
         "input_shape",
@@ -560,6 +546,4 @@ class TestSparseAttentionKernel:
                     mask[i, 0] = True
             return dense_mask_to_block_sparse(mask)
 
-        _run_sparse_attention_kernel(
-            input_shape, mfma_variant, custom_fn
-        )
+        _run_sparse_attention_kernel(input_shape, mfma_variant, custom_fn)

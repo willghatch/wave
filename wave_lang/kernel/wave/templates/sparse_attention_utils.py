@@ -47,7 +47,9 @@ def causal_block_pattern(
 
     offsets = torch.zeros(num_q_blocks + 1, dtype=torch.int32)
     offsets[1:] = torch.cumsum(torch.tensor(counts, dtype=torch.int32), dim=0)
-    indices = torch.cat(all_indices) if all_indices else torch.tensor([], dtype=torch.int32)
+    indices = (
+        torch.cat(all_indices) if all_indices else torch.tensor([], dtype=torch.int32)
+    )
     return offsets, indices
 
 
@@ -78,7 +80,9 @@ def local_window_block_pattern(
 
     offsets = torch.zeros(num_q_blocks + 1, dtype=torch.int32)
     offsets[1:] = torch.cumsum(torch.tensor(counts, dtype=torch.int32), dim=0)
-    indices = torch.cat(all_indices) if all_indices else torch.tensor([], dtype=torch.int32)
+    indices = (
+        torch.cat(all_indices) if all_indices else torch.tensor([], dtype=torch.int32)
+    )
     return offsets, indices
 
 
