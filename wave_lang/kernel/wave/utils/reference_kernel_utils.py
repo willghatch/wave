@@ -65,3 +65,68 @@ def scaled_dot_product_attention_bhsd(
     attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
 
     return torch.matmul(attn_weights, value)
+
+
+def sparse_scaled_dot_product_attention(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    block_offsets: Tensor,
+    block_indices: Tensor,
+    block_size: int,
+) -> Tensor:
+    """Reference implementation of block-sparse attention.
+
+    Computes dense attention but masks out blocks not in the sparse pattern.
+    Used for correctness verification, not performance.
+
+    Args:
+        query: [B, H, S_q, D]
+        key: [B, H, S_kv, D]
+        value: [B, H, S_kv, D_v]
+        block_offsets: [num_q_blocks + 1] CSR row pointers (int32)
+        block_indices: [nnz_blocks] KV block indices (int32)
+        block_size: block size in tokens
+    Returns:
+        Tensor: [B, H, S_q, D_v]
+    """
+    if query.dtype != torch.float32:
+        query = query.to(torch.float32)
+    if key.dtype != torch.float32:
+        key = key.to(torch.float32)
+    if value.dtype != torch.float32:
+        value = value.to(torch.float32)
+
+    S_q = query.shape[2]
+    S_kv = key.shape[2]
+    num_q_blocks = S_q // block_size
+    num_kv_blocks = S_kv // block_size
+
+    # Build element-level mask from block CSR pattern
+    block_mask = torch.zeros(num_q_blocks, num_kv_blocks, dtype=torch.bool)
+    for i in range(num_q_blocks):
+        start = block_offsets[i].item()
+        end = block_offsets[i + 1].item()
+        if end > start:
+            row_indices = block_indices[start:end].long()
+            block_mask[i, row_indices] = True
+
+    elem_mask = block_mask.repeat_interleave(block_size, dim=0).repeat_interleave(
+        block_size, dim=1
+    )
+    # Broadcast to [B, H, S_q, S_kv]
+    elem_mask = elem_mask.unsqueeze(0).unsqueeze(0).expand_as(
+        torch.empty(query.shape[0], query.shape[1], S_q, S_kv)
+    )
+    elem_mask = elem_mask.to(query.device)
+
+    scale: float = query.shape[-1] ** -0.5
+    attn_logits = torch.matmul(query, key.transpose(-2, -1)) * scale
+    attn_logits = attn_logits.masked_fill(~elem_mask, float("-inf"))
+
+    # Numerical stability
+    attn_logits = attn_logits - attn_logits.max(dim=-1, keepdim=True).values
+    attn_weights = F.softmax(attn_logits, dim=-1)
+    attn_weights = torch.nan_to_num(attn_weights, nan=0.0)
+
+    return torch.matmul(attn_weights, value)
