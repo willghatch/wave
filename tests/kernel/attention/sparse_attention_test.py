@@ -19,6 +19,31 @@ from wave_lang.kernel.wave.templates.sparse_attention_utils import (
 from wave_lang.kernel.wave.utils.reference_kernel_utils import (
     sparse_scaled_dot_product_attention,
 )
+from wave_lang.kernel.wave.templates.sparse_attention import (
+    prepare_sparse_attention_inputs,
+    get_sparse_bshd_attention_kernel,
+)
+from wave_lang.kernel.wave.templates.attention_common import AttentionShape
+from wave_lang.kernel.wave.constraints import MMAType
+from wave_lang.kernel.wave.utils.general_utils import (
+    get_default_scheduling_params,
+)
+from wave_lang.kernel.wave.utils.run_utils import (
+    set_default_run_config,
+)
+from wave_lang.kernel.wave.utils.torch_utils import (
+    device_randn,
+    device_zeros,
+)
+from wave_lang.kernel.wave.compile import WaveCompileOptions, wave_compile
+from wave_lang.kernel.wave.scheduling.schedule import SchedulingType
+from ..common.utils import (
+    param_bool,
+    require_e2e,
+    require_cdna_2_or_3_or_4,
+)
+
+BLOCK_SIZE = 64
 
 
 # ---------------------------------------------------------------------------
@@ -339,3 +364,202 @@ class TestSparseAttentionReference:
         # Other rows should be non-zero
         assert (ref[:, :, :block_size, :] != 0).any()
         assert (ref[:, :, 2 * block_size :, :] != 0).any()
+
+
+# ---------------------------------------------------------------------------
+# Phase 0c: End-to-end kernel tests (GPU required)
+# ---------------------------------------------------------------------------
+
+# (num_heads, query_seq_len, head_size_kv, head_size, kv_seq_len)
+sparse_attention_shapes = [
+    (8, 256, 64, 64, 256),
+    (8, 512, 64, 64, 512),
+    (8, 256, 64, 64, 1024),
+]
+
+
+def _run_sparse_attention_kernel(
+    input_shape,
+    mfma_variant,
+    pattern_fn,
+    dynamic_dims=False,
+):
+    """Helper to run sparse attention kernel with a given pattern.
+
+    Args:
+        input_shape: (num_heads, query_seq_len, head_size_kv, head_size, kv_seq_len)
+        mfma_variant: tuple of two MMATypes
+        pattern_fn: callable(num_q_blocks, num_kv_blocks) -> (offsets, indices)
+        dynamic_dims: whether to use dynamic dims
+    """
+    num_heads, query_seq_len, head_size_kv, head_size, kv_seq_len = input_shape
+    num_q_blocks = query_seq_len // BLOCK_SIZE
+    num_kv_blocks = kv_seq_len // BLOCK_SIZE
+
+    shape = AttentionShape(
+        num_query_heads=num_heads,
+        num_kv_heads=num_heads,
+        query_seq_len=query_seq_len,
+        head_size_kv=head_size_kv,
+        head_size=head_size,
+        kv_seq_len=kv_seq_len,
+    )
+
+    offsets, indices = pattern_fn(num_q_blocks, num_kv_blocks)
+    kv_token_indices, row_lengths, max_blocks_per_row = prepare_sparse_attention_inputs(
+        offsets, indices, num_q_blocks, BLOCK_SIZE, query_seq_len
+    )
+
+    kernel_fn, hyperparams, dynamic_symbols = get_sparse_bshd_attention_kernel(
+        shape, mfma_variant, max_blocks_per_row, dynamic_dims
+    )
+    hyperparams.update(get_default_scheduling_params())
+
+    options = WaveCompileOptions(
+        subs=hyperparams,
+        schedule=SchedulingType.NONE,
+        dynamic_symbols=dynamic_symbols,
+        waves_per_eu=2,
+        denorm_fp_math_f32="preserve-sign",
+    )
+    options = set_default_run_config(options)
+    kernel_fn = wave_compile(options, kernel_fn)
+
+    torch.manual_seed(1)
+    # BSHD layout: [B, S, H, D]
+    q = device_randn(1, query_seq_len, num_heads, head_size, dtype=torch.float16)
+    k = device_randn(1, kv_seq_len, num_heads, head_size, dtype=torch.float16)
+    v = device_randn(1, kv_seq_len, num_heads, head_size_kv, dtype=torch.float16)
+    output = device_zeros(1, query_seq_len, num_heads, head_size_kv, dtype=torch.float32)
+
+    # Move auxiliary tensors to device
+    kv_token_indices_dev = kv_token_indices.to(q.device)
+    row_lengths_dev = row_lengths.to(q.device)
+
+    kernel_fn(q, k, v, kv_token_indices_dev, row_lengths_dev, output)
+
+    # Compute reference: transpose to BHSD for the reference function
+    q_bhsd = q.squeeze(0).permute(1, 0, 2).unsqueeze(0)  # [1, H, S_q, D]
+    k_bhsd = k.squeeze(0).permute(1, 0, 2).unsqueeze(0)  # [1, H, S_kv, D]
+    v_bhsd = v.squeeze(0).permute(1, 0, 2).unsqueeze(0)  # [1, H, S_kv, D_v]
+
+    ref = sparse_scaled_dot_product_attention(
+        q_bhsd, k_bhsd, v_bhsd, offsets, indices, BLOCK_SIZE
+    )
+    # ref is [1, H, S_q, D_v] -> transpose to [1, S_q, H, D_v]
+    ref_bshd = ref.squeeze(0).permute(1, 0, 2).unsqueeze(0)
+
+    assert_close(output, ref_bshd, check_dtype=False, atol=1e-3, rtol=1e-3)
+
+
+@require_e2e
+class TestSparseAttentionKernel:
+    """End-to-end tests for the block-sparse attention Wave kernel."""
+
+    @pytest.mark.parametrize("input_shape", sparse_attention_shapes)
+    @pytest.mark.parametrize(
+        "mfma_variant",
+        [
+            pytest.param(
+                (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16),
+                marks=require_cdna_2_or_3_or_4,
+            ),
+        ],
+    )
+    def test_sparse_attention_dense_pattern(self, input_shape, mfma_variant):
+        """With fully-dense CSR pattern, kernel output must match reference."""
+        _run_sparse_attention_kernel(
+            input_shape, mfma_variant, dense_block_pattern
+        )
+
+    @pytest.mark.parametrize("input_shape", sparse_attention_shapes)
+    @pytest.mark.parametrize(
+        "mfma_variant",
+        [
+            pytest.param(
+                (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16),
+                marks=require_cdna_2_or_3_or_4,
+            ),
+        ],
+    )
+    def test_sparse_attention_causal_pattern(self, input_shape, mfma_variant):
+        """With causal CSR pattern, kernel output must match reference."""
+        _run_sparse_attention_kernel(
+            input_shape, mfma_variant, causal_block_pattern
+        )
+
+    @pytest.mark.parametrize("input_shape", sparse_attention_shapes)
+    @pytest.mark.parametrize(
+        "mfma_variant",
+        [
+            pytest.param(
+                (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16),
+                marks=require_cdna_2_or_3_or_4,
+            ),
+        ],
+    )
+    def test_sparse_attention_local_window(self, input_shape, mfma_variant):
+        """With local-window CSR pattern, kernel output must match reference."""
+
+        def local_window_fn(num_q, num_kv):
+            return local_window_block_pattern(num_q, num_kv, 3, causal=True)
+
+        _run_sparse_attention_kernel(
+            input_shape, mfma_variant, local_window_fn
+        )
+
+    @pytest.mark.parametrize("input_shape", sparse_attention_shapes)
+    @pytest.mark.parametrize(
+        "mfma_variant",
+        [
+            pytest.param(
+                (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16),
+                marks=require_cdna_2_or_3_or_4,
+            ),
+        ],
+    )
+    def test_sparse_attention_mixed_pattern(self, input_shape, mfma_variant):
+        """Local window + global tokens pattern, verify against reference."""
+
+        def mixed_fn(num_q, num_kv):
+            base_off, base_idx = local_window_block_pattern(
+                num_q, num_kv, 2, causal=True
+            )
+            return block_pattern_with_global_tokens(
+                base_off, base_idx, num_q, num_kv, 1
+            )
+
+        _run_sparse_attention_kernel(
+            input_shape, mfma_variant, mixed_fn
+        )
+
+    @pytest.mark.parametrize(
+        "input_shape",
+        [(8, 256, 64, 64, 256)],
+    )
+    @pytest.mark.parametrize(
+        "mfma_variant",
+        [
+            pytest.param(
+                (MMAType.F32_16x16x16_F16, MMAType.F32_16x16x16_F16),
+                marks=require_cdna_2_or_3_or_4,
+            ),
+        ],
+    )
+    def test_sparse_attention_custom_block_sparse(self, input_shape, mfma_variant):
+        """Random block-sparse pattern at ~50% density, verify against reference."""
+        num_q_blocks = input_shape[1] // BLOCK_SIZE
+        num_kv_blocks = input_shape[4] // BLOCK_SIZE
+
+        def custom_fn(num_q, num_kv):
+            torch.manual_seed(42)
+            mask = torch.rand(num_q, num_kv) > 0.5
+            # Ensure at least one block per row for a valid test
+            for i in range(num_q):
+                if not mask[i].any():
+                    mask[i, 0] = True
+            return dense_mask_to_block_sparse(mask)
+
+        _run_sparse_attention_kernel(
+            input_shape, mfma_variant, custom_fn
+        )
